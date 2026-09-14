@@ -1,0 +1,47 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "rbconfig"
+
+ROOT = File.expand_path("..", __dir__)
+
+command = ARGV.shift
+
+case command
+when "version"
+  $LOAD_PATH.unshift File.join(ROOT, "lib")
+  require "runpod_ollama_fleet/version"
+  puts RunpodOllamaFleet::VERSION
+when "bootstrap"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-bootstrap"), *ARGV
+when "dispatch-legacy"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-dispatch"), *ARGV
+when "lease"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-lease"), *ARGV
+when "scale"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-lifecycle"), "scale", *ARGV
+when "replace"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-lifecycle"), "replace", *ARGV
+when "status"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-status"), *ARGV
+when "tunnels"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-tunnels"), *ARGV
+else
+  warn <<~USAGE
+    Usage: bin/rpof COMMAND [options]
+
+    Step-4 extracted commands:
+      version
+      bootstrap
+      dispatch-legacy
+      lease
+      scale
+      replace
+      status
+      tunnels
+
+    The frozen AFIO-facing capability-check + dispatch JSON interface is wired in
+    the bridge step after this extracted provider suite is green.
+  USAGE
+  exit(command ? 2 : 0)
+end
