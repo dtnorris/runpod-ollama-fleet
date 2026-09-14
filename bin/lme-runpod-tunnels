@@ -1,0 +1,121 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+
+require "local_model_evaluation/runpod_fleet_namespace"
+require "local_model_evaluation/runpod_fleet_state"
+require "local_model_evaluation/runpod_tunnels"
+require "local_model_evaluation/runpod_workers"
+
+def parse_worker_indices(value)
+  LocalModelEvaluation::RunpodWorkers.parse_selector(value)
+rescue LocalModelEvaluation::RunpodWorkers::Error => e
+  raise OptionParser::InvalidArgument, e.message
+end
+
+action = %w[start status repair stop].include?(ARGV.first) ? ARGV.shift : "start"
+opts = {
+  workers: nil,
+  all: false,
+  wait_seconds: LocalModelEvaluation::RunpodTunnels::DEFAULT_WAIT_SECONDS,
+  remote_port: LocalModelEvaluation::RunpodTunnels::DEFAULT_REMOTE_PORT,
+  identity: ENV.fetch("RUNPOD_SSH_IDENTITY_PATH", "~/.ssh/id_ed25519")
+}
+
+parser = OptionParser.new do |o|
+  o.banner = <<~USAGE
+    Usage:
+      bin/lme runpod-tunnels --workers 1-16
+      bin/lme runpod-tunnels start --workers 1-16
+      bin/lme runpod-tunnels status [--workers 1-16]
+      bin/lme runpod-tunnels repair --workers 1-16
+      bin/lme runpod-tunnels stop --workers 1-16
+  USAGE
+  o.on("--workers LIST", "Burst worker indices, e.g. 1-12 or 1,6,12") { |v| opts[:workers] = parse_worker_indices(v) }
+  o.on("--all", "Select every active worker in the current fleet") { opts[:all] = true }
+  o.on("--wait-seconds N", Integer, "Ollama health timeout when starting (default: 30)") { |v| opts[:wait_seconds] = v }
+  o.on("--remote-port N", Integer, "Remote Ollama port (default: 11434)") { |v| opts[:remote_port] = v }
+  o.on("--identity PATH", "SSH private key (default: ~/.ssh/id_ed25519)") { |v| opts[:identity] = v }
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+  raise OptionParser::InvalidArgument, "use either --workers or --all, not both" if opts[:workers] && opts[:all]
+rescue OptionParser::ParseError => e
+  warn "ERROR: #{e.message}"
+  warn parser
+  exit 2
+end
+
+begin
+  namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
+    root: File.join(ROOT, "output", "runpod-fleets"),
+    repo_root: ROOT,
+    fleet_key: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY)
+  )
+  state = LocalModelEvaluation::RunpodFleetState.new(
+    root: namespace.state_root,
+    local_port_base: namespace.local_port_base
+  )
+rescue LocalModelEvaluation::RunpodFleetNamespace::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end
+
+if opts[:all]
+  begin
+    current = state.current
+    raise LocalModelEvaluation::RunpodTunnels::Error, "no current RunPod fleet state exists; provision a fleet first" unless current
+    opts[:workers] = current.fetch("workers").select { |worker| worker["status"] == "active" }.map { |worker| worker.fetch("index") }
+  rescue LocalModelEvaluation::RunpodFleetState::Error, KeyError => e
+    warn "ERROR: #{e.message}"
+    exit 1
+  end
+end
+
+if %w[start repair stop].include?(action) && !opts[:workers]
+  warn "ERROR: #{action} requires --workers LIST or --all"
+  warn parser
+  exit 2
+end
+
+manager = LocalModelEvaluation::RunpodTunnels.new(
+  fleet_state: state,
+  repo_root: ROOT,
+  identity_path: opts[:identity]
+)
+
+begin
+  case action
+  when "start"
+    manager.start(
+      worker_indices: opts[:workers],
+      wait_seconds: opts[:wait_seconds],
+      remote_port: opts[:remote_port]
+    )
+  when "status"
+    rows = manager.status(worker_indices: opts[:workers])
+    puts manager.render_status(rows)
+    unhealthy = rows.any? { |row| row["process_status"] != "running" || row["health_status"] != "healthy" }
+    exit(unhealthy ? 1 : 0)
+  when "repair"
+    rows = manager.repair(
+      worker_indices: opts[:workers],
+      wait_seconds: opts[:wait_seconds],
+      remote_port: opts[:remote_port]
+    )
+    puts manager.render_status(rows)
+  when "stop"
+    manager.stop(worker_indices: opts[:workers])
+  end
+rescue Interrupt
+  exit 130
+rescue LocalModelEvaluation::RunpodTunnels::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end

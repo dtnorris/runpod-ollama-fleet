@@ -1,0 +1,87 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+
+require "local_model_evaluation/runpod_fleet_namespace"
+require "local_model_evaluation/runpod_fleet_state"
+require "local_model_evaluation/runpod_bootstrap"
+require "local_model_evaluation/runpod_workers"
+
+def parse_worker_indices(value)
+  LocalModelEvaluation::RunpodWorkers.parse_selector(value)
+rescue LocalModelEvaluation::RunpodWorkers::Error => e
+  raise OptionParser::InvalidArgument, e.message
+end
+
+opts = {
+  workers: nil,
+  models: [],
+  expected_digests: [],
+  clean: false,
+  reuse_existing: false,
+  context: nil,
+  heartbeat_seconds: ENV.fetch(
+    "LME_RUNPOD_BOOTSTRAP_HEARTBEAT_SECONDS",
+    LocalModelEvaluation::RunpodBootstrap::DEFAULT_HEARTBEAT_SECONDS
+  )
+}
+
+parser = OptionParser.new do |o|
+  o.banner = "Usage: bin/lme runpod-bootstrap --workers 1-16 --model MODEL [options]"
+  o.on("--workers LIST", "Burst worker indices, e.g. 1-12 or 1,6,12") { |v| opts[:workers] = parse_worker_indices(v) }
+  o.on("--model MODEL", "Ollama model to bootstrap; repeatable") { |v| opts[:models] << v }
+  o.on("--expect-digest MODEL=DIGEST", "Required exact 64-hex digest for each --model; repeatable") { |v| opts[:expected_digests] << v }
+  o.on("--clean", "Delete staging/shared Ollama stores before bootstrap") { opts[:clean] = true }
+  o.on("--reuse-existing", "Reuse and validate the existing /workspace Ollama cache; never pull or copy models") { opts[:reuse_existing] = true }
+  o.on("--context N", Integer, "Ollama context length; remote default is 131072") { |v| opts[:context] = v }
+  o.on("--heartbeat-seconds N", Float, "Fleet heartbeat interval (default: 10)") { |v| opts[:heartbeat_seconds] = v }
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::MissingArgument, "--workers" unless opts[:workers]
+  raise OptionParser::MissingArgument, "--model" if opts[:models].empty?
+  if opts[:clean] && opts[:reuse_existing]
+    raise OptionParser::InvalidArgument, "--clean cannot be combined with --reuse-existing"
+  end
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+rescue OptionParser::ParseError => e
+  warn "ERROR: #{e.message}"
+  warn parser
+  exit 2
+end
+
+begin
+  namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
+    root: File.join(ROOT, "output", "runpod-fleets"),
+    repo_root: ROOT,
+    fleet_key: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY)
+  )
+  state = LocalModelEvaluation::RunpodFleetState.new(
+    root: namespace.state_root,
+    local_port_base: namespace.local_port_base
+  )
+  bootstrap = LocalModelEvaluation::RunpodBootstrap.new(
+    fleet_state: state,
+    remote_setup_path: File.join(ROOT, "scripts", "setup_runpod_worker_remote.sh"),
+    repo_root: ROOT
+  )
+  bootstrap.run(
+    worker_indices: opts[:workers],
+    models: opts[:models],
+    expected_digests: opts[:expected_digests],
+    clean: opts[:clean],
+    reuse_existing: opts[:reuse_existing],
+    context: opts[:context],
+    heartbeat_seconds: opts[:heartbeat_seconds]
+  )
+rescue Interrupt
+  exit 130
+rescue LocalModelEvaluation::RunpodBootstrap::Error, LocalModelEvaluation::RunpodFleetNamespace::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end

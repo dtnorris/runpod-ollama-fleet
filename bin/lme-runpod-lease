@@ -1,0 +1,99 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "dotenv"
+require "fileutils"
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+Dotenv.load(File.join(ROOT, ".env"))
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+
+require "local_model_evaluation/runpod_client"
+require "local_model_evaluation/runpod_fleet_namespace"
+require "local_model_evaluation/runpod_fleet_state"
+require "local_model_evaluation/runpod_fleet"
+require "local_model_evaluation/runpod_lease"
+
+command = ARGV.shift || "status"
+opts = {
+  fleet: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY),
+  expected_fleet_id: nil,
+  poll_seconds: LocalModelEvaluation::RunpodLease::DEFAULT_POLL_SECONDS
+}
+OptionParser.new do |o|
+  o.on("--fleet KEY", "Managed RunPod fleet key") { |v| opts[:fleet] = v }
+  o.on("--expected-fleet-id ID", "Exit rather than policing a replacement fleet") { |v| opts[:expected_fleet_id] = v }
+  o.on("--poll-seconds N", Float, "Lease enforcement poll interval") { |v| opts[:poll_seconds] = v }
+end.parse!(ARGV)
+
+unless %w[status watch].include?(command) && ARGV.empty?
+  warn "Usage: bin/lme-runpod-lease [status|watch] [--fleet KEY] [--expected-fleet-id ID] [--poll-seconds N]"
+  exit 2
+end
+
+begin
+  namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
+    root: File.join(ROOT, "output", "runpod-fleets"),
+    repo_root: ROOT,
+    fleet_key: opts[:fleet]
+  )
+  state = LocalModelEvaluation::RunpodFleetState.new(
+    root: namespace.state_root,
+    local_port_base: namespace.local_port_base
+  )
+
+  if command == "status"
+    lease = LocalModelEvaluation::RunpodLease.new(fleet_state: state)
+    $stdout.write(lease.render(lease.snapshot))
+    exit 0
+  end
+
+  api_key = ENV["RUNPOD_API_KEY"].to_s
+  raise LocalModelEvaluation::RunpodLease::Error, "RUNPOD_API_KEY is missing" if api_key.empty?
+
+  client = LocalModelEvaluation::RunpodClient.new(
+    api_key:,
+    base_url: ENV.fetch("RUNPOD_API_BASE_URL", LocalModelEvaluation::RunpodClient::DEFAULT_BASE_URL)
+  )
+  fleet = LocalModelEvaluation::RunpodFleet.new(
+    client:,
+    env_path: namespace.env_path,
+    state_root: namespace.state_root,
+    fleet_key: namespace.fleet_key,
+    local_port_base: namespace.local_port_base
+  )
+  current = state.current
+  raise LocalModelEvaluation::RunpodLease::Error, "no current RunPod fleet" unless current
+  expected_fleet_id = opts[:expected_fleet_id] || current.fetch("fleet_id")
+  if current.fetch("fleet_id") != expected_fleet_id
+    raise LocalModelEvaluation::RunpodLease::Error,
+          "expected fleet #{expected_fleet_id} is not current (#{current.fetch('fleet_id')})"
+  end
+  raise LocalModelEvaluation::RunpodLease::Error, "current RunPod fleet has no runtime/spend lease" unless current["lease"]
+
+  lease_dir = state.artifact_dir(current.fetch("fleet_id"), "lease")
+  pid_path = File.join(lease_dir, LocalModelEvaluation::RunpodLease::PID_FILE)
+  FileUtils.mkdir_p(lease_dir)
+  File.write(pid_path, "#{Process.pid}\n")
+
+  begin
+    LocalModelEvaluation::RunpodLease.new(
+      fleet_state: state,
+      fleet:,
+      expected_fleet_id:,
+      out: $stdout
+    ).watch(poll_seconds: opts[:poll_seconds])
+  ensure
+    if File.file?(pid_path) && File.read(pid_path).strip == Process.pid.to_s
+      File.delete(pid_path)
+    end
+  end
+rescue LocalModelEvaluation::RunpodFleetNamespace::Error,
+       LocalModelEvaluation::RunpodFleetState::Error,
+       LocalModelEvaluation::RunpodFleet::Error,
+       LocalModelEvaluation::RunpodClient::Error,
+       LocalModelEvaluation::RunpodLease::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end

@@ -1,0 +1,116 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+
+require "local_model_evaluation/runpod_dispatcher"
+require "local_model_evaluation/runpod_fleet_namespace"
+require "local_model_evaluation/runpod_fleet_state"
+require "local_model_evaluation/runpod_workers"
+
+opts = {
+  jobs: nil,
+  workers: nil,
+  all: false,
+  output: nil,
+  group_by_affinity: false,
+  fleet: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY)
+}
+
+interrupted_signal = nil
+%w[INT TERM].each do |signal|
+  Signal.trap(signal) do
+    next if interrupted_signal
+
+    interrupted_signal = signal
+    Thread.main.raise(Interrupt, "received #{signal}")
+  end
+end
+
+parser = OptionParser.new do |o|
+  o.banner = "Usage: bin/lme runpod-dispatch --jobs FILE (--workers LIST|--all) --output DIR [--group-by-affinity] [--fleet KEY]"
+  o.on("--jobs FILE", "JSON jobs with job_id, argv, optional env, and optional affinity") { |v| opts[:jobs] = v }
+  o.on("--workers LIST", "Burst worker indices, e.g. 1-12 or 1,6,12") do |v|
+    opts[:workers] = LocalModelEvaluation::RunpodWorkers.parse_selector(v)
+  rescue LocalModelEvaluation::RunpodWorkers::Error => e
+    raise OptionParser::InvalidArgument, e.message
+  end
+  o.on("--all", "Select every active worker in the current fleet") { opts[:all] = true }
+  o.on("--output DIR", "Directory for manifest, job logs, and summary; matching output resumes unstarted jobs") { |v| opts[:output] = v }
+  o.on("--group-by-affinity", "Stably group equal job affinity values before dispatch; FIFO remains the default") { opts[:group_by_affinity] = true }
+  o.on("--fleet KEY", "Managed RunPod fleet key") { |v| opts[:fleet] = v }
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+  raise OptionParser::MissingArgument, "--jobs" unless opts[:jobs]
+  raise OptionParser::MissingArgument, "--output" unless opts[:output]
+  raise OptionParser::InvalidArgument, "use either --workers or --all, not both" if opts[:workers] && opts[:all]
+  raise OptionParser::InvalidArgument, "use --workers LIST or --all" unless opts[:workers] || opts[:all]
+rescue OptionParser::ParseError => e
+  warn "ERROR: #{e.message}"
+  warn parser
+  exit 2
+end
+
+begin
+  jobs_path = File.expand_path(opts.fetch(:jobs))
+  raise LocalModelEvaluation::RunpodDispatcher::Error, "jobs file not found: #{jobs_path}" unless File.file?(jobs_path)
+
+  document = JSON.parse(File.read(jobs_path))
+  jobs = document.is_a?(Hash) ? document.fetch("jobs") : document
+  namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
+    root: File.join(ROOT, "output", "runpod-fleets"),
+    repo_root: ROOT,
+    fleet_key: opts.fetch(:fleet)
+  )
+  fleet_state = LocalModelEvaluation::RunpodFleetState.new(
+    root: namespace.state_root,
+    local_port_base: namespace.local_port_base
+  )
+  if opts[:all]
+    current = fleet_state.current
+    unless current && current["status"] == "active"
+      raise LocalModelEvaluation::RunpodDispatcher::InfrastructureError, "no current active RunPod fleet state exists"
+    end
+    opts[:workers] = current.fetch("workers").filter_map do |worker|
+      Integer(worker.fetch("index")) if worker["status"] == "active"
+    end
+  end
+
+  dispatcher = LocalModelEvaluation::RunpodDispatcher.new(
+    fleet_state:,
+    output_dir: opts.fetch(:output),
+    repo_root: ROOT
+  )
+  summary = dispatcher.run(
+    jobs:,
+    worker_indices: opts.fetch(:workers),
+    group_by_affinity: opts.fetch(:group_by_affinity)
+  )
+  puts "Dispatch #{summary.fetch('status')}: #{summary.fetch('completed_count')} completed, " \
+       "#{summary.fetch('failed_count')} failed, #{summary.fetch('not_started_count')} not started."
+  puts "Evidence: #{dispatcher.output_dir}"
+  exit(summary.fetch("status") == "completed" ? 0 : summary.fetch("status") == "workload_failed" ? 2 : 1)
+rescue Interrupt => e
+  signal = interrupted_signal || "INT"
+  warn "ERROR: dispatch interrupted by #{signal}: #{e.message}"
+  warn "Active workload process groups were terminated; unstarted jobs remain resumable."
+  exit(128 + Signal.list.fetch(signal, 2))
+rescue JSON::ParserError => e
+  warn "ERROR: jobs file is invalid JSON: #{e.message}"
+  exit 2
+rescue KeyError => e
+  warn "ERROR: jobs file is missing #{e.key.inspect}"
+  exit 2
+rescue LocalModelEvaluation::RunpodDispatcher::Error,
+       LocalModelEvaluation::RunpodFleetNamespace::Error,
+       LocalModelEvaluation::RunpodFleetState::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end

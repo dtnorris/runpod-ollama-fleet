@@ -1,0 +1,306 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "dotenv"
+require "fileutils"
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+Dotenv.load(File.join(ROOT, ".env"))
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "local_model_evaluation"
+
+command = ARGV.shift
+unless %w[scale replace].include?(command)
+  warn "Usage: bin/lme-runpod-lifecycle (scale --workers N|replace --worker N) [options]"
+  exit 2
+end
+
+opts = {
+  fleet: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY),
+  workers: nil,
+  worker: nil,
+  dry_run: false,
+  yes: false,
+  max_hourly_usd: ENV.fetch("RUNPOD_MAX_FLEET_HOURLY_USD", LocalModelEvaluation::RunpodFleet::DEFAULT_MAX_FLEET_HOURLY_USD),
+  max_total_hourly_usd: ENV.fetch("RUNPOD_MAX_TOTAL_HOURLY_USD", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_MAX_TOTAL_HOURLY_USD),
+  ssh_public_key: ENV.fetch("RUNPOD_SSH_PUBLIC_KEY_PATH", "~/.ssh/id_ed25519.pub"),
+  wait_seconds: LocalModelEvaluation::RunpodFleet::DEFAULT_WAIT_SECONDS,
+  poll_seconds: LocalModelEvaluation::RunpodFleet::DEFAULT_POLL_SECONDS
+}
+
+parser = OptionParser.new do |o|
+  o.banner = if command == "scale"
+               "Usage: bin/lme runpod-scale --workers N [options]"
+             else
+               "Usage: bin/lme runpod-replace --worker N [options]"
+             end
+  o.on("--fleet KEY", "Managed RunPod fleet key") { |v| opts[:fleet] = v }
+  if command == "scale"
+    o.on("--workers N", Integer, "Resize active fleet to N contiguous logical workers (1-16)") { |v| opts[:workers] = v }
+  else
+    o.on("--worker N", Integer, "Replace logical worker slot N (1-16)") { |v| opts[:worker] = v }
+  end
+  o.on("--dry-run", "Read-only availability/cost/prerequisite check") { opts[:dry_run] = true }
+  o.on("--yes", "Skip the paid lifecycle confirmation prompt") { opts[:yes] = true }
+  o.on("--max-hourly-usd USD", Float, "Fail closed above this fleet's projected hourly rate") { |v| opts[:max_hourly_usd] = v }
+  o.on("--max-total-hourly-usd USD", Float, "Fail closed above aggregate managed RunPod hourly rate") { |v| opts[:max_total_hourly_usd] = v }
+  o.on("--ssh-public-key PATH", "OpenSSH public key file to authorize") { |v| opts[:ssh_public_key] = v }
+  o.on("--wait-seconds N", Integer, "Maximum provisioning wait") { |v| opts[:wait_seconds] = v }
+  o.on("--poll-seconds N", Float, "Provisioning poll interval") { |v| opts[:poll_seconds] = v }
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+  if command == "scale"
+    raise OptionParser::MissingArgument, "--workers" unless opts[:workers]
+  else
+    raise OptionParser::MissingArgument, "--worker" unless opts[:worker]
+  end
+rescue OptionParser::ParseError => e
+  warn "ERROR: #{e.message}"
+  warn parser
+  exit 2
+end
+
+def positive_cap(value, label)
+  number = Float(value)
+  raise ArgumentError unless number.positive?
+  number
+rescue ArgumentError, TypeError
+  raise LocalModelEvaluation::RunpodFleetLifecycle::Error, "#{label} must be a positive number"
+end
+
+def confirm_or_abort(prompt, assume_yes:)
+  return if assume_yes
+  $stdout.print "#{prompt} [y/N] "
+  $stdout.flush
+  answer = $stdin.gets.to_s.strip.downcase
+  abort "Aborted; no changes made." unless %w[y yes].include?(answer)
+end
+
+def stop_replaced_tunnel(namespace, preflight)
+  worker = preflight.current_worker
+  return unless worker && worker["status"] == "active"
+
+  state = LocalModelEvaluation::RunpodFleetState.new(
+    root: namespace.state_root,
+    local_port_base: namespace.local_port_base
+  )
+  current = state.current
+  return unless current
+  tunnel_root = state.artifact_dir(current.fetch("fleet_id"), "tunnels")
+  return unless File.file?(File.join(tunnel_root, LocalModelEvaluation::RunpodTunnels::STATE_FILE))
+
+  LocalModelEvaluation::RunpodTunnels.new(
+    fleet_state: state,
+    repo_root: ROOT
+  ).stop(worker_indices: preflight.worker_indices)
+rescue LocalModelEvaluation::RunpodFleetState::Error, LocalModelEvaluation::RunpodTunnels::Error => e
+  warn "WARNING: could not stop managed tunnel before replacement: #{e.message}; continuing lifecycle replacement."
+end
+
+def stop_scaled_tunnels(namespace, worker_indices)
+  state = LocalModelEvaluation::RunpodFleetState.new(
+    root: namespace.state_root,
+    local_port_base: namespace.local_port_base
+  )
+  current = state.current
+  return unless current
+
+  requested = Array(worker_indices).map { |index| Integer(index) }
+  active = Array(current.fetch("workers")).filter_map do |worker|
+    index = Integer(worker.fetch("index"))
+    index if requested.include?(index) && worker["status"] == "active"
+  end
+  return if active.empty?
+
+  tunnel_root = state.artifact_dir(current.fetch("fleet_id"), "tunnels")
+  return unless File.file?(File.join(tunnel_root, LocalModelEvaluation::RunpodTunnels::STATE_FILE))
+
+  LocalModelEvaluation::RunpodTunnels.new(
+    fleet_state: state,
+    repo_root: ROOT
+  ).stop(worker_indices: active)
+rescue LocalModelEvaluation::RunpodFleetState::Error, LocalModelEvaluation::RunpodTunnels::Error => e
+  warn "WARNING: could not stop managed tunnel(s) before scale-down: #{e.message}; continuing lifecycle scale-down."
+end
+
+begin
+  fleet_key = LocalModelEvaluation::RunpodFleetNamespace.normalize_key(opts[:fleet])
+  namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
+    root: File.join(ROOT, "output", "runpod-fleets"),
+    repo_root: ROOT,
+    fleet_key:
+  )
+  api_key = ENV["RUNPOD_API_KEY"].to_s
+  raise LocalModelEvaluation::RunpodFleetLifecycle::Error, "RUNPOD_API_KEY is missing" if api_key.empty?
+  client = LocalModelEvaluation::RunpodClient.new(
+    api_key:,
+    base_url: ENV.fetch("RUNPOD_API_BASE_URL", LocalModelEvaluation::RunpodClient::DEFAULT_BASE_URL)
+  )
+  state = LocalModelEvaluation::RunpodFleetState.new(
+    root: namespace.state_root,
+    local_port_base: namespace.local_port_base
+  )
+  fleet = LocalModelEvaluation::RunpodFleet.new(
+    client:,
+    env_path: namespace.env_path,
+    state_root: namespace.state_root,
+    fleet_key: namespace.fleet_key,
+    local_port_base: namespace.local_port_base
+  )
+  lifecycle = LocalModelEvaluation::RunpodFleetLifecycle.new(
+    client:,
+    fleet_state: state,
+    env_path: namespace.env_path,
+    fleet_key: namespace.fleet_key,
+    local_port_base: namespace.local_port_base
+  )
+
+  preflight = if command == "scale"
+                lifecycle.preflight_scale(
+                  target_worker_count: opts[:workers],
+                  max_fleet_hourly_usd: opts[:max_hourly_usd]
+                )
+              else
+                lifecycle.preflight_replace(
+                  worker_index: opts[:worker],
+                  max_fleet_hourly_usd: opts[:max_hourly_usd]
+                )
+              end
+  scale_down = command == "scale" && preflight.scale_direction == "down"
+  ssh_public_key = scale_down ? nil : fleet.read_ssh_public_key(opts[:ssh_public_key])
+  max_total_rate = positive_cap(opts[:max_total_hourly_usd], "aggregate managed RunPod hourly safety cap")
+  current_total_rate = namespace.total_active_hourly_usd
+  projected_total_rate = current_total_rate - preflight.current_fleet_hourly_rate + preflight.projected_fleet_hourly_rate
+  if !scale_down && projected_total_rate > max_total_rate
+    raise LocalModelEvaluation::RunpodFleetLifecycle::Error, format(
+      "projected managed RunPod total $%.4f/hr exceeds aggregate safety cap $%.4f/hr; no pods were created",
+      projected_total_rate,
+      max_total_rate
+    )
+  end
+
+  puts "RunPod lifecycle preflight"
+  operation_label = if command == "scale"
+                      "SCALE #{preflight.scale_direction.upcase}"
+                    else
+                      command.upcase
+                    end
+  puts "  Operation: #{operation_label}"
+  puts "  Fleet: #{namespace.fleet_key} / #{preflight.fleet_id}"
+  if scale_down
+    puts "  GPU: #{preflight.gpu.fetch('id')} (recorded fleet contract)"
+  else
+    puts "  GPU: #{preflight.gpu.fetch('id')} (#{preflight.gpu.fetch('memory')} GB VRAM)"
+  end
+  puts "  Cloud: #{preflight.cloud}"
+  puts "  Availability: #{preflight.availability}" unless scale_down
+  if command == "scale"
+    puts "  Workers: #{preflight.current_worker_count} -> #{preflight.target_worker_count}"
+    slot_label = scale_down ? "Retiring logical slots" : "New logical slots"
+    puts "  #{slot_label}: #{preflight.worker_indices.map { |i| "burst_#{i}" }.join(', ')}"
+  else
+    puts "  Logical slot: burst_#{preflight.worker_indices.fetch(0)}"
+    puts "  Recorded pod: #{preflight.current_worker.fetch('pod_id')} (#{preflight.current_worker.fetch('status')})"
+  end
+  unless scale_down
+    puts "  Container disk: #{preflight.container_disk_gb} GB"
+    puts "  Workspace volume: #{preflight.volume_gb} GB at #{LocalModelEvaluation::RunpodFleet::VOLUME_MOUNT_PATH}"
+    puts format("  Catalog rate: $%.4f/hr per new worker", preflight.hourly_rate)
+  end
+  puts format("  Current fleet rate: $%.4f/hr", preflight.current_fleet_hourly_rate)
+  puts format("  Projected fleet rate: $%.4f/hr", preflight.projected_fleet_hourly_rate)
+  puts format("  Per-fleet safety cap: $%.4f/hr", preflight.max_fleet_hourly_rate)
+  puts format("  Existing managed fleets: $%.4f/hr", current_total_rate)
+  puts format("  Projected managed total: $%.4f/hr", projected_total_rate)
+  puts format("  Aggregate safety cap: $%.4f/hr", max_total_rate)
+  puts "  SSH public key: #{File.expand_path(opts[:ssh_public_key])}" unless scale_down
+  puts "No lifecycle mutation has occurred."
+
+  if opts[:dry_run]
+    puts "Dry run PASS."
+    exit 0
+  end
+
+  prompt = if scale_down
+             format(
+               "Delete %d paid RunPod worker(s) from fleet %s and shrink to %d contiguous slots at projected $%.4f/hr?",
+               preflight.worker_indices.length,
+               namespace.fleet_key,
+               preflight.target_worker_count,
+               preflight.projected_fleet_hourly_rate
+             )
+           elsif command == "scale"
+             format(
+               "Create %d additional paid RunPod worker(s) in fleet %s and grow to %d slots at projected $%.4f/hr?",
+               preflight.worker_indices.length,
+               namespace.fleet_key,
+               preflight.target_worker_count,
+               preflight.projected_fleet_hourly_rate
+             )
+           else
+             format(
+               "Replace burst_%d in fleet %s by deleting its recorded pod first, then creating one paid replacement at projected $%.4f/hr?",
+               preflight.worker_indices.fetch(0),
+               namespace.fleet_key,
+               preflight.projected_fleet_hourly_rate
+             )
+           end
+  confirm_or_abort(prompt, assume_yes: opts[:yes])
+
+  if command == "scale"
+    if scale_down
+      stop_scaled_tunnels(namespace, preflight.worker_indices)
+      retired = lifecycle.shrink(
+        target_worker_count: opts[:workers],
+        preflight:
+      )
+      puts "RunPod scale-down complete:"
+      puts "  Retired logical slots: #{retired.map { |index| "burst_#{index}" }.join(', ')}"
+      puts "  Remaining logical slots: burst_1-burst_#{preflight.target_worker_count}"
+    else
+      workers = lifecycle.scale(
+        target_worker_count: opts[:workers],
+        ssh_public_key:,
+        preflight:,
+        max_fleet_hourly_usd: opts[:max_hourly_usd],
+        wait_seconds: opts[:wait_seconds],
+        poll_seconds: opts[:poll_seconds]
+      )
+      puts "RunPod scale-up complete:"
+      workers.each do |worker|
+        puts format("  burst_%d: pod=%s ssh=%s:%d $%.4f/hr", worker.index, worker.pod_id, worker.host, worker.ssh_port, worker.hourly_rate)
+      end
+      selector = workers.map(&:index).join(",")
+      puts "New workers are provisioned but not bootstrapped or tunneled."
+      puts "Next: bin/lme runpod-bootstrap --workers #{selector} --model MODEL [--fleet #{namespace.fleet_key}]"
+      puts "Then: bin/lme runpod-tunnels start --workers #{selector} [--fleet #{namespace.fleet_key}]"
+    end
+  else
+    stop_replaced_tunnel(namespace, preflight)
+    worker = lifecycle.replace(
+      worker_index: opts[:worker],
+      ssh_public_key:,
+      preflight:,
+      max_fleet_hourly_usd: opts[:max_hourly_usd],
+      wait_seconds: opts[:wait_seconds],
+      poll_seconds: opts[:poll_seconds]
+    )
+    puts "RunPod replacement complete:"
+    puts format("  burst_%d: pod=%s ssh=%s:%d $%.4f/hr", worker.index, worker.pod_id, worker.host, worker.ssh_port, worker.hourly_rate)
+    puts "The logical burst_#{worker.index} slot is preserved; the physical pod generation changed."
+    puts "Replacement worker is not bootstrapped or tunneled yet."
+    puts "Next: bin/lme runpod-bootstrap --workers #{worker.index} --model MODEL [--fleet #{namespace.fleet_key}]"
+    puts "Then: bin/lme runpod-tunnels start --workers #{worker.index} [--fleet #{namespace.fleet_key}]"
+  end
+rescue LocalModelEvaluation::RunpodClient::Error,
+       LocalModelEvaluation::RunpodFleet::Error,
+       LocalModelEvaluation::RunpodFleetState::Error,
+       LocalModelEvaluation::RunpodFleetNamespace::Error,
+       LocalModelEvaluation::RunpodFleetLifecycle::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end
