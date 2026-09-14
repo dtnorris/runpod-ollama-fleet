@@ -99,10 +99,11 @@ module LocalModelEvaluation
 
     def initialize(fleet_state:, output_dir:, repo_root:, out: $stdout,
                    endpoint_checker: nil, command_runner: nil,
-                   wall_clock: nil, monotonic_clock: nil)
+                   wall_clock: nil, monotonic_clock: nil, workdir: nil)
       @fleet_state = fleet_state
       @output_dir = File.expand_path(output_dir)
       @repo_root = File.expand_path(repo_root)
+      @workdir = File.expand_path(workdir || repo_root)
       @out = out
       @endpoint_checker = endpoint_checker || RunpodTunnels::HttpHealthChecker.new
       @command_runner = command_runner || SystemCommandRunner.new
@@ -376,7 +377,7 @@ module LocalModelEvaluation
         env:,
         stdout_path:,
         stderr_path:,
-        chdir: @repo_root
+        chdir: @workdir
       )
       metadata["exit_status"] = exit_status
       metadata["status"] = exit_status.zero? ? "completed" : "failed"

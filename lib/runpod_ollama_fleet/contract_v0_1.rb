@@ -1,0 +1,125 @@
+# frozen_string_literal: true
+
+module RunpodOllamaFleet
+  module ContractV01
+    CAPABILITY_REQUEST_VERSION = "afio-rpof-capability-check-request/v0.1"
+    CAPABILITY_RESULT_VERSION = "afio-rpof-capability-check-result/v0.1"
+    DISPATCH_REQUEST_VERSION = "afio-rpof-dispatch-request/v0.1"
+    DISPATCH_SUMMARY_VERSION = "afio-rpof-dispatch-summary/v0.1"
+
+    FLEET_KEY = /\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z/
+    JOB_ID = /\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z/
+    ENV_KEY = /\A[A-Za-z_][A-Za-z0-9_]*\z/
+    DIGEST = /\A[0-9A-Fa-f]{64}\z/
+
+    class Error < StandardError; end
+
+    module_function
+
+    def validate_capability_request!(document)
+      object!(document, %w[contract_version fleet_key worker_selector requirements], [])
+      const!(document, "contract_version", CAPABILITY_REQUEST_VERSION)
+      string!(document, "fleet_key", pattern: FLEET_KEY, max: 64)
+
+      selector = document.fetch("worker_selector")
+      raise Error, "worker_selector must be an object" unless selector.is_a?(Hash)
+      case selector["mode"]
+      when "all"
+        object!(selector, %w[mode], [])
+      when "indices"
+        object!(selector, %w[mode indices], [])
+        positive_unique_integers!(selector.fetch("indices"), "worker_selector.indices")
+      else
+        raise Error, "worker_selector.mode must be all or indices"
+      end
+
+      requirements = document.fetch("requirements")
+      object!(requirements, %w[models required_context_length require_fully_gpu_resident], %w[required_gpu_id])
+      models = requirements.fetch("models")
+      raise Error, "requirements.models must be a non-empty array" unless models.is_a?(Array) && !models.empty?
+      models.each_with_index do |model, index|
+        object!(model, %w[name], %w[expected_digest])
+        string!(model, "name", max: 256)
+        if model.key?("expected_digest")
+          string!(model, "expected_digest", pattern: DIGEST, max: 64)
+        end
+      rescue Error => e
+        raise Error, "requirements.models[#{index}]: #{e.message}"
+      end
+      positive_integer!(requirements.fetch("required_context_length"), "requirements.required_context_length")
+      unless requirements.fetch("require_fully_gpu_resident") == true
+        raise Error, "requirements.require_fully_gpu_resident must be true"
+      end
+      string!(requirements, "required_gpu_id", max: 256) if requirements.key?("required_gpu_id")
+      document
+    end
+
+    def validate_dispatch_request!(document)
+      object!(document, %w[contract_version target group_by_affinity jobs], [])
+      const!(document, "contract_version", DISPATCH_REQUEST_VERSION)
+      target = document.fetch("target")
+      object!(target, %w[fleet_key expected_fleet_id worker_indices], [])
+      string!(target, "fleet_key", pattern: FLEET_KEY, max: 64)
+      string!(target, "expected_fleet_id", max: 256)
+      positive_unique_integers!(target.fetch("worker_indices"), "target.worker_indices")
+      unless [true, false].include?(document.fetch("group_by_affinity"))
+        raise Error, "group_by_affinity must be boolean"
+      end
+      jobs = document.fetch("jobs")
+      raise Error, "jobs must be a non-empty array" unless jobs.is_a?(Array) && !jobs.empty?
+      ids = {}
+      jobs.each_with_index do |job, index|
+        object!(job, %w[job_id argv], %w[env affinity])
+        string!(job, "job_id", pattern: JOB_ID, max: 128)
+        raise Error, "duplicate job_id #{job['job_id'].inspect}" if ids[job["job_id"]]
+        ids[job["job_id"]] = true
+        argv = job.fetch("argv")
+        unless argv.is_a?(Array) && !argv.empty? && argv.all? { |value| value.is_a?(String) && !value.include?("\0") }
+          raise Error, "jobs[#{index}].argv must be a non-empty string array without NUL bytes"
+        end
+        if job.key?("env")
+          env = job.fetch("env")
+          unless env.is_a?(Hash) && env.all? { |key, value| key.to_s.match?(ENV_KEY) && value.is_a?(String) }
+            raise Error, "jobs[#{index}].env must map environment-variable names to strings"
+          end
+        end
+        string!(job, "affinity", max: 256) if job.key?("affinity")
+      end
+      document
+    end
+
+    def object!(value, required, optional)
+      raise Error, "value must be an object" unless value.is_a?(Hash)
+      missing = required.reject { |key| value.key?(key) }
+      raise Error, "missing required field(s): #{missing.join(', ')}" unless missing.empty?
+      unknown = value.keys.map(&:to_s) - required - optional
+      raise Error, "unknown field(s): #{unknown.sort.join(', ')}" unless unknown.empty?
+    end
+
+    def const!(object, key, expected)
+      actual = object.fetch(key)
+      raise Error, "unsupported #{key} #{actual.inspect}; expected #{expected.inspect}" unless actual == expected
+    end
+
+    def string!(object, key, pattern: nil, max: nil)
+      value = object.fetch(key)
+      raise Error, "#{key} must be a non-empty string" unless value.is_a?(String) && !value.empty?
+      raise Error, "#{key} exceeds #{max} characters" if max && value.length > max
+      raise Error, "#{key} has invalid format" if pattern && !value.match?(pattern)
+      value
+    end
+
+    def positive_integer!(value, label)
+      raise Error, "#{label} must be a positive integer" unless value.is_a?(Integer) && value.positive?
+      value
+    end
+
+    def positive_unique_integers!(values, label)
+      unless values.is_a?(Array) && !values.empty? && values.all? { |value| value.is_a?(Integer) && value.positive? }
+        raise Error, "#{label} must be a non-empty array of positive integers"
+      end
+      raise Error, "#{label} must be unique" unless values.uniq.length == values.length
+      values
+    end
+  end
+end

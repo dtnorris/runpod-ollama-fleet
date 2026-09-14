@@ -27,6 +27,10 @@ module LocalModelEvaluation
     end
 
     def initialize(root:, repo_root:, fleet_key: DEFAULT_KEY, create: false, provisional: false, clock: nil)
+      migration_root = ENV["RPOF_STATE_ROOT"].to_s.strip
+      migration_repo_root = ENV["RPOF_STATE_REPO_ROOT"].to_s.strip
+      root = migration_root unless migration_root.empty?
+      repo_root = migration_repo_root unless migration_repo_root.empty?
       @root = File.expand_path(root)
       @repo_root = File.expand_path(repo_root)
       @fleet_key = self.class.normalize_key(fleet_key)

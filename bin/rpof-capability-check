@@ -1,0 +1,70 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "fileutils"
+require "json"
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "runpod_ollama_fleet"
+require "local_model_evaluation/runpod_fleet_namespace"
+require "local_model_evaluation/runpod_fleet_state"
+
+opts = { request: nil, output: nil }
+parser = OptionParser.new do |o|
+  o.banner = "Usage: bin/rpof capability-check --request FILE --output FILE"
+  o.on("--request FILE") { |v| opts[:request] = v }
+  o.on("--output FILE") { |v| opts[:output] = v }
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::MissingArgument, "--request" unless opts[:request]
+  raise OptionParser::MissingArgument, "--output" unless opts[:output]
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+  request = JSON.parse(File.read(File.expand_path(opts[:request])))
+  RunpodOllamaFleet::ContractV01.validate_capability_request!(request)
+rescue OptionParser::ParseError, JSON::ParserError, SystemCallError, RunpodOllamaFleet::ContractV01::Error => e
+  warn "ERROR: #{e.message}"
+  exit 2
+end
+
+begin
+  namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
+    root: File.join(ROOT, "output", "runpod-fleets"),
+    repo_root: ROOT,
+    fleet_key: request.fetch("fleet_key")
+  )
+  state = LocalModelEvaluation::RunpodFleetState.new(
+    root: namespace.state_root,
+    local_port_base: namespace.local_port_base
+  )
+  client = nil
+  unless ENV["RUNPOD_API_KEY"].to_s.empty?
+    client = LocalModelEvaluation::RunpodClient.new(
+      api_key: ENV.fetch("RUNPOD_API_KEY"),
+      base_url: ENV.fetch("RUNPOD_API_BASE_URL", LocalModelEvaluation::RunpodClient::DEFAULT_BASE_URL)
+    )
+  end
+  result = RunpodOllamaFleet::CapabilityCheck.new(
+    fleet_state: state,
+    fleet_key: request.fetch("fleet_key"),
+    client: client
+  ).check(request)
+rescue LocalModelEvaluation::RunpodFleetNamespace::Error => e
+  result = {
+    "contract_version" => RunpodOllamaFleet::ContractV01::CAPABILITY_RESULT_VERSION,
+    "ready" => false,
+    "fleet_key" => request.fetch("fleet_key"),
+    "fleet_id" => nil,
+    "selected_worker_indices" => [],
+    "capabilities" => nil,
+    "diagnostics" => [{ "code" => "fleet.active", "status" => "FAIL", "detail" => e.message }]
+  }
+end
+
+output = File.expand_path(opts.fetch(:output))
+FileUtils.mkdir_p(File.dirname(output)) if defined?(FileUtils)
+File.write(output, JSON.pretty_generate(result) + "\n")
+exit(result.fetch("ready") ? 0 : 1)

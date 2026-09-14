@@ -1,0 +1,58 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "runpod_ollama_fleet"
+require "local_model_evaluation/runpod_fleet_namespace"
+require "local_model_evaluation/runpod_fleet_state"
+
+opts = { request: nil, workdir: nil, output: nil }
+parser = OptionParser.new do |o|
+  o.banner = "Usage: bin/rpof dispatch --request FILE --workdir DIR --output DIR"
+  o.on("--request FILE") { |v| opts[:request] = v }
+  o.on("--workdir DIR") { |v| opts[:workdir] = v }
+  o.on("--output DIR") { |v| opts[:output] = v }
+end
+
+begin
+  parser.parse!(ARGV)
+  %i[request workdir output].each { |key| raise OptionParser::MissingArgument, "--#{key}" unless opts[key] }
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+  raise OptionParser::InvalidArgument, "workdir is not a directory" unless File.directory?(File.expand_path(opts[:workdir]))
+  request = JSON.parse(File.read(File.expand_path(opts[:request])))
+  RunpodOllamaFleet::ContractV01.validate_dispatch_request!(request)
+rescue OptionParser::ParseError, JSON::ParserError, SystemCallError, RunpodOllamaFleet::ContractV01::Error => e
+  warn "ERROR: #{e.message}"
+  exit 2
+end
+
+begin
+  target = request.fetch("target")
+  namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
+    root: File.join(ROOT, "output", "runpod-fleets"),
+    repo_root: ROOT,
+    fleet_key: target.fetch("fleet_key")
+  )
+  state = LocalModelEvaluation::RunpodFleetState.new(
+    root: namespace.state_root,
+    local_port_base: namespace.local_port_base
+  )
+  summary = RunpodOllamaFleet::DispatchV01.new(
+    fleet_state: state,
+    fleet_key: target.fetch("fleet_key"),
+    workdir: opts.fetch(:workdir),
+    output_dir: opts.fetch(:output),
+    provider_repo_root: namespace.repo_root
+  ).run(request)
+  puts "Dispatch #{summary.fetch('status')}: #{summary.fetch('completed_count')} completed, #{summary.fetch('failed_count')} failed, #{summary.fetch('not_started_count')} not started."
+  exit(summary.fetch("status") == "completed" ? 0 : 1)
+rescue LocalModelEvaluation::RunpodFleetNamespace::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+rescue Interrupt
+  exit 130
+end

@@ -12,6 +12,10 @@ when "version"
   $LOAD_PATH.unshift File.join(ROOT, "lib")
   require "runpod_ollama_fleet/version"
   puts RunpodOllamaFleet::VERSION
+when "capability-check"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-capability-check"), *ARGV
+when "dispatch"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-dispatch"), *ARGV
 when "create"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-fleet"), "create", *ARGV
 when "destroy"
@@ -36,6 +40,8 @@ else
 
     Step-4 extracted commands:
       version
+      capability-check
+      dispatch
       create
       destroy
       bootstrap
