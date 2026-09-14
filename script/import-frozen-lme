@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SOURCE_REPO="${LME_SOURCE_REPO:-/Users/davidnorris/code/local-model-eval}"
+DEFAULT_SOURCE_REPO="$(cd "$ROOT/.." && pwd)/af-inference-orchestrator"
+SOURCE_REPO="${LME_SOURCE_REPO:-$DEFAULT_SOURCE_REPO}"
 SOURCE_SHA="2e34ccfdf0a6e4f6de97ddea8c1876fe489ba839"
 MANIFEST="$ROOT/SOURCE_IMPORT_MANIFEST.txt"
 

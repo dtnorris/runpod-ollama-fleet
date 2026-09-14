@@ -38,7 +38,7 @@ else
   warn <<~USAGE
     Usage: bin/rpof COMMAND [options]
 
-    Step-4 extracted commands:
+    Commands:
       version
       capability-check
       dispatch
@@ -52,8 +52,9 @@ else
       status
       tunnels
 
-    The frozen AFIO-facing capability-check + dispatch JSON interface is wired in
-    the bridge step after this extracted provider suite is green.
+    capability-check + dispatch implement the frozen AFIO-facing v0.1 JSON
+    interface. dispatch-legacy and the lme-runpod helper names remain
+    compatibility surfaces.
   USAGE
   exit(command ? 2 : 0)
 end

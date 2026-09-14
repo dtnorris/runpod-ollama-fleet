@@ -1,29 +1,36 @@
-# runpod-ollama-fleet — Step 4 extraction seed
+# runpod-ollama-fleet (RPOF)
 
-This seed creates the new **RPOF (`runpod-ollama-fleet`)** repository without changing the active `local-model-eval` RunPod path yet.
+**RPOF (`runpod-ollama-fleet`)** is AdventureFinder's current/default supporting
+infrastructure for optional RunPod/Ollama remote compute. It owns provider mechanics,
+fleet lifecycle/state, readiness, leases/cost safety, bootstrap/tunnels, worker
+replacement/scaling, and generic remote dispatch. AdventureFinder inference intent,
+qualification, production-workload semantics, and result interpretation remain in
+**AFIO (`af-inference-orchestrator`)**.
 
-It is intentionally a behavior-preserving extraction from the frozen pre-refactor baseline:
+The AFIO ↔ RPOF boundary is CLI + versioned machine-readable files. The frozen v0.1
+interface is defined by the AdventureFinder architecture contracts.
 
-- source repository: `local-model-eval`
+## Historical extraction provenance
+
+RPOF was seeded by a behavior-preserving extraction from the frozen pre-refactor
+`local-model-eval` baseline:
+
+- historical source repository: `local-model-eval`
 - source commit: `2e34ccfdf0a6e4f6de97ddea8c1876fe489ba839`
 - architectural contract owner: `adventure-finder`
 - split contract: `docs/LOCAL_MODEL_EVAL_SPLIT_CONTRACT_v0.1.md`
 - AFIO ↔ RPOF interface: `docs/AFIO_RPOF_INTERFACE_v0.1.md`
 
-## Step-4 scope
+The extracted Ruby implementation intentionally retains the historical
+`LocalModelEvaluation` namespace and `lme-runpod-*` helper names as compatibility
+surfaces. They are not the current repository identity.
 
-This seed imports only the provider-control-plane implementation and deterministic tests assigned to RPOF by the frozen split contract. It deliberately does **not** import AdventureFinder experiment, qualification, backlog, scoring, or result-interpretation code.
+## Reproduce the frozen extraction
 
-The copied Ruby implementation keeps the historical `LocalModelEvaluation` namespace and `lme-runpod-*` helper names for migration compatibility. Those names are compatibility surface, not the target architecture.
-
-The active LME operator workflow is **not switched over by this seed**. That cutover is the next bridge step, after this extracted suite is green. This avoids a flag-day change and avoids using paid RunPod calls as a debugging technique.
-
-## Seed an empty repository
-
-From an empty checkout at `/Users/davidnorris/code/runpod-ollama-fleet`:
+The historical extraction can still be reproduced from the renamed AFIO checkout,
+which retains the predecessor Git history and frozen source commit:
 
 ```bash
-unzip ~/Downloads/runpod-ollama-fleet-step4-seed-v0.1.zip -d /Users/davidnorris/code/runpod-ollama-fleet
 cd /Users/davidnorris/code/runpod-ollama-fleet
 ./script/import-frozen-lme
 ./script/verify-frozen-import
@@ -31,13 +38,18 @@ bundle install
 bundle exec rake test
 ```
 
-The importer reads the exact frozen Git objects from the existing local checkout at `/Users/davidnorris/code/local-model-eval`. Override that only when necessary with `LME_SOURCE_REPO=/path/to/local-model-eval`.
+By default the importer reads the exact frozen Git objects from the sibling
+`af-inference-orchestrator` checkout. Override that only when necessary with
+`LME_SOURCE_REPO=/path/to/source-checkout`. The `LME_SOURCE_REPO` name is retained
+as a migration-compatibility identifier.
 
-## Transitional operator entry point
+## Operator entry point
 
-`bin/rpof` exposes the extracted helper families without claiming the AFIO-facing v0.1 bridge is already complete:
+`bin/rpof` exposes the current interface and retained compatibility helper families:
 
 ```text
+bin/rpof capability-check ...
+bin/rpof dispatch ...
 bin/rpof create ...
 bin/rpof destroy ...
 bin/rpof bootstrap ...
@@ -49,7 +61,9 @@ bin/rpof status ...
 bin/rpof tunnels ...
 ```
 
-`dispatch-legacy` is intentionally named as such because the frozen AFIO-facing `capability-check` + `dispatch` JSON contract belongs to the bridge step, not this extraction seed.
+`capability-check` + `dispatch` are the frozen AFIO-facing v0.1 JSON interface.
+`dispatch-legacy` and the `lme-runpod-*` executable names remain compatibility
+surfaces for pre-split workflows.
 
 ## Safety
 
