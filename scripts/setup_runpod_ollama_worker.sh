@@ -6,8 +6,9 @@ set -euo pipefail
 # Design goals:
 # - do not provision or destroy RunPod resources;
 # - pull model weights on the fast local/root disk;
-# - copy completed Ollama stores to /workspace one model at a time;
-# - serve inference from /workspace at the requested context length;
+# - optionally keep a single-model bootstrap on root instead of copying to /workspace;
+# - otherwise copy completed Ollama stores to /workspace one model at a time;
+# - serve inference from the selected final store at the requested context length;
 # - verify model digest, full GPU residency, and context before declaring success;
 # - emit incremental console feedback for every long-running step.
 
@@ -21,6 +22,7 @@ MIN_VRAM_GB=40
 EXPECTED_GPU_NAME=""
 CLEAN=0
 REUSE_EXISTING=0
+KEEP_ROOT_MODELS=0
 MODELS=()
 declare -A EXPECTED_DIGESTS=()
 declare -A FINAL_DIGESTS=()
@@ -50,6 +52,7 @@ Options:
   --expect-digest MODEL=DIGEST  Fail unless the requested model has this full digest. Repeatable.
   --clean                       Delete both staging and shared Ollama stores before setup.
   --reuse-existing              Reuse /workspace cache only; never pull, stage, or rsync model data.
+  --keep-root-models            Keep one pulled model in root storage and serve it there; skip rsync.
   -h, --help                    Show this help.
 
 Example for the first automated worker-2 validation:
@@ -101,6 +104,8 @@ while (($#)); do
       CLEAN=1; shift ;;
     --reuse-existing)
       REUSE_EXISTING=1; shift ;;
+    --keep-root-models)
+      KEEP_ROOT_MODELS=1; shift ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -113,6 +118,12 @@ done
 [[ "$MIN_VRAM_GB" =~ ^[0-9]+$ ]] || die "--min-vram-gb must be an integer"
 if [[ $REUSE_EXISTING -eq 1 && $CLEAN -eq 1 ]]; then
   die "--clean cannot be combined with --reuse-existing"
+fi
+if [[ $REUSE_EXISTING -eq 1 && $KEEP_ROOT_MODELS -eq 1 ]]; then
+  die "--keep-root-models cannot be combined with --reuse-existing"
+fi
+if [[ $KEEP_ROOT_MODELS -eq 1 && ${#MODELS[@]} -ne 1 ]]; then
+  die "--keep-root-models requires exactly one --model"
 fi
 if [[ $REUSE_EXISTING -eq 1 ]]; then
   for model in "${MODELS[@]}"; do
@@ -221,7 +232,7 @@ df -h / /workspace > "$STATE_DIR/disk-preflight.txt" 2>&1 || true
 cat "$STATE_DIR/disk-preflight.txt"
 
 missing_packages=()
-if [[ $REUSE_EXISTING -eq 0 ]]; then
+if [[ $REUSE_EXISTING -eq 0 && $KEEP_ROOT_MODELS -eq 0 ]]; then
   command -v rsync >/dev/null 2>&1 || missing_packages+=(rsync)
 fi
 command -v jq >/dev/null 2>&1 || missing_packages+=(jq)
@@ -261,7 +272,11 @@ if [[ $REUSE_EXISTING -eq 1 ]]; then
   step "Reuse existing workspace model cache without pull or copy"
   info "Skipping staging, ollama pull, and rsync. Exact cached digests will be validated from the workspace-backed server."
 else
-  step "Stage requested models on fast local disk and copy them to workspace"
+  if [[ $KEEP_ROOT_MODELS -eq 1 ]]; then
+    step "Pull requested model to fast local/root store and keep it there"
+  else
+    step "Stage requested models on fast local disk and copy them to workspace"
+  fi
   for model in "${MODELS[@]}"; do
     safe="${model//[^A-Za-z0-9._-]/_}"
     printf '\n[%s] ---- Model: %s ----\n' "$(ts)" "$model"
@@ -285,27 +300,42 @@ else
       die "digest mismatch for $model: expected $expected, got $digest"
     fi
 
-    stop_ollama
-    info "Copying completed Ollama store into $SHARED_DIR. rsync progress follows."
-    if ! rsync -ah --info=progress2 "$STAGING_DIR/" "$SHARED_DIR/"; then
-      die "rsync to $SHARED_DIR failed (a RunPod workspace quota may have been reached)"
+    if [[ $KEEP_ROOT_MODELS -eq 1 ]]; then
+      info "Keeping completed Ollama store on fast local/root disk: $STAGING_DIR"
+      info "Root model store now uses: $(du -sh "$STAGING_DIR" | awk '{print $1}')"
+    else
+      stop_ollama
+      info "Copying completed Ollama store into $SHARED_DIR. rsync progress follows."
+      if ! rsync -ah --info=progress2 "$STAGING_DIR/" "$SHARED_DIR/"; then
+        die "rsync to $SHARED_DIR failed (a RunPod workspace quota may have been reached)"
+      fi
+      info "Copy complete. Shared store now uses: $(du -sh "$SHARED_DIR" | awk '{print $1}')"
+      info "Removing local staging copy to recover root-disk space."
+      rm -rf "$STAGING_DIR"
+      mkdir -p "$STAGING_DIR"
     fi
-    info "Copy complete. Shared store now uses: $(du -sh "$SHARED_DIR" | awk '{print $1}')"
-    info "Removing local staging copy to recover root-disk space."
-    rm -rf "$STAGING_DIR"
-    mkdir -p "$STAGING_DIR"
   done
 fi
 
-step "Start final workspace-backed Ollama server"
-start_ollama "$SHARED_DIR" "workspace"
+if [[ $KEEP_ROOT_MODELS -eq 1 ]]; then
+  FINAL_MODEL_STORE="$STAGING_DIR"
+  FINAL_SERVER_LABEL="root"
+  MODEL_STORE_MODE="root"
+else
+  FINAL_MODEL_STORE="$SHARED_DIR"
+  FINAL_SERVER_LABEL="workspace"
+  MODEL_STORE_MODE="workspace"
+fi
+
+step "Start final ${MODEL_STORE_MODE}-backed Ollama server"
+start_ollama "$FINAL_MODEL_STORE" "$FINAL_SERVER_LABEL"
 curl -fsS "$CLIENT_URL/api/tags" | jq . > "$STATE_DIR/api-tags-final.json"
 OLLAMA_HOST="$CLIENT_URL" ollama list | tee "$STATE_DIR/ollama-list-final.txt"
 
 step "Verify requested model digests from the final server"
 for model in "${MODELS[@]}"; do
   digest="$(model_digest "$model")"
-  [[ -n "$digest" && "$digest" != "null" ]] || die "$model is not visible from final workspace server"
+  [[ -n "$digest" && "$digest" != "null" ]] || die "$model is not visible from final $MODEL_STORE_MODE server"
   expected="${EXPECTED_DIGESTS[$model]:-}"
   info "$model digest: $digest"
   FINAL_DIGESTS["$model"]="$digest"
@@ -350,9 +380,12 @@ step "Write durable worker evidence"
   echo "gpu=$GPU_NAME"
   echo "gpu_vram_mib=$GPU_VRAM_MIB"
   echo "context_length=$CONTEXT_LENGTH"
+  echo "model_store_mode=$MODEL_STORE_MODE"
+  echo "final_model_store=$FINAL_MODEL_STORE"
   echo "shared_model_store=$SHARED_DIR"
   echo "server_url=$CLIENT_URL"
   echo "reuse_existing=$REUSE_EXISTING"
+  echo "keep_root_models=$KEEP_ROOT_MODELS"
   echo "models=${MODELS[*]}"
 } > "$STATE_DIR/worker-summary.txt"
 
@@ -365,9 +398,9 @@ for model in "${MODELS[@]}"; do
 done
 
 info "Worker setup PASS."
-info "Ollama is serving from $SHARED_DIR on $CLIENT_URL."
+info "Ollama is serving from $FINAL_MODEL_STORE on $CLIENT_URL."
 info "Evidence directory: $STATE_DIR"
-info "Server log: $STATE_DIR/ollama-workspace.log"
+info "Server log: $STATE_DIR/ollama-${FINAL_SERVER_LABEL}.log"
 info "Leave this pod running; use the Mac tunnel helper to expose it to LME."
 
 FINAL_SERVER_READY=1
