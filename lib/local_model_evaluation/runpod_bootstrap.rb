@@ -31,7 +31,7 @@ module LocalModelEvaluation
     end
 
     def run(worker_indices:, models:, expected_digests: [], clean: false, reuse_existing: false,
-            keep_root_models: false, context: nil, heartbeat_seconds: DEFAULT_HEARTBEAT_SECONDS,
+            keep_root_models: false, context: nil, state_root: nil, heartbeat_seconds: DEFAULT_HEARTBEAT_SECONDS,
             poll_seconds: DEFAULT_POLL_SECONDS)
       fleet = active_fleet!
       workers = selected_workers(fleet, worker_indices)
@@ -47,6 +47,17 @@ module LocalModelEvaluation
       end
       if keep_root_models && models.length != 1
         raise Error, "--keep-root-models requires exactly one model"
+      end
+
+      if state_root && !state_root.to_s.start_with?("/")
+        raise Error, "--state-root must be an absolute remote path"
+      end
+      if fleet.dig("provisioning", "network_volume_id")
+        raise Error, "network-volume bootstrap requires --reuse-existing" unless reuse_existing
+        remote_state = File.expand_path(state_root || "/workspace/lme-worker-state")
+        if remote_state == "/workspace" || remote_state.start_with?("/workspace/")
+          raise Error, "network-volume bootstrap requires --state-root outside /workspace (e.g. /root/lme-worker-state)"
+        end
       end
 
       heartbeat_seconds = positive_float(heartbeat_seconds, "heartbeat seconds")
@@ -65,6 +76,7 @@ module LocalModelEvaluation
           clean:,
           reuse_existing:,
           keep_root_models:,
+          state_root:,
           context:,
           heartbeat_seconds:,
           poll_seconds:,
@@ -78,7 +90,7 @@ module LocalModelEvaluation
     private
 
     def execute_run(fleet:, workers:, models:, digests:, expected_gpu:, clean:, reuse_existing:,
-                    keep_root_models:, context:, heartbeat_seconds:, poll_seconds:, bootstrap_root:)
+                    keep_root_models:, state_root:, context:, heartbeat_seconds:, poll_seconds:, bootstrap_root:)
       started_wall = utc_now
       started_mono = @monotonic_clock.call
       run_id = build_run_id(started_wall)
@@ -93,6 +105,7 @@ module LocalModelEvaluation
         clean:,
         reuse_existing:,
         keep_root_models:,
+        state_root:,
         context:,
         heartbeat_seconds:,
         started_wall:,
@@ -112,6 +125,7 @@ module LocalModelEvaluation
             clean:,
             reuse_existing:,
             keep_root_models:,
+            state_root:,
             context:,
             run_dir:
           )
@@ -297,7 +311,7 @@ module LocalModelEvaluation
     end
 
     def spawn_worker(worker:, models:, digests:, expected_gpu:, clean:, reuse_existing:, keep_root_models:,
-                     context:, run_dir:)
+                     context:, state_root:, run_dir:)
       index = worker.fetch("index")
       command = [@remote_setup_path, "--worker", index.to_s]
       command.concat(["--expect-gpu", expected_gpu])
@@ -305,6 +319,7 @@ module LocalModelEvaluation
       command << "--clean" if clean
       command << "--reuse-existing" if reuse_existing
       command << "--keep-root-models" if keep_root_models
+      command.concat(["--state-root", state_root]) if state_root
       models.each do |model|
         command.concat(["--model", model])
         command.concat(["--expect-digest", "#{model}=#{digests.fetch(model)}"])
@@ -521,7 +536,7 @@ module LocalModelEvaluation
     end
 
     def initial_record(fleet:, workers:, models:, digests:, expected_gpu:, clean:, reuse_existing:,
-                       keep_root_models:, context:, heartbeat_seconds:, started_wall:, run_id:)
+                       keep_root_models:, state_root:, context:, heartbeat_seconds:, started_wall:, run_id:)
       {
         "schema_version" => 2,
         "bootstrap_run_id" => run_id,
@@ -535,6 +550,7 @@ module LocalModelEvaluation
         "clean" => clean,
         "reuse_existing" => reuse_existing,
         "keep_root_models" => keep_root_models,
+        "state_root" => state_root || "/workspace/lme-worker-state",
         "context" => context,
         "heartbeat_seconds" => heartbeat_seconds,
         "fleet_hourly_rate_usd" => fleet.fetch("fleet_hourly_rate_usd"),

@@ -25,6 +25,8 @@ opts = {
   reuse_existing: false,
   keep_root_models: false,
   context: nil,
+  state_root: nil,
+  fleet_key: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY),
   heartbeat_seconds: ENV.fetch(
     "LME_RUNPOD_BOOTSTRAP_HEARTBEAT_SECONDS",
     LocalModelEvaluation::RunpodBootstrap::DEFAULT_HEARTBEAT_SECONDS
@@ -39,6 +41,8 @@ parser = OptionParser.new do |o|
   o.on("--clean", "Delete staging/shared Ollama stores before bootstrap") { opts[:clean] = true }
   o.on("--reuse-existing", "Reuse and validate the existing /workspace Ollama cache; never pull or copy models") { opts[:reuse_existing] = true }
   o.on("--keep-root-models", "Pull one model to fast root storage and serve it there; skip the /workspace copy") { opts[:keep_root_models] = true }
+  o.on("--fleet KEY", "Select the managed fleet") { |v| opts[:fleet_key] = v }
+  o.on("--state-root PATH", "Remote worker evidence root (default: /workspace/lme-worker-state)") { |v| opts[:state_root] = v }
   o.on("--context N", Integer, "Ollama context length; remote default is 131072") { |v| opts[:context] = v }
   o.on("--heartbeat-seconds N", Float, "Fleet heartbeat interval (default: 10)") { |v| opts[:heartbeat_seconds] = v }
 end
@@ -67,8 +71,9 @@ begin
   namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
     root: File.join(ROOT, "output", "runpod-fleets"),
     repo_root: ROOT,
-    fleet_key: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY)
+    fleet_key: opts[:fleet_key]
   )
+  ENV["LME_RUNPOD_FLEET"] = namespace.fleet_key
   state = LocalModelEvaluation::RunpodFleetState.new(
     root: namespace.state_root,
     local_port_base: namespace.local_port_base
@@ -86,6 +91,7 @@ begin
     reuse_existing: opts[:reuse_existing],
     keep_root_models: opts[:keep_root_models],
     context: opts[:context],
+    state_root: opts[:state_root],
     heartbeat_seconds: opts[:heartbeat_seconds]
   )
 rescue Interrupt

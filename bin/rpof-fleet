@@ -73,7 +73,7 @@ def create_options(argv)
     workers: nil, cloud: LocalModelEvaluation::RunpodFleet::DEFAULT_CLOUD,
     gpu_id: LocalModelEvaluation::RunpodFleet::GPU_ID,
     container_disk_gb: LocalModelEvaluation::RunpodFleet::DEFAULT_CONTAINER_DISK_GB,
-    volume_gb: LocalModelEvaluation::RunpodFleet::DEFAULT_VOLUME_GB,
+    volume_gb: nil, network_volume_id: nil,
     max_runtime_seconds: nil, max_spend_usd: nil, dry_run: false, yes: false,
     max_hourly_usd: ENV.fetch("RUNPOD_MAX_FLEET_HOURLY_USD", LocalModelEvaluation::RunpodFleet::DEFAULT_MAX_FLEET_HOURLY_USD),
     max_total_hourly_usd: ENV.fetch("RUNPOD_MAX_TOTAL_HOURLY_USD", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_MAX_TOTAL_HOURLY_USD),
@@ -86,6 +86,7 @@ def create_options(argv)
     o.on("--cloud TIER") { |v| opts[:cloud] = v }
     o.on("--gpu GPU_ID") { |v| opts[:gpu_id] = v }
     o.on("--container-disk-gb N", Integer) { |v| opts[:container_disk_gb] = v }
+    o.on("--network-volume-id ID", "Attach an existing network volume at /workspace on every worker") { |v| opts[:network_volume_id] = v }
     o.on("--volume-gb N", Integer) { |v| opts[:volume_gb] = v }
     o.on("--max-runtime-minutes MINUTES", Float) { |v| opts[:max_runtime_seconds] = v * 60.0 }
     o.on("--max-spend-usd USD", Float) { |v| opts[:max_spend_usd] = v }
@@ -97,6 +98,7 @@ def create_options(argv)
     o.on("--wait-seconds N", Integer) { |v| opts[:wait_seconds] = v }
     o.on("--poll-seconds N", Float) { |v| opts[:poll_seconds] = v }
   end.parse!(argv)
+  abort "--network-volume-id cannot be combined with --volume-gb" if opts[:network_volume_id] && opts[:volume_gb]
   abort "Usage: bin/rpof create --workers N [--dry-run|--yes]" unless opts[:workers]
   opts
 end
@@ -156,6 +158,7 @@ when "create"
     preflight = fleet.preflight(
       worker_count: opts[:workers], cloud: opts[:cloud], max_fleet_hourly_usd: opts[:max_hourly_usd],
       container_disk_gb: opts[:container_disk_gb], volume_gb: opts[:volume_gb],
+      network_volume_id: opts[:network_volume_id],
       max_runtime_seconds: opts[:max_runtime_seconds], max_spend_usd: opts[:max_spend_usd]
     )
     ssh_public_key = fleet.read_ssh_public_key(opts[:ssh_public_key])
@@ -176,7 +179,14 @@ when "create"
     puts "  Availability: #{preflight.availability}"
     puts "  Workers: #{preflight.worker_count}"
     puts "  Container disk: #{preflight.container_disk_gb} GB"
-    puts "  Workspace volume: #{preflight.volume_gb} GB at #{LocalModelEvaluation::RunpodFleet::VOLUME_MOUNT_PATH}"
+    if preflight.network_volume_id
+      puts "  Existing network volume: #{preflight.network_volume_id} at #{LocalModelEvaluation::RunpodFleet::VOLUME_MOUNT_PATH} on every worker"
+      puts "  No fresh per-pod workspace volume will be created."
+      puts "  Bootstrap shared models with --reuse-existing --state-root /root/lme-worker-state."
+      puts "  GPU catalog availability is not specific to the network volume's data center."
+    else
+      puts "  Workspace volume: #{preflight.volume_gb} GB at #{LocalModelEvaluation::RunpodFleet::VOLUME_MOUNT_PATH}"
+    end
     puts format("  Catalog rate: $%.4f/hr per worker", preflight.hourly_rate)
     puts format("  Projected fleet rate: $%.4f/hr", preflight.fleet_hourly_rate)
     puts format("  Projected 10-minute cost: $%.4f", preflight.fleet_hourly_rate / 6.0)
@@ -205,7 +215,7 @@ when "create"
     workers = fleet.create(
       worker_count: opts[:workers], cloud: opts[:cloud], ssh_public_key:, preflight:,
       max_fleet_hourly_usd: opts[:max_hourly_usd], container_disk_gb: opts[:container_disk_gb],
-      volume_gb: opts[:volume_gb], max_runtime_seconds: opts[:max_runtime_seconds],
+      volume_gb: opts[:volume_gb], network_volume_id: opts[:network_volume_id], max_runtime_seconds: opts[:max_runtime_seconds],
       max_spend_usd: opts[:max_spend_usd], wait_seconds: opts[:wait_seconds], poll_seconds: opts[:poll_seconds]
     )
     start_lease_watchdog!(namespace:, fleet:, workers:)

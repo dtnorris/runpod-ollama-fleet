@@ -184,7 +184,13 @@ start_ollama() {
   local label="$2"
   local log="$STATE_DIR/ollama-${label}.log"
   stop_ollama
-  mkdir -p "$store"
+  if [[ $REUSE_EXISTING -eq 1 ]]; then
+    [[ -d "$store/blobs" && -d "$store/manifests" ]] || die "existing Ollama store is incomplete: $store"
+    # Serving a shared cache must not prune another worker's model data.
+    export OLLAMA_NOPRUNE=1
+  else
+    mkdir -p "$store"
+  fi
   info "Starting Ollama with model store: $store"
   info "Context length: $CONTEXT_LENGTH"
   OLLAMA_MODELS="$store" \
@@ -216,16 +222,47 @@ command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is required"
 
 GPU_LINE="$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits | head -n 1)"
 GPU_NAME="${GPU_LINE%,*}"
-GPU_VRAM_MIB="${GPU_LINE##*,}"
-GPU_VRAM_MIB="${GPU_VRAM_MIB// /}"
+GPU_VRAM_RAW="${GPU_LINE##*,}"
+GPU_VRAM_RAW="${GPU_VRAM_RAW// /}"
+GPU_PROVENANCE_NAME="$GPU_NAME"
+EXPECTED_GPU_BASE="$EXPECTED_GPU_NAME"
+EXPECTED_MIG_PROFILE=""
+
+if [[ "$EXPECTED_GPU_NAME" =~ ^(.+)\ MIG\ ([^[:space:]]+)$ ]]; then
+  EXPECTED_GPU_BASE="${BASH_REMATCH[1]}"
+  EXPECTED_MIG_PROFILE="${BASH_REMATCH[2]}"
+fi
+
+if [[ -n "$EXPECTED_GPU_NAME" && "$GPU_NAME" != "$EXPECTED_GPU_BASE" ]]; then
+  die "GPU mismatch: expected physical GPU '$EXPECTED_GPU_BASE', got '$GPU_NAME'"
+fi
+
+if [[ -n "$EXPECTED_MIG_PROFILE" ]]; then
+  MIG_LAYOUT="$(nvidia-smi -L)"
+  printf '%s\n' "$MIG_LAYOUT" > "$STATE_DIR/nvidia-smi-l.txt"
+  grep -Fq "MIG $EXPECTED_MIG_PROFILE" <<<"$MIG_LAYOUT" || \
+    die "MIG profile mismatch: expected '$EXPECTED_MIG_PROFILE'"
+  GPU_PROVENANCE_NAME="$EXPECTED_GPU_NAME"
+
+  GPU_VRAM_MIB="$(
+    nvidia-smi |
+      sed -nE '/MIG devices:/,$ s/.*[0-9]+MiB \/[[:space:]]*([0-9]+)MiB.*/\1/p' |
+      head -n 1
+  )"
+  [[ "$GPU_VRAM_MIB" =~ ^[0-9]+$ ]] || \
+    die "could not determine MIG slice VRAM from nvidia-smi"
+  info "MIG profile detected: $EXPECTED_MIG_PROFILE (${GPU_VRAM_MIB} MiB VRAM)"
+elif [[ "$GPU_VRAM_RAW" =~ ^[0-9]+$ ]]; then
+  GPU_VRAM_MIB="$GPU_VRAM_RAW"
+else
+  die "GPU VRAM query did not return a numeric value: $GPU_VRAM_RAW"
+fi
+
 MIN_VRAM_MIB=$((MIN_VRAM_GB * 1024))
 VRAM_REPORTING_TOLERANCE_MIB=64
-info "GPU detected: $GPU_NAME (${GPU_VRAM_MIB} MiB VRAM)"
+info "GPU detected: $GPU_NAME (${GPU_VRAM_MIB} MiB usable VRAM)"
 ((GPU_VRAM_MIB + VRAM_REPORTING_TOLERANCE_MIB >= MIN_VRAM_MIB)) || \
   die "GPU has less than required ${MIN_VRAM_GB} GiB VRAM (allowing ${VRAM_REPORTING_TOLERANCE_MIB} MiB reporting tolerance)"
-if [[ -n "$EXPECTED_GPU_NAME" && "$GPU_NAME" != "$EXPECTED_GPU_NAME" ]]; then
-  die "GPU mismatch: expected '$EXPECTED_GPU_NAME', got '$GPU_NAME'"
-fi
 
 nvidia-smi > "$STATE_DIR/nvidia-smi-preflight.txt"
 df -h / /workspace > "$STATE_DIR/disk-preflight.txt" 2>&1 || true
@@ -348,8 +385,15 @@ step "Warm each model and verify context plus full GPU residency"
 for model in "${MODELS[@]}"; do
   safe="${model//[^A-Za-z0-9._-]/_}"
   info "Preloading $model into VRAM without generating a response."
-  OLLAMA_HOST="$CLIENT_URL" ollama run "$model" "" </dev/null \
-    2>&1 | tee "$STATE_DIR/warmup-${safe}.log"
+  if [[ $REUSE_EXISTING -eq 1 ]]; then
+    # The CLI can pull on a missing model; the generate API fails instead.
+    curl -fsS "$CLIENT_URL/api/generate" -H 'Content-Type: application/json' \
+      -d "$(jq -nc --arg model "$model" '{model: $model, prompt: "", stream: false}')" \
+      | tee "$STATE_DIR/warmup-${safe}.log"
+  else
+    OLLAMA_HOST="$CLIENT_URL" ollama run "$model" "" </dev/null \
+      2>&1 | tee "$STATE_DIR/warmup-${safe}.log"
+  fi
 
   OLLAMA_HOST="$CLIENT_URL" ollama ps | tee "$STATE_DIR/ollama-ps-${safe}.txt"
   curl -fsS "$CLIENT_URL/api/ps" | jq . > "$STATE_DIR/api-ps-${safe}.json"
@@ -377,7 +421,9 @@ done
 step "Write durable worker evidence"
 {
   echo "timestamp_utc=$STAMP"
-  echo "gpu=$GPU_NAME"
+  echo "gpu=$GPU_PROVENANCE_NAME"
+  echo "gpu_physical_name=$GPU_NAME"
+  echo "gpu_mig_profile=$EXPECTED_MIG_PROFILE"
   echo "gpu_vram_mib=$GPU_VRAM_MIB"
   echo "context_length=$CONTEXT_LENGTH"
   echo "model_store_mode=$MODEL_STORE_MODE"
@@ -390,7 +436,7 @@ step "Write durable worker evidence"
 } > "$STATE_DIR/worker-summary.txt"
 
 info "Emitting machine-readable model/GPU provenance."
-printf '[%s] LME_PROVENANCE_GPU\t%s\t%s\n' "$(ts)" "$GPU_NAME" "$GPU_VRAM_MIB"
+printf '[%s] LME_PROVENANCE_GPU\t%s\t%s\n' "$(ts)" "$GPU_PROVENANCE_NAME" "$GPU_VRAM_MIB"
 for model in "${MODELS[@]}"; do
   printf '[%s] LME_PROVENANCE_MODEL\t%s\t%s\t%s\t%s\t%s\n' \
     "$(ts)" "$model" "${FINAL_DIGESTS[$model]}" \

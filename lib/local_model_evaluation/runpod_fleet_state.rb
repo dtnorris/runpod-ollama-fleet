@@ -443,10 +443,19 @@ module LocalModelEvaluation
       return nil if value.nil?
       raise Error, "provisioning metadata must be a hash" unless value.is_a?(Hash)
       data = value.transform_keys(&:to_s)
-      {
-        "container_disk_gb" => positive_integer(data.fetch("container_disk_gb"), "provisioning container_disk_gb"),
-        "volume_gb" => positive_integer(data.fetch("volume_gb"), "provisioning volume_gb")
-      }
+      disk = positive_integer(data.fetch("container_disk_gb"), "provisioning container_disk_gb")
+      if data["network_volume_id"]
+        id = data.fetch("network_volume_id").to_s
+        raise Error, "invalid provisioning network_volume_id" unless id.match?(/\A[A-Za-z0-9_-]+\z/)
+        raise Error, "network volume conflicts with provisioning volume_gb" unless data["volume_gb"].nil?
+        raise Error, "network volume must mount at /workspace" unless data["volume_mount_path"] == "/workspace"
+
+        { "container_disk_gb" => disk, "volume_gb" => nil,
+          "network_volume_id" => id, "volume_mount_path" => "/workspace" }
+      else
+        { "container_disk_gb" => disk,
+          "volume_gb" => positive_integer(data.fetch("volume_gb"), "provisioning volume_gb") }
+      end
     rescue KeyError => e
       raise Error, "invalid provisioning metadata: #{e.message}"
     end

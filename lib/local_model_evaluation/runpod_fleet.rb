@@ -37,6 +37,7 @@ module LocalModelEvaluation
       :max_fleet_hourly_rate,
       :container_disk_gb,
       :volume_gb,
+      :network_volume_id,
       :max_runtime_seconds,
       :max_spend_usd,
       keyword_init: true
@@ -148,12 +149,12 @@ module LocalModelEvaluation
     end
 
     def preflight(worker_count:, cloud: DEFAULT_CLOUD, max_fleet_hourly_usd: DEFAULT_MAX_FLEET_HOURLY_USD,
-                  container_disk_gb: DEFAULT_CONTAINER_DISK_GB, volume_gb: DEFAULT_VOLUME_GB,
+                  container_disk_gb: DEFAULT_CONTAINER_DISK_GB, volume_gb: nil, network_volume_id: nil,
                   max_runtime_seconds: nil, max_spend_usd: nil)
       worker_count = validate_worker_count(worker_count)
       cloud = normalize_cloud(cloud)
       container_disk_gb = positive_integer(container_disk_gb, "container disk size")
-      volume_gb = positive_integer(volume_gb, "workspace volume size")
+      volume_gb, network_volume_id = normalize_workspace_storage(volume_gb, network_volume_id)
       max_runtime_seconds = optional_positive_float(max_runtime_seconds, "max runtime")
       max_spend_usd = optional_positive_float(max_spend_usd, "max spend")
       with_fleet_state { @fleet_state.assert_no_active! }
@@ -193,6 +194,7 @@ module LocalModelEvaluation
         max_fleet_hourly_rate: max_fleet_hourly_usd,
         container_disk_gb:,
         volume_gb:,
+        network_volume_id:,
         max_runtime_seconds:,
         max_spend_usd:
       )
@@ -216,18 +218,18 @@ module LocalModelEvaluation
 
     def create(worker_count:, ssh_public_key:, preflight: nil, cloud: DEFAULT_CLOUD,
                max_fleet_hourly_usd: DEFAULT_MAX_FLEET_HOURLY_USD,
-               container_disk_gb: DEFAULT_CONTAINER_DISK_GB, volume_gb: DEFAULT_VOLUME_GB,
+               container_disk_gb: DEFAULT_CONTAINER_DISK_GB, volume_gb: nil, network_volume_id: nil,
                max_runtime_seconds: nil, max_spend_usd: nil,
                wait_seconds: DEFAULT_WAIT_SECONDS, poll_seconds: DEFAULT_POLL_SECONDS)
       worker_count = validate_worker_count(worker_count)
       cloud = normalize_cloud(cloud)
       container_disk_gb = positive_integer(container_disk_gb, "container disk size")
-      volume_gb = positive_integer(volume_gb, "workspace volume size")
+      volume_gb, network_volume_id = normalize_workspace_storage(volume_gb, network_volume_id)
       max_runtime_seconds = optional_positive_float(max_runtime_seconds, "max runtime")
       max_spend_usd = optional_positive_float(max_spend_usd, "max spend")
       preflight ||= self.preflight(
         worker_count:, cloud:, max_fleet_hourly_usd:, container_disk_gb:, volume_gb:,
-        max_runtime_seconds:, max_spend_usd:
+        network_volume_id:, max_runtime_seconds:, max_spend_usd:
       )
       if preflight.worker_count != worker_count
         raise Error, "preflight worker count does not match requested worker count"
@@ -241,6 +243,9 @@ module LocalModelEvaluation
       if preflight.container_disk_gb != container_disk_gb
         raise Error,
               "preflight container disk #{preflight.container_disk_gb} GB does not match requested #{container_disk_gb} GB"
+      end
+      if preflight.network_volume_id != network_volume_id
+        raise Error, "preflight network volume does not match requested network volume"
       end
       if preflight.volume_gb != volume_gb
         raise Error,
@@ -273,7 +278,7 @@ module LocalModelEvaluation
       begin
         (1..worker_count).each do |index|
           pod = @client.create_pod(
-            create_body(index, ssh_public_key, cloud, container_disk_gb:, volume_gb:)
+            create_body(index, ssh_public_key, cloud, container_disk_gb:, volume_gb:, network_volume_id:)
           )
           pod_id = pod["id"].to_s
           raise Error, "RunPod create response for #{worker_name(index)} did not include a pod id" if pod_id.empty?
@@ -309,7 +314,10 @@ module LocalModelEvaluation
             provisioning: {
               "container_disk_gb" => container_disk_gb,
               "volume_gb" => volume_gb
-            }
+            }.merge(network_volume_id ? {
+              "network_volume_id" => network_volume_id,
+              "volume_mount_path" => VOLUME_MOUNT_PATH
+            } : {})
           )
         end
         write_worker_env(workers, fleet_record:)
@@ -385,19 +393,18 @@ module LocalModelEvaluation
 
     private
 
-    def create_body(index, ssh_public_key, cloud, container_disk_gb:, volume_gb:)
+    def create_body(index, ssh_public_key, cloud, container_disk_gb:, volume_gb:, network_volume_id: nil)
       {
         "name" => worker_name(index),
         "image" => IMAGE,
         "disk" => container_disk_gb,
         "ports" => ["22/tcp"],
         "env" => { "PUBLIC_KEY" => ssh_public_key },
-        "mounts" => {
-          "persistent" => {
-            "size" => volume_gb,
-            "path" => VOLUME_MOUNT_PATH
-          }
-        },
+        "mounts" => if network_volume_id
+                      { "network" => [{ "volumeId" => network_volume_id, "path" => VOLUME_MOUNT_PATH }] }
+                    else
+                      { "persistent" => { "size" => volume_gb, "path" => VOLUME_MOUNT_PATH } }
+                    end,
         "cloud" => cloud,
         "gpu" => {
           "id" => gpu_id,
@@ -565,6 +572,18 @@ module LocalModelEvaluation
       return cloud if SUPPORTED_CLOUDS.include?(cloud)
 
       raise Error, "cloud must be one of: #{SUPPORTED_CLOUDS.join(', ')}"
+    end
+
+    def normalize_workspace_storage(volume_gb, network_volume_id)
+      if network_volume_id
+        raise Error, "--network-volume-id cannot be combined with --volume-gb" unless volume_gb.nil?
+        id = network_volume_id.to_s.strip
+        raise Error, "invalid network volume id" unless id.match?(/\A[A-Za-z0-9_-]+\z/)
+
+        [nil, id]
+      else
+        [positive_integer(volume_gb || DEFAULT_VOLUME_GB, "workspace volume size"), nil]
+      end
     end
 
     def positive_integer(value, label)
