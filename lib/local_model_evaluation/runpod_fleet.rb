@@ -220,8 +220,10 @@ module LocalModelEvaluation
                max_fleet_hourly_usd: DEFAULT_MAX_FLEET_HOURLY_USD,
                container_disk_gb: DEFAULT_CONTAINER_DISK_GB, volume_gb: nil, network_volume_id: nil,
                max_runtime_seconds: nil, max_spend_usd: nil,
+               min_ready_workers: nil,
                wait_seconds: DEFAULT_WAIT_SECONDS, poll_seconds: DEFAULT_POLL_SECONDS)
       worker_count = validate_worker_count(worker_count)
+      min_ready_workers = normalize_min_ready_workers(min_ready_workers, worker_count)
       cloud = normalize_cloud(cloud)
       container_disk_gb = positive_integer(container_disk_gb, "container disk size")
       volume_gb, network_volume_id = normalize_workspace_storage(volume_gb, network_volume_id)
@@ -293,7 +295,19 @@ module LocalModelEvaluation
                                  else
                                    wait_seconds
                                  end
-        workers = wait_until_ready(created, cloud:, wait_seconds: effective_wait_seconds, poll_seconds:)
+        workers, unaccepted = wait_until_ready(
+          created,
+          cloud:,
+          wait_seconds: effective_wait_seconds,
+          poll_seconds:,
+          min_ready_workers:
+        )
+        unless unaccepted.empty?
+          delete_unaccepted_created(unaccepted)
+          accepted_indices = workers.map(&:index)
+          created = created.select { |index, _pod_id| accepted_indices.include?(index) }
+          @out.puts "Partial fleet accepted: #{workers.length}/#{worker_count} requested worker(s); minimum was #{min_ready_workers}."
+        end
         actual_fleet_rate = workers.sum(&:hourly_rate)
         if actual_fleet_rate > max_fleet_hourly_usd
           raise Error, format(
@@ -413,7 +427,7 @@ module LocalModelEvaluation
       }
     end
 
-    def wait_until_ready(created, cloud:, wait_seconds:, poll_seconds:)
+    def wait_until_ready(created, cloud:, wait_seconds:, poll_seconds:, min_ready_workers:)
       pending = created.to_h
       ready = {}
       deadline = @clock.call + wait_seconds
@@ -425,7 +439,14 @@ module LocalModelEvaluation
           validate_pod!(pod, index, pod_id, cloud:)
 
           status = pod["status"].to_s
-          raise Error, "#{worker_name(index)} entered terminal status #{status}" if %w[ERROR TERMINATED].include?(status)
+          if %w[ERROR TERMINATED].include?(status)
+            if min_ready_workers < created.length
+              pending.delete(index)
+              @out.puts "Unavailable #{worker_name(index)}: terminal status #{status}"
+              next
+            end
+            raise Error, "#{worker_name(index)} entered terminal status #{status}"
+          end
 
           next unless status == "RUNNING"
 
@@ -452,13 +473,59 @@ module LocalModelEvaluation
           )
         end
 
+        accepted = contiguous_ready_prefix(ready)
+        break if accepted.length >= min_ready_workers
         break if pending.empty?
-        raise Error, "timed out waiting for RunPod SSH endpoints: #{pending.keys.map { |i| worker_name(i) }.join(', ')}" if @clock.call >= deadline
+
+        if @clock.call >= deadline
+          waiting = pending.keys.map { |i| worker_name(i) }
+          if min_ready_workers == created.length
+            raise Error, "timed out waiting for RunPod SSH endpoints: #{waiting.join(', ')}"
+          end
+          raise Error,
+                "timed out waiting for RunPod SSH endpoints: #{waiting.join(', ')}; " \
+                "only #{accepted.length} contiguous ready worker(s), minimum #{min_ready_workers}"
+        end
 
         @sleeper.call(poll_seconds)
       end
 
-      ready.keys.sort.map { |index| ready.fetch(index) }
+      accepted = contiguous_ready_prefix(ready)
+      if accepted.length < min_ready_workers
+        raise Error,
+              "RunPod readiness ended with only #{accepted.length} contiguous ready worker(s); " \
+              "minimum #{min_ready_workers}"
+      end
+
+      accepted_indices = accepted.map(&:index)
+      unaccepted = created.reject { |index, _pod_id| accepted_indices.include?(index) }
+      [accepted, unaccepted]
+    end
+
+    def contiguous_ready_prefix(ready)
+      accepted = []
+      index = 1
+      while (worker = ready[index])
+        accepted << worker
+        index += 1
+      end
+      accepted
+    end
+
+    def delete_unaccepted_created(unaccepted)
+      @out.puts "Deleting #{unaccepted.length} unaccepted requested pod(s) before fleet activation."
+      unaccepted.reverse_each do |index, pod_id|
+        begin
+          @client.delete_pod(pod_id)
+          @out.puts "Deleted unaccepted #{worker_name(index)}: #{pod_id}"
+        rescue RunpodClient::Error => e
+          if e.status == 404
+            @out.puts "Already absent unaccepted #{worker_name(index)}: #{pod_id}"
+          else
+            raise
+          end
+        end
+      end
     end
 
     def validate_pod!(pod, index, pod_id, cloud:)
@@ -559,6 +626,19 @@ module LocalModelEvaluation
       RunpodWorkers.validate_count(value)
     rescue RunpodWorkers::Error => e
       raise Error, e.message
+    end
+
+    def normalize_min_ready_workers(value, worker_count)
+      return worker_count if value.nil?
+
+      count = Integer(value)
+      unless count.between?(1, worker_count)
+        raise Error, "minimum ready workers must be between 1 and requested worker count #{worker_count}"
+      end
+
+      count
+    rescue ArgumentError, TypeError
+      raise Error, "minimum ready workers must be an integer"
     end
 
     def validate_worker_index(index)

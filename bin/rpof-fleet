@@ -74,7 +74,7 @@ def create_options(argv)
     gpu_id: LocalModelEvaluation::RunpodFleet::GPU_ID,
     container_disk_gb: LocalModelEvaluation::RunpodFleet::DEFAULT_CONTAINER_DISK_GB,
     volume_gb: nil, network_volume_id: nil,
-    max_runtime_seconds: nil, max_spend_usd: nil, dry_run: false, yes: false,
+    max_runtime_seconds: nil, max_spend_usd: nil, min_ready_workers: nil, dry_run: false, yes: false,
     max_hourly_usd: ENV.fetch("RUNPOD_MAX_FLEET_HOURLY_USD", LocalModelEvaluation::RunpodFleet::DEFAULT_MAX_FLEET_HOURLY_USD),
     max_total_hourly_usd: ENV.fetch("RUNPOD_MAX_TOTAL_HOURLY_USD", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_MAX_TOTAL_HOURLY_USD),
     ssh_public_key: ENV.fetch("RUNPOD_SSH_PUBLIC_KEY_PATH", "~/.ssh/id_ed25519.pub"),
@@ -83,6 +83,7 @@ def create_options(argv)
   }
   OptionParser.new do |o|
     o.on("--workers N", Integer) { |v| opts[:workers] = v }
+    o.on("--min-ready-workers N", Integer, "Accept once this many leading workers are ready") { |v| opts[:min_ready_workers] = v }
     o.on("--cloud TIER") { |v| opts[:cloud] = v }
     o.on("--gpu GPU_ID") { |v| opts[:gpu_id] = v }
     o.on("--container-disk-gb N", Integer) { |v| opts[:container_disk_gb] = v }
@@ -100,6 +101,9 @@ def create_options(argv)
   end.parse!(argv)
   abort "--network-volume-id cannot be combined with --volume-gb" if opts[:network_volume_id] && opts[:volume_gb]
   abort "Usage: bin/rpof create --workers N [--dry-run|--yes]" unless opts[:workers]
+  if opts[:min_ready_workers] && !opts[:min_ready_workers].between?(1, opts[:workers])
+    abort "--min-ready-workers must be between 1 and --workers"
+  end
   opts
 end
 
@@ -178,6 +182,12 @@ when "create"
     puts "  Cloud: #{preflight.cloud}"
     puts "  Availability: #{preflight.availability}"
     puts "  Workers: #{preflight.worker_count}"
+    minimum_ready_workers = opts[:min_ready_workers] || preflight.worker_count
+    puts "  Minimum ready workers: #{minimum_ready_workers}"
+    if minimum_ready_workers < preflight.worker_count
+      puts "  Partial acceptance: activate once that many leading workers are ready"
+      puts "  and delete any unaccepted requested tail workers before fleet activation."
+    end
     puts "  Container disk: #{preflight.container_disk_gb} GB"
     if preflight.network_volume_id
       puts "  Existing network volume: #{preflight.network_volume_id} at #{LocalModelEvaluation::RunpodFleet::VOLUME_MOUNT_PATH} on every worker"
@@ -216,7 +226,8 @@ when "create"
       worker_count: opts[:workers], cloud: opts[:cloud], ssh_public_key:, preflight:,
       max_fleet_hourly_usd: opts[:max_hourly_usd], container_disk_gb: opts[:container_disk_gb],
       volume_gb: opts[:volume_gb], network_volume_id: opts[:network_volume_id], max_runtime_seconds: opts[:max_runtime_seconds],
-      max_spend_usd: opts[:max_spend_usd], wait_seconds: opts[:wait_seconds], poll_seconds: opts[:poll_seconds]
+      max_spend_usd: opts[:max_spend_usd], min_ready_workers: minimum_ready_workers,
+      wait_seconds: opts[:wait_seconds], poll_seconds: opts[:poll_seconds]
     )
     start_lease_watchdog!(namespace:, fleet:, workers:)
     puts "RunPod fleet ready:"
