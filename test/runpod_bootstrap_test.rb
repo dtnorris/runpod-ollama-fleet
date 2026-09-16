@@ -429,6 +429,25 @@ class RunpodBootstrapTest < Minitest::Test
     assert_equal true, record.fetch("reuse_existing")
   end
 
+  def test_copy_to_workspace_is_forwarded_and_recorded
+    script = fake_remote_script("puts 'copy model fixture'\n")
+
+    record = build_runner(script).run(
+      worker_indices: [2],
+      models: ["gemma4:26b"],
+      expected_digests: ["gemma4:26b=#{DIGEST}"],
+      copy_to_workspace: true,
+      poll_seconds: 0.005
+    )
+
+    command = @process_supervisor.commands.fetch(0).fetch(:command)
+    assert_includes command, "--copy-to-workspace"
+    refute_includes command, "--keep-root-models"
+    refute_includes command, "--reuse-existing"
+    assert_equal true, record.fetch("copy_to_workspace")
+    assert_equal "workspace", record.fetch("model_store_mode")
+  end
+
   def test_keep_root_models_is_forwarded_and_recorded
     script = fake_remote_script("puts 'root model fixture'\n")
 

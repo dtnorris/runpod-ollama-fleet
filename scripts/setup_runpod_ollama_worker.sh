@@ -6,8 +6,8 @@ set -euo pipefail
 # Design goals:
 # - do not provision or destroy RunPod resources;
 # - pull model weights on the fast local/root disk;
-# - optionally keep a single-model bootstrap on root instead of copying to /workspace;
-# - otherwise copy completed Ollama stores to /workspace one model at a time;
+# - serve a fresh single-model bootstrap directly from root by default;
+# - copy completed Ollama stores to /workspace only when explicitly requested;
 # - serve inference from the selected final store at the requested context length;
 # - verify model digest, full GPU residency, and context before declaring success;
 # - emit incremental console feedback for every long-running step.
@@ -22,7 +22,9 @@ MIN_VRAM_GB=40
 EXPECTED_GPU_NAME=""
 CLEAN=0
 REUSE_EXISTING=0
-KEEP_ROOT_MODELS=0
+COPY_TO_WORKSPACE=0
+KEEP_ROOT_MODELS=1
+KEEP_ROOT_MODELS_EXPLICIT=0
 MODELS=()
 declare -A EXPECTED_DIGESTS=()
 declare -A FINAL_DIGESTS=()
@@ -52,7 +54,8 @@ Options:
   --expect-digest MODEL=DIGEST  Fail unless the requested model has this full digest. Repeatable.
   --clean                       Delete both staging and shared Ollama stores before setup.
   --reuse-existing              Reuse /workspace cache only; never pull, stage, or rsync model data.
-  --keep-root-models            Keep one pulled model in root storage and serve it there; skip rsync.
+  --copy-to-workspace           Persist pulled model data to /workspace instead of serving from root.
+  --keep-root-models            Compatibility flag; root storage is already the default for one model.
   -h, --help                    Show this help.
 
 Example for the first automated worker-2 validation:
@@ -104,8 +107,10 @@ while (($#)); do
       CLEAN=1; shift ;;
     --reuse-existing)
       REUSE_EXISTING=1; shift ;;
+    --copy-to-workspace)
+      COPY_TO_WORKSPACE=1; shift ;;
     --keep-root-models)
-      KEEP_ROOT_MODELS=1; shift ;;
+      KEEP_ROOT_MODELS_EXPLICIT=1; shift ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -119,11 +124,22 @@ done
 if [[ $REUSE_EXISTING -eq 1 && $CLEAN -eq 1 ]]; then
   die "--clean cannot be combined with --reuse-existing"
 fi
-if [[ $REUSE_EXISTING -eq 1 && $KEEP_ROOT_MODELS -eq 1 ]]; then
+if [[ $REUSE_EXISTING -eq 1 && $COPY_TO_WORKSPACE -eq 1 ]]; then
+  die "--copy-to-workspace cannot be combined with --reuse-existing"
+fi
+if [[ $KEEP_ROOT_MODELS_EXPLICIT -eq 1 && $COPY_TO_WORKSPACE -eq 1 ]]; then
+  die "--copy-to-workspace cannot be combined with --keep-root-models"
+fi
+if [[ $REUSE_EXISTING -eq 1 && $KEEP_ROOT_MODELS_EXPLICIT -eq 1 ]]; then
   die "--keep-root-models cannot be combined with --reuse-existing"
 fi
+if [[ $REUSE_EXISTING -eq 1 || $COPY_TO_WORKSPACE -eq 1 ]]; then
+  KEEP_ROOT_MODELS=0
+else
+  KEEP_ROOT_MODELS=1
+fi
 if [[ $KEEP_ROOT_MODELS -eq 1 && ${#MODELS[@]} -ne 1 ]]; then
-  die "--keep-root-models requires exactly one --model"
+  die "fresh root-storage bootstrap requires exactly one --model; use --copy-to-workspace for multiple models"
 fi
 if [[ $REUSE_EXISTING -eq 1 ]]; then
   for model in "${MODELS[@]}"; do
@@ -431,6 +447,7 @@ step "Write durable worker evidence"
   echo "shared_model_store=$SHARED_DIR"
   echo "server_url=$CLIENT_URL"
   echo "reuse_existing=$REUSE_EXISTING"
+  echo "copy_to_workspace=$COPY_TO_WORKSPACE"
   echo "keep_root_models=$KEEP_ROOT_MODELS"
   echo "models=${MODELS[*]}"
 } > "$STATE_DIR/worker-summary.txt"

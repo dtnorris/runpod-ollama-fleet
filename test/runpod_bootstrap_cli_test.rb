@@ -13,6 +13,7 @@ class RunpodBootstrapCliTest < Minitest::Test
 
     assert status.success?, err
     assert_includes out, "--reuse-existing"
+    assert_includes out, "--copy-to-workspace"
     assert_includes out, "--keep-root-models"
   end
 
@@ -29,6 +30,21 @@ class RunpodBootstrapCliTest < Minitest::Test
     refute status.success?, out + err
     assert_equal 2, status.exitstatus
     assert_includes err, "--clean cannot be combined with --reuse-existing"
+  end
+
+  def test_copy_to_workspace_and_reuse_existing_fail_before_fleet_access
+    out, err, status = Open3.capture3(
+      RbConfig.ruby,
+      BIN,
+      "--workers", "1",
+      "--model", "gemma4:26b",
+      "--copy-to-workspace",
+      "--reuse-existing"
+    )
+
+    refute status.success?, out + err
+    assert_equal 2, status.exitstatus
+    assert_includes err, "--copy-to-workspace cannot be combined with --reuse-existing"
   end
 
   def test_keep_root_models_and_reuse_existing_fail_before_fleet_access
@@ -59,5 +75,19 @@ class RunpodBootstrapCliTest < Minitest::Test
     refute status.success?, out + err
     assert_equal 2, status.exitstatus
     assert_includes err, "--keep-root-models requires exactly one --model"
+  end
+
+  def test_default_root_storage_requires_exactly_one_model_before_fleet_access
+    out, err, status = Open3.capture3(
+      RbConfig.ruby,
+      BIN,
+      "--workers", "1",
+      "--model", "gemma4:26b",
+      "--model", "qwen3.6:27b"
+    )
+
+    refute status.success?, out + err
+    assert_equal 2, status.exitstatus
+    assert_includes err, "fresh root-storage bootstrap requires exactly one --model"
   end
 end

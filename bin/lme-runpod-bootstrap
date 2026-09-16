@@ -23,6 +23,7 @@ opts = {
   expected_digests: [],
   clean: false,
   reuse_existing: false,
+  copy_to_workspace: false,
   keep_root_models: false,
   context: nil,
   state_root: nil,
@@ -40,7 +41,8 @@ parser = OptionParser.new do |o|
   o.on("--expect-digest MODEL=DIGEST", "Required exact 64-hex digest for each --model; repeatable") { |v| opts[:expected_digests] << v }
   o.on("--clean", "Delete staging/shared Ollama stores before bootstrap") { opts[:clean] = true }
   o.on("--reuse-existing", "Reuse and validate the existing /workspace Ollama cache; never pull or copy models") { opts[:reuse_existing] = true }
-  o.on("--keep-root-models", "Pull one model to fast root storage and serve it there; skip the /workspace copy") { opts[:keep_root_models] = true }
+  o.on("--copy-to-workspace", "Persist pulled model data to /workspace; fresh single-model bootstrap stays on root by default") { opts[:copy_to_workspace] = true }
+  o.on("--keep-root-models", "Compatibility flag; fresh single-model bootstrap already stays on root by default") { opts[:keep_root_models] = true }
   o.on("--fleet KEY", "Select the managed fleet") { |v| opts[:fleet_key] = v }
   o.on("--state-root PATH", "Remote worker evidence root (default: /workspace/lme-worker-state)") { |v| opts[:state_root] = v }
   o.on("--context N", Integer, "Ollama context length; remote default is 131072") { |v| opts[:context] = v }
@@ -54,11 +56,20 @@ begin
   if opts[:clean] && opts[:reuse_existing]
     raise OptionParser::InvalidArgument, "--clean cannot be combined with --reuse-existing"
   end
+  if opts[:copy_to_workspace] && opts[:reuse_existing]
+    raise OptionParser::InvalidArgument, "--copy-to-workspace cannot be combined with --reuse-existing"
+  end
+  if opts[:copy_to_workspace] && opts[:keep_root_models]
+    raise OptionParser::InvalidArgument, "--copy-to-workspace cannot be combined with --keep-root-models"
+  end
   if opts[:keep_root_models] && opts[:reuse_existing]
     raise OptionParser::InvalidArgument, "--keep-root-models cannot be combined with --reuse-existing"
   end
   if opts[:keep_root_models] && opts[:models].length != 1
     raise OptionParser::InvalidArgument, "--keep-root-models requires exactly one --model"
+  end
+  if !opts[:reuse_existing] && !opts[:copy_to_workspace] && opts[:models].length != 1
+    raise OptionParser::InvalidArgument, "fresh root-storage bootstrap requires exactly one --model; use --copy-to-workspace for multiple models"
   end
   raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
 rescue OptionParser::ParseError => e
@@ -89,6 +100,7 @@ begin
     expected_digests: opts[:expected_digests],
     clean: opts[:clean],
     reuse_existing: opts[:reuse_existing],
+    copy_to_workspace: opts[:copy_to_workspace],
     keep_root_models: opts[:keep_root_models],
     context: opts[:context],
     state_root: opts[:state_root],

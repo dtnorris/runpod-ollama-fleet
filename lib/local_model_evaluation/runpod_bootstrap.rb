@@ -31,8 +31,8 @@ module LocalModelEvaluation
     end
 
     def run(worker_indices:, models:, expected_digests: [], clean: false, reuse_existing: false,
-            keep_root_models: false, context: nil, state_root: nil, heartbeat_seconds: DEFAULT_HEARTBEAT_SECONDS,
-            poll_seconds: DEFAULT_POLL_SECONDS)
+            copy_to_workspace: false, keep_root_models: false, context: nil, state_root: nil,
+            heartbeat_seconds: DEFAULT_HEARTBEAT_SECONDS, poll_seconds: DEFAULT_POLL_SECONDS)
       fleet = active_fleet!
       workers = selected_workers(fleet, worker_indices)
       models = normalize_models(models)
@@ -43,11 +43,20 @@ module LocalModelEvaluation
       if clean && reuse_existing
         raise Error, "--clean cannot be combined with --reuse-existing"
       end
+      if copy_to_workspace && reuse_existing
+        raise Error, "--copy-to-workspace cannot be combined with --reuse-existing"
+      end
+      if copy_to_workspace && keep_root_models
+        raise Error, "--copy-to-workspace cannot be combined with --keep-root-models"
+      end
       if keep_root_models && reuse_existing
         raise Error, "--keep-root-models cannot be combined with --reuse-existing"
       end
       if keep_root_models && models.length != 1
         raise Error, "--keep-root-models requires exactly one model"
+      end
+      if !reuse_existing && !copy_to_workspace && models.length != 1
+        raise Error, "fresh root-storage bootstrap requires exactly one model; use --copy-to-workspace for multiple models"
       end
 
       if state_root && !state_root.to_s.start_with?("/")
@@ -76,6 +85,7 @@ module LocalModelEvaluation
           expected_gpus:,
           clean:,
           reuse_existing:,
+          copy_to_workspace:,
           keep_root_models:,
           state_root:,
           context:,
@@ -91,7 +101,8 @@ module LocalModelEvaluation
     private
 
     def execute_run(fleet:, workers:, models:, digests:, expected_gpus:, clean:, reuse_existing:,
-                    keep_root_models:, state_root:, context:, heartbeat_seconds:, poll_seconds:, bootstrap_root:)
+                    copy_to_workspace:, keep_root_models:, state_root:, context:, heartbeat_seconds:, poll_seconds:,
+                    bootstrap_root:)
       started_wall = utc_now
       started_mono = @monotonic_clock.call
       run_id = build_run_id(started_wall)
@@ -105,6 +116,7 @@ module LocalModelEvaluation
         expected_gpus:,
         clean:,
         reuse_existing:,
+        copy_to_workspace:,
         keep_root_models:,
         state_root:,
         context:,
@@ -125,6 +137,7 @@ module LocalModelEvaluation
             expected_gpu: expected_gpus.fetch(Integer(worker.fetch("index"))),
             clean:,
             reuse_existing:,
+            copy_to_workspace:,
             keep_root_models:,
             state_root:,
             context:,
@@ -318,14 +331,15 @@ module LocalModelEvaluation
       digests
     end
 
-    def spawn_worker(worker:, models:, digests:, expected_gpu:, clean:, reuse_existing:, keep_root_models:,
-                     context:, state_root:, run_dir:)
+    def spawn_worker(worker:, models:, digests:, expected_gpu:, clean:, reuse_existing:, copy_to_workspace:,
+                     keep_root_models:, context:, state_root:, run_dir:)
       index = worker.fetch("index")
       command = [@remote_setup_path, "--worker", index.to_s]
       command.concat(["--expect-gpu", expected_gpu])
       command.concat(["--min-vram-gb", ENV.fetch("RUNPOD_GPU_MEMORY_GB", "40")])
       command << "--clean" if clean
       command << "--reuse-existing" if reuse_existing
+      command << "--copy-to-workspace" if copy_to_workspace
       command << "--keep-root-models" if keep_root_models
       command.concat(["--state-root", state_root]) if state_root
       models.each do |model|
@@ -544,7 +558,8 @@ module LocalModelEvaluation
     end
 
     def initial_record(fleet:, workers:, models:, digests:, expected_gpus:, clean:, reuse_existing:,
-                       keep_root_models:, state_root:, context:, heartbeat_seconds:, started_wall:, run_id:)
+                       copy_to_workspace:, keep_root_models:, state_root:, context:, heartbeat_seconds:, started_wall:,
+                       run_id:)
       gpu_ids = expected_gpus.values.uniq
       {
         "schema_version" => 2,
@@ -559,6 +574,8 @@ module LocalModelEvaluation
         "expected_gpus" => expected_gpus.transform_keys(&:to_s),
         "clean" => clean,
         "reuse_existing" => reuse_existing,
+        "copy_to_workspace" => copy_to_workspace,
+        "model_store_mode" => reuse_existing ? "workspace_reuse" : (copy_to_workspace ? "workspace" : "root"),
         "keep_root_models" => keep_root_models,
         "state_root" => state_root || "/workspace/lme-worker-state",
         "context" => context,

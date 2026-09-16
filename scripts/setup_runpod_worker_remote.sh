@@ -145,7 +145,7 @@ for arg in "${REMOTE_ARGS[@]}"; do
 done
 
 info "[4/4] Streaming setup_runpod_ollama_worker.sh to worker $WORKER ..."
-info "Remote setup progress follows. Normal bootstrap may pull/rsync models; --reuse-existing never does."
+info "Remote setup progress follows. Fresh single-model bootstrap serves from root by default; --copy-to-workspace opts into rsync; --reuse-existing never pulls or copies."
 ssh \
   "${SSH_COMMON_ARGS[@]}" \
   "$SSH_USER@$HOST" \
