@@ -42,6 +42,16 @@ class RunpodStatusTest < Minitest::Test
     end
   end
 
+  class FakeActivity
+    def initialize(snapshot)
+      @snapshot = snapshot
+    end
+
+    def snapshot(_fleet)
+      Marshal.load(Marshal.dump(@snapshot))
+    end
+  end
+
   def setup
     @tmp = Dir.mktmpdir("lme-runpod-status-")
     @now = Time.utc(2026, 8, 29, 20, 30, 0)
@@ -182,6 +192,40 @@ class RunpodStatusTest < Minitest::Test
     assert_includes status.render(snapshot), "burst_16"
   end
 
+  def test_status_renders_live_inference_summary_and_worker_activity
+    fleet = fleet_record(
+      workers: [
+        worker(1, "pod_a", 0.44),
+        worker(2, "pod_b", 0.44)
+      ]
+    )
+    activity = FakeActivity.new(
+      {
+        "counts" => {
+          "active" => 1,
+          "idle" => 1,
+          "unavailable" => 0,
+          "unknown" => 0
+        },
+        "workers" => {
+          1 => { "status" => "active", "detail" => "established client connection observed" },
+          2 => { "status" => "idle", "detail" => "no established client connection observed" }
+        }
+      }
+    )
+    status = build_status(fleet, activity_monitor: activity)
+
+    snapshot = status.snapshot
+    assert_equal "active", snapshot.fetch("workers").first.fetch("inference_status")
+    assert_equal "idle", snapshot.fetch("workers").last.fetch("inference_status")
+
+    output = status.render(snapshot)
+    assert_includes output, "Ollama inference: 1 active; 1 idle; 0 unavailable; 0 unknown"
+    assert_match(/burst_1.*ACTIVE/, output)
+    assert_match(/burst_2.*IDLE/, output)
+    assert_includes output, "Inference ACTIVE means an established local TCP client connection"
+  end
+
   def test_no_current_fleet_is_a_clean_zero_state
     state = FakeFleetState.new(root: @tmp, current: nil)
     status = LocalModelEvaluation::RunpodStatus.new(fleet_state: state, wall_clock: -> { @now })
@@ -192,12 +236,13 @@ class RunpodStatusTest < Minitest::Test
 
   private
 
-  def build_status(fleet, client: nil)
+  def build_status(fleet, client: nil, activity_monitor: nil)
     state = FakeFleetState.new(root: @tmp, current: fleet)
     LocalModelEvaluation::RunpodStatus.new(
       fleet_state: state,
       client: client,
-      wall_clock: -> { @now }
+      wall_clock: -> { @now },
+      activity_monitor: activity_monitor
     )
   end
 

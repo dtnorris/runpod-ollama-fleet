@@ -9,10 +9,11 @@ module LocalModelEvaluation
   class RunpodStatus
     class Error < StandardError; end
 
-    def initialize(fleet_state:, client: nil, wall_clock: nil)
+    def initialize(fleet_state:, client: nil, wall_clock: nil, activity_monitor: nil)
       @fleet_state = fleet_state
       @client = client
       @wall_clock = wall_clock || -> { Time.now.utc }
+      @activity_monitor = activity_monitor
     end
 
     def snapshot
@@ -21,8 +22,19 @@ module LocalModelEvaluation
 
       now = utc_now
       created_at = parse_time(fleet.fetch("created_at_utc"), "fleet created_at_utc")
+      activity = @activity_monitor&.snapshot(fleet)
+      activity_workers = activity ? activity.fetch("workers") : {}
       workers = fleet.fetch("workers").sort_by { |worker| Integer(worker.fetch("index")) }.map do |worker|
-        worker_snapshot(worker, created_at, now)
+        row = worker_snapshot(worker, created_at, now)
+        if activity
+          observation = activity_workers.fetch(row.fetch("index")) do
+            { "status" => "unknown", "detail" => "activity observation is missing" }
+          end
+          row["inference_status"] = observation.fetch("status")
+          row["inference_detail"] = observation["detail"]
+          row["inference_endpoint"] = observation["endpoint"]
+        end
+        row
       end
       active_workers = workers.select { |worker| worker.fetch("lme_status") == "active" }
       stopped_at = if fleet["status"] == "destroyed" && fleet["destroyed_at_utc"]
@@ -48,6 +60,7 @@ module LocalModelEvaluation
         "estimated_accrued_cost_usd" => workers.sum { |worker| worker.fetch("estimated_cost_usd") }.round(6),
         "provider_checked" => !@client.nil?,
         "workers" => workers,
+        "inference_activity" => activity && activity.fetch("counts"),
         "lease" => lease,
         "bootstrap" => bootstrap_snapshot(fleet, now)
       }
@@ -80,29 +93,56 @@ module LocalModelEvaluation
       lines << format("  Estimated accrued cost: $%.4f", snapshot.fetch("estimated_accrued_cost_usd"))
       append_lease(lines, snapshot["lease"])
       lines << "  Provider check: #{snapshot.fetch('provider_checked') ? 'enabled' : 'not checked (RUNPOD_API_KEY unavailable)'}"
+      append_inference_summary(lines, snapshot["inference_activity"])
       lines << ""
-      lines << format("%-9s %-10s %-12s %-10s %-10s %-10s %s", "WORKER", "LME", "RUNPOD", "RATE", "ELAPSED", "EST.COST", "BOOTSTRAP")
+      if snapshot["inference_activity"]
+        lines << format(
+          "%-9s %-10s %-12s %-10s %-10s %-10s %-11s %s",
+          "WORKER", "LME", "RUNPOD", "RATE", "ELAPSED", "EST.COST", "INFERENCE", "BOOTSTRAP"
+        )
+      else
+        lines << format("%-9s %-10s %-12s %-10s %-10s %-10s %s", "WORKER", "LME", "RUNPOD", "RATE", "ELAPSED", "EST.COST", "BOOTSTRAP")
+      end
 
       bootstrap_workers = bootstrap_workers_by_index(snapshot["bootstrap"])
       snapshot.fetch("workers").each do |worker|
         boot = bootstrap_worker_label(bootstrap_workers[worker.fetch("index")])
-        lines << format(
-          "%-9s %-10s %-12s $%-9.4f %-10s $%-9.4f %s",
-          "burst_#{worker.fetch('index')}",
-          worker.fetch("lme_status").upcase,
-          worker.fetch("provider_status"),
-          worker.fetch("hourly_rate_usd"),
-          format_duration(worker.fetch("tracked_elapsed_seconds")),
-          worker.fetch("estimated_cost_usd"),
-          boot
-        )
+        if snapshot["inference_activity"]
+          lines << format(
+            "%-9s %-10s %-12s $%-9.4f %-10s $%-9.4f %-11s %s",
+            "burst_#{worker.fetch('index')}",
+            worker.fetch("lme_status").upcase,
+            worker.fetch("provider_status"),
+            worker.fetch("hourly_rate_usd"),
+            format_duration(worker.fetch("tracked_elapsed_seconds")),
+            worker.fetch("estimated_cost_usd"),
+            inference_label(worker["inference_status"]),
+            boot
+          )
+        else
+          lines << format(
+            "%-9s %-10s %-12s $%-9.4f %-10s $%-9.4f %s",
+            "burst_#{worker.fetch('index')}",
+            worker.fetch("lme_status").upcase,
+            worker.fetch("provider_status"),
+            worker.fetch("hourly_rate_usd"),
+            format_duration(worker.fetch("tracked_elapsed_seconds")),
+            worker.fetch("estimated_cost_usd"),
+            boot
+          )
+        end
       end
 
       append_bootstrap(lines, snapshot["bootstrap"])
       append_provider_warnings(lines, snapshot)
+      append_inference_warnings(lines, snapshot)
       lines << ""
       lines << "Billing estimate uses per-worker lifecycle timestamps when available; legacy fleets fall back to LME fleet activation."
       lines << "It remains an estimate and can differ because of provider billing granularity, storage/network charges, credits, or rate changes."
+      if snapshot["inference_activity"]
+        lines << "Inference ACTIVE means an established local TCP client connection to the worker's managed Ollama tunnel was observed at this snapshot."
+        lines << "It indicates live Ollama request traffic (such as scoring), not AFIO job identity; short requests can be missed between snapshots."
+      end
       if snapshot["lease"]
         lines << "Lease spend is a conservative guard estimate that starts before the first paid pod create and uses recorded worker rates."
         lines << "Lease enforcement is a local watchdog, not a provider-side billing cap; it cannot enforce limits while the control-plane Mac is offline."
@@ -297,6 +337,50 @@ module LocalModelEvaluation
 
       lines << ""
       lines.concat(warnings)
+    end
+
+    def append_inference_summary(lines, counts)
+      return unless counts
+
+      lines << format(
+        "  Ollama inference: %d active; %d idle; %d unavailable; %d unknown",
+        counts.fetch("active", 0),
+        counts.fetch("idle", 0),
+        counts.fetch("unavailable", 0),
+        counts.fetch("unknown", 0)
+      )
+    end
+
+    def append_inference_warnings(lines, snapshot)
+      return unless snapshot["inference_activity"]
+
+      warnings = snapshot.fetch("workers").filter_map do |worker|
+        status = worker["inference_status"].to_s
+        next unless %w[unavailable unknown].include?(status)
+
+        detail = worker["inference_detail"].to_s
+        suffix = detail.empty? ? "" : ": #{detail}"
+        "NOTE: burst_#{worker.fetch('index')} inference visibility is #{status.upcase}#{suffix}"
+      end
+      return if warnings.empty?
+
+      lines << ""
+      lines.concat(warnings)
+    end
+
+    def inference_label(status)
+      case status.to_s
+      when "active"
+        "ACTIVE"
+      when "idle"
+        "IDLE"
+      when "unavailable"
+        "UNAVAILABLE"
+      when "unknown"
+        "UNKNOWN"
+      else
+        "-"
+      end
     end
 
     def parse_time(value, label)

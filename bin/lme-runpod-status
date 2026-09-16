@@ -8,6 +8,7 @@ Dotenv.load(File.join(ROOT, ".env"))
 $LOAD_PATH.unshift File.join(ROOT, "lib")
 
 require "local_model_evaluation/runpod_client"
+require "local_model_evaluation/runpod_activity"
 require "local_model_evaluation/runpod_fleet_namespace"
 require "local_model_evaluation/runpod_fleet_state"
 require "local_model_evaluation/runpod_status"
@@ -41,9 +42,14 @@ client = unless api_key.empty?
            )
          end
 
+activity_monitor = LocalModelEvaluation::RunpodActivity.new(
+  fleet_state: state
+)
+
 status = LocalModelEvaluation::RunpodStatus.new(
   fleet_state: state,
-  client: client
+  client: client,
+  activity_monitor: activity_monitor
 )
 
 begin
