@@ -1,0 +1,77 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "fileutils"
+require "json"
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "local_model_evaluation"
+
+opts = {
+  fleet: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY),
+  workers: nil,
+  source_model: nil,
+  runtime_model: nil,
+  expected_digest: nil,
+  context: nil,
+  output: nil
+}
+
+parser = OptionParser.new do |o|
+  o.banner = "Usage: bin/rpof runtime-alias --fleet KEY --workers LIST --source-model MODEL --runtime-model MODEL --expect-digest DIGEST --context N --output FILE"
+  o.on("--fleet KEY") { |v| opts[:fleet] = v }
+  o.on("--workers LIST") { |v| opts[:workers] = LocalModelEvaluation::RunpodWorkers.parse_selector(v) }
+  o.on("--source-model MODEL") { |v| opts[:source_model] = v }
+  o.on("--runtime-model MODEL") { |v| opts[:runtime_model] = v }
+  o.on("--expect-digest DIGEST") { |v| opts[:expected_digest] = v }
+  o.on("--context N", Integer) { |v| opts[:context] = v }
+  o.on("--output FILE") { |v| opts[:output] = v }
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+  %i[workers source_model runtime_model expected_digest context output].each do |key|
+    raise OptionParser::MissingArgument, "--#{key.to_s.tr('_', '-')}" if opts[key].nil?
+  end
+rescue OptionParser::ParseError, LocalModelEvaluation::RunpodWorkers::Error => e
+  warn "ERROR: #{e.message}"
+  warn parser
+  exit 2
+end
+
+begin
+  namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
+    root: File.join(ROOT, "output", "runpod-fleets"),
+    repo_root: ROOT,
+    fleet_key: opts.fetch(:fleet)
+  )
+  state = LocalModelEvaluation::RunpodFleetState.new(
+    root: namespace.state_root,
+    local_port_base: namespace.local_port_base
+  )
+  evidence = LocalModelEvaluation::RunpodRuntimeAlias.new(fleet_state: state).ensure_alias(
+    worker_indices: opts.fetch(:workers),
+    source_model: opts.fetch(:source_model),
+    runtime_model: opts.fetch(:runtime_model),
+    expected_digest: opts.fetch(:expected_digest),
+    context: opts.fetch(:context)
+  )
+  document = {
+    "contract_version" => "rpof-runtime-alias-result/v0.1",
+    "ready" => true,
+    "fleet_key" => namespace.fleet_key,
+    "workers" => evidence
+  }
+  output = File.expand_path(opts.fetch(:output))
+  FileUtils.mkdir_p(File.dirname(output))
+  File.write(output, JSON.pretty_generate(document) + "\n")
+  puts "Runtime model ready: #{opts.fetch(:runtime_model)} on #{evidence.length} worker(s)."
+rescue LocalModelEvaluation::RunpodFleetNamespace::Error,
+       LocalModelEvaluation::RunpodFleetState::Error,
+       LocalModelEvaluation::RunpodRuntimeAlias::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end

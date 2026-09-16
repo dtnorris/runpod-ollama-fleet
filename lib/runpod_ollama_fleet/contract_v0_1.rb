@@ -6,6 +6,8 @@ module RunpodOllamaFleet
     CAPABILITY_RESULT_VERSION = "afio-rpof-capability-check-result/v0.1"
     DISPATCH_REQUEST_VERSION = "afio-rpof-dispatch-request/v0.1"
     DISPATCH_SUMMARY_VERSION = "afio-rpof-dispatch-summary/v0.1"
+    EXECUTION_POOL_REQUEST_VERSION = "afio-rpof-execution-pool-fulfill-request/v0.1"
+    EXECUTION_POOL_RESULT_VERSION = "afio-rpof-execution-pool-fulfill-result/v0.1"
 
     FLEET_KEY = /\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z/
     JOB_ID = /\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z/
@@ -51,6 +53,42 @@ module RunpodOllamaFleet
         raise Error, "requirements.require_fully_gpu_resident must be true"
       end
       string!(requirements, "required_gpu_id", max: 256) if requirements.key?("required_gpu_id")
+      document
+    end
+
+    def validate_execution_pool_request!(document)
+      object!(document, %w[contract_version plan_sha256 pool_id requirements capacity], [])
+      const!(document, "contract_version", EXECUTION_POOL_REQUEST_VERSION)
+      string!(document, "plan_sha256", pattern: DIGEST, max: 64)
+      string!(document, "pool_id", pattern: FLEET_KEY, max: 64)
+
+      requirements = document.fetch("requirements")
+      object!(
+        requirements,
+        %w[ollama_model pull_model expected_digest required_context_length require_fully_gpu_resident],
+        []
+      )
+      string!(requirements, "ollama_model", max: 256)
+      string!(requirements, "pull_model", max: 256)
+      string!(requirements, "expected_digest", pattern: DIGEST, max: 64)
+      positive_integer!(requirements.fetch("required_context_length"), "requirements.required_context_length")
+      unless requirements.fetch("require_fully_gpu_resident") == true
+        raise Error, "requirements.require_fully_gpu_resident must be true"
+      end
+
+      capacity = document.fetch("capacity")
+      object!(
+        capacity,
+        %w[desired_workers minimum_workers max_pool_hourly_usd max_total_hourly_usd],
+        []
+      )
+      desired = positive_integer!(capacity.fetch("desired_workers"), "capacity.desired_workers")
+      minimum = positive_integer!(capacity.fetch("minimum_workers"), "capacity.minimum_workers")
+      if minimum > desired
+        raise Error, "capacity.minimum_workers cannot exceed capacity.desired_workers"
+      end
+      positive_number!(capacity.fetch("max_pool_hourly_usd"), "capacity.max_pool_hourly_usd")
+      positive_number!(capacity.fetch("max_total_hourly_usd"), "capacity.max_total_hourly_usd")
       document
     end
 
@@ -112,6 +150,14 @@ module RunpodOllamaFleet
     def positive_integer!(value, label)
       raise Error, "#{label} must be a positive integer" unless value.is_a?(Integer) && value.positive?
       value
+    end
+
+    def positive_number!(value, label)
+      number = Float(value)
+      raise Error, "#{label} must be a positive finite number" unless number.positive? && number.finite?
+      number
+    rescue ArgumentError, TypeError
+      raise Error, "#{label} must be a positive finite number"
     end
 
     def positive_unique_integers!(values, label)

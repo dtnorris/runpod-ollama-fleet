@@ -20,6 +20,10 @@ when "capacity"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-capacity"), *ARGV
 when "fulfill"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-fulfill"), *ARGV
+when "execution-pool-fulfill"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-execution-pool-fulfill"), *ARGV
+when "runtime-alias"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-runtime-alias"), *ARGV
 when "create"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-fleet"), "create", *ARGV
 when "destroy"
@@ -54,6 +58,8 @@ else
       dispatch
       capacity
       fulfill
+      execution-pool-fulfill
+      runtime-alias
       create
       destroy
       bootstrap

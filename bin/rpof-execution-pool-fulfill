@@ -1,0 +1,73 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "fileutils"
+require "json"
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "runpod_ollama_fleet"
+
+opts = {
+  request: nil,
+  output: nil,
+  hardware: File.join(ROOT, "config", "execution_pool_hardware.yml"),
+  dry_run: false,
+  yes: false
+}
+
+parser = OptionParser.new do |o|
+  o.banner = "Usage: bin/rpof execution-pool-fulfill --request FILE --output FILE [--dry-run|--yes]"
+  o.on("--request FILE") { |v| opts[:request] = v }
+  o.on("--output FILE") { |v| opts[:output] = v }
+  o.on("--hardware PATH", "RPOF-owned hardware qualification registry") { |v| opts[:hardware] = v }
+  o.on("--dry-run", "Plan capacity only; create no paid resources") { opts[:dry_run] = true }
+  o.on("--yes", "Authorize paid fulfillment without another prompt") { opts[:yes] = true }
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::MissingArgument, "--request" unless opts[:request]
+  raise OptionParser::MissingArgument, "--output" unless opts[:output]
+  raise OptionParser::InvalidArgument, "--dry-run and --yes are mutually exclusive" if opts[:dry_run] && opts[:yes]
+  raise OptionParser::InvalidArgument, "use --dry-run or --yes" unless opts[:dry_run] || opts[:yes]
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+  request = JSON.parse(File.read(File.expand_path(opts.fetch(:request))))
+  RunpodOllamaFleet::ContractV01.validate_execution_pool_request!(request)
+rescue OptionParser::ParseError, JSON::ParserError, SystemCallError, RunpodOllamaFleet::ContractV01::Error => e
+  warn "ERROR: #{e.message}"
+  exit 2
+end
+
+begin
+  hardware = RunpodOllamaFleet::ExecutionPoolHardware.new(path: opts.fetch(:hardware))
+  orchestrator = RunpodOllamaFleet::ExecutionPoolFulfill.new(
+    repo_root: ROOT,
+    executable: File.join(ROOT, "bin", "rpof"),
+    hardware:
+  )
+  result = orchestrator.run(
+    request,
+    dry_run: opts.fetch(:dry_run),
+    assume_yes: opts.fetch(:yes)
+  )
+
+  output = File.expand_path(opts.fetch(:output))
+  FileUtils.mkdir_p(File.dirname(output))
+  File.write(output, JSON.pretty_generate(result) + "\n")
+
+  puts "RPOF execution-pool fulfillment"
+  puts "  Pool: #{result.fetch('pool_id')}"
+  puts "  Handle: #{result.fetch('execution_handle')}"
+  puts "  Status: #{result.fetch('status')}"
+  puts "  Workers: #{result.fetch('worker_indices').join(', ')}" unless result.fetch("worker_indices").empty?
+  puts "  Detail: #{result.fetch('detail')}"
+  puts "  Result: #{output}"
+
+  exit(result.fetch("ready") || result.fetch("status") == "planned" ? 0 : 1)
+rescue RunpodOllamaFleet::ExecutionPoolFulfill::Error,
+       RunpodOllamaFleet::ExecutionPoolHardware::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end

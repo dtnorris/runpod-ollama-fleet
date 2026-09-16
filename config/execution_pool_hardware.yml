@@ -1,0 +1,19 @@
+---
+# RPOF owns hardware qualification for execution-pool fulfillment.
+# Add or broaden entries only after empirical qualification evidence exists.
+contract_version: rpof-execution-pool-hardware/v0.1
+default_cloud: SECURE
+models:
+  qwen3.6:35b-a3b:
+    qualified_gpus:
+      - NVIDIA A40
+  qwen3.6:27b:
+    qualified_gpus:
+      - NVIDIA A40
+      - NVIDIA RTX A6000
+  gemma4:26b:
+    qualified_gpus:
+      - NVIDIA L40S
+  gpt-oss:20b:
+    qualified_gpus:
+      - NVIDIA A40
