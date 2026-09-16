@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
+require "stringio"
 require "tmpdir"
 require_relative "../lib/local_model_evaluation/runpod_fleet"
 
@@ -61,6 +62,7 @@ class RunpodFleetVerifiedDestroyTest < Minitest::Test
       fleet = TestFleet.new(
         client: client,
         env_path: env,
+        out: StringIO.new,
         state_root: File.join(dir, "state"),
         clock: -> { now },
         sleeper: ->(seconds) { now += seconds }
