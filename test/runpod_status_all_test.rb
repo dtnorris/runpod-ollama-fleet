@@ -60,10 +60,11 @@ class RunpodStatusAllTest < Minitest::Test
     assert_includes output, "Active fleets: 2"
     assert_includes output, "Active workers: 4"
     assert_includes output, "Current managed rate: $2.0400/hr"
-    assert_includes output, "batch31-gptoss"
-    assert_includes output, "batch31-nos-qwen27"
-    assert_match(/batch31-gptoss.*burst_1.*NVIDIA A40.*gpt-oss:20b.*gpt-oss:20b.*IDLE.*READY/, output)
-    assert_match(/batch31-nos-qwen27.*burst_1.*NVIDIA RTX A6000.*-.*UNAVAILABLE.*UNAVAILABLE.*-/, output)
+    assert_includes output, "Fleet aliases (current active set):"
+    assert_includes output, "A: batch31-gptoss"
+    assert_includes output, "B: batch31-nos-qwen27"
+    assert_match(/^A\s+1\s+NVIDIA A40.*gpt-oss:20b.*gpt-oss:20b.*IDLE.*READY$/, output)
+    assert_match(/^B\s+1\s+NVIDIA RTX A6000.*-.*UNAVAILABLE.*UNAVAILABLE.*-$/, output)
     refute_includes output, "old-destroyed"
   end
 
@@ -108,11 +109,12 @@ class RunpodStatusAllTest < Minitest::Test
 
     output = @overview.render(@overview.snapshot([fleet]))
 
-    assert_match(/replacement.*burst_1.*gpt-oss:20b.*IDLE.*-/, output)
-    refute_match(/replacement.*READY/, output)
+    assert_includes output, "A: replacement"
+    assert_match(/^A\s+1\s+.*gpt-oss:20b.*IDLE.*-$/, output)
+    refute_match(/^A\s+1\s+.*READY$/, output)
   end
 
-  def test_render_truncates_long_fleet_gpu_and_model_labels
+  def test_render_truncates_long_gpu_and_model_labels_and_keeps_full_fleet_alias
     fleet = entry(
       "batch31-qwen35-main",
       rate: 1.09,
@@ -133,7 +135,7 @@ class RunpodStatusAllTest < Minitest::Test
 
     output = @overview.render(@overview.snapshot([fleet]))
 
-    assert_includes output, "batch31-qwen35-..."
+    assert_includes output, "A: batch31-qwen35-main"
     assert_includes output, "NVIDIA RTX PRO ..."
     assert_includes output, "qwen3.6:35b-a3b..."
     refute_includes output, "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb"

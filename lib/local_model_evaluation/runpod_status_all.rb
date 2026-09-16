@@ -2,7 +2,8 @@
 
 module LocalModelEvaluation
   class RunpodStatusAll
-    FLEET_WIDTH = 18
+    FLEET_WIDTH = 5
+    BURST_WIDTH = 5
     GPU_WIDTH = 18
     MODEL_WIDTH = 18
     RUNPOD_WIDTH = 8
@@ -17,14 +18,18 @@ module LocalModelEvaluation
         next unless fleet_snapshot.fetch("lme_status").to_s == "active"
 
         { "fleet_key" => fleet_key, "snapshot" => fleet_snapshot }
-      end.sort_by { |entry| entry.fetch("fleet_key") }
+      end.sort_by do |entry|
+        [entry.fetch("snapshot")["created_at_utc"].to_s, entry.fetch("fleet_key")]
+      end.each_with_index.map do |entry, index|
+        entry.merge("fleet_alias" => fleet_alias(index))
+      end
 
       workers = fleets.flat_map do |entry|
         fleet_snapshot = entry.fetch("snapshot")
         Array(fleet_snapshot.fetch("workers")).filter_map do |worker|
           next unless worker.fetch("lme_status").to_s == "active"
 
-          worker_row(entry.fetch("fleet_key"), fleet_snapshot, worker)
+          worker_row(entry.fetch("fleet_key"), entry.fetch("fleet_alias"), fleet_snapshot, worker)
         end
       end
 
@@ -41,6 +46,9 @@ module LocalModelEvaluation
         end,
         "inference_counts" => INFERENCE_STATUSES.to_h do |status|
           [status, inference_statuses.count(status)]
+        end,
+        "fleet_aliases" => fleets.map do |entry|
+          { "alias" => entry.fetch("fleet_alias"), "fleet_key" => entry.fetch("fleet_key") }
         end,
         "workers" => workers
       }
@@ -65,17 +73,21 @@ module LocalModelEvaluation
         counts.fetch("unavailable"),
         counts.fetch("unknown")
       )
+      lines << "  Fleet aliases (current active set):"
+      snapshot.fetch("fleet_aliases").each do |fleet|
+        lines << "    #{fleet.fetch('alias')}: #{fleet.fetch('fleet_key')}"
+      end
       lines << ""
       lines << format(
-        "%-18s %-8s %-18s %-18s %-18s %-8s %-8s %-11s %s",
-        "FLEET", "WORKER", "GPU", "AVAILABLE", "LOADED", "RUNPOD", "RATE", "INFERENCE", "BOOTSTRAP"
+        "%-5s %-5s %-18s %-18s %-18s %-8s %-8s %-11s %s",
+        "FLEET", "BURST", "GPU", "AVAILABLE", "LOADED", "RUNPOD", "RATE", "INFERENCE", "BOOTSTRAP"
       )
 
       snapshot.fetch("workers").each do |worker|
         lines << format(
-          "%-18s %-8s %-18s %-18s %-18s %-8s $%-7.4f %-11s %s",
-          truncate(worker.fetch("fleet_key"), FLEET_WIDTH),
-          "burst_#{worker.fetch('index')}",
+          "%-5s %-5s %-18s %-18s %-18s %-8s $%-7.4f %-11s %s",
+          truncate(worker.fetch("fleet_alias"), FLEET_WIDTH),
+          truncate(worker.fetch("index"), BURST_WIDTH),
           truncate(worker.fetch("gpu_id"), GPU_WIDTH),
           truncate(available_model_label(worker), MODEL_WIDTH),
           truncate(loaded_model_label(worker), MODEL_WIDTH),
@@ -87,15 +99,17 @@ module LocalModelEvaluation
       end
 
       lines << ""
+      lines << "FLEET aliases are listed above; BURST is the worker index within that fleet."
       lines << "AVAILABLE=bootstrap-qualified; LOADED=live Ollama residency; rate=active managed workers."
       lines.join("\n") + "\n"
     end
 
     private
 
-    def worker_row(fleet_key, fleet_snapshot, worker)
+    def worker_row(fleet_key, fleet_alias, fleet_snapshot, worker)
       {
         "fleet_key" => fleet_key,
+        "fleet_alias" => fleet_alias,
         "index" => Integer(worker.fetch("index")),
         "gpu_id" => worker.fetch("gpu_id").to_s,
         "available_models" => Array(worker["available_models"]),
@@ -106,6 +120,17 @@ module LocalModelEvaluation
         "inference_status" => normalize_inference_status(worker["inference_status"]),
         "bootstrap_status" => bootstrap_label(fleet_snapshot["bootstrap"], worker)
       }
+    end
+
+    def fleet_alias(index)
+      value = Integer(index) + 1
+      label = +""
+      while value.positive?
+        value -= 1
+        label.prepend((65 + (value % 26)).chr)
+        value /= 26
+      end
+      label
     end
 
     def normalize_inference_status(value)
