@@ -168,8 +168,13 @@ when "create"
     ssh_public_key = fleet.read_ssh_public_key(opts[:ssh_public_key])
     current_total_rate = namespace.total_active_hourly_usd
     projected_total_rate = current_total_rate + preflight.fleet_hourly_rate
-    max_total_rate = Float(opts[:max_total_hourly_usd])
-    raise LocalModelEvaluation::RunpodFleet::Error, "aggregate managed RunPod hourly safety cap must be a positive number" unless max_total_rate.positive?
+    requested_total_rate = Float(opts[:max_total_hourly_usd])
+    raise LocalModelEvaluation::RunpodFleet::Error, "aggregate managed RunPod hourly safety cap must be a positive number" unless requested_total_rate.positive?
+    cost_control = LocalModelEvaluation::RunpodCostControl.new(
+      root: File.join(ROOT, "output", "runpod-fleets"),
+      repo_root: ROOT
+    )
+    max_total_rate = cost_control.provisioning_cap(requested_total_rate)
     if projected_total_rate > max_total_rate
       raise LocalModelEvaluation::RunpodFleet::Error, format(
         "projected managed RunPod total $%.4f/hr exceeds aggregate safety cap $%.4f/hr; no pods were created",

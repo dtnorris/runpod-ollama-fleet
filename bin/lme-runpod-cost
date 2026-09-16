@@ -1,0 +1,243 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "dotenv"
+require "fileutils"
+require "optparse"
+require "rbconfig"
+
+ROOT = File.expand_path("..", __dir__)
+Dotenv.load(File.join(ROOT, ".env"))
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+
+require "local_model_evaluation/runpod_client"
+require "local_model_evaluation/runpod_cost_control"
+
+STATE_ROOT = File.join(ROOT, "output", "runpod-fleets")
+
+
+def build_control(client: nil)
+  LocalModelEvaluation::RunpodCostControl.new(
+    root: STATE_ROOT,
+    repo_root: ROOT,
+    client: client
+  )
+end
+
+
+def runpod_client!
+  api_key = ENV["RUNPOD_API_KEY"].to_s
+  raise LocalModelEvaluation::RunpodCostControl::Error, "RUNPOD_API_KEY is missing" if api_key.empty?
+
+  LocalModelEvaluation::RunpodClient.new(
+    api_key: api_key,
+    base_url: ENV.fetch("RUNPOD_API_BASE_URL", LocalModelEvaluation::RunpodClient::DEFAULT_BASE_URL)
+  )
+end
+
+
+def process_alive?(pid)
+  Process.kill(0, Integer(pid))
+  true
+rescue Errno::ESRCH, ArgumentError, TypeError
+  false
+rescue Errno::EPERM
+  true
+end
+
+command = ARGV.shift || "status"
+
+begin
+  case command
+  when "status"
+    abort "Usage: bin/rpof cost status" unless ARGV.empty?
+    control = build_control
+    $stdout.write(control.render)
+
+  when "limit"
+    opts = { max_total_hourly_usd: nil }
+    OptionParser.new do |o|
+      o.on("--max-total-hourly-usd USD", Float) { |v| opts[:max_total_hourly_usd] = v }
+    end.parse!(ARGV)
+    abort "Usage: bin/rpof cost limit --max-total-hourly-usd USD" unless ARGV.empty? && opts[:max_total_hourly_usd]
+    control = build_control
+    control.set_limit!(opts.fetch(:max_total_hourly_usd))
+    $stdout.write(control.render)
+
+  when "override"
+    opts = { max_total_hourly_usd: nil, minutes: nil }
+    OptionParser.new do |o|
+      o.on("--max-total-hourly-usd USD", Float) { |v| opts[:max_total_hourly_usd] = v }
+      o.on("--minutes MINUTES", Float) { |v| opts[:minutes] = v }
+    end.parse!(ARGV)
+    unless ARGV.empty? && opts[:max_total_hourly_usd] && opts[:minutes]
+      abort "Usage: bin/rpof cost override --max-total-hourly-usd USD --minutes MINUTES"
+    end
+    control = build_control
+    control.set_override!(max_total_hourly_usd: opts.fetch(:max_total_hourly_usd), minutes: opts.fetch(:minutes))
+    $stdout.write(control.render)
+
+  when "clear-override"
+    abort "Usage: bin/rpof cost clear-override" unless ARGV.empty?
+    control = build_control
+    control.clear_override!
+    $stdout.write(control.render)
+
+  when "configure"
+    opts = {
+      fleet: nil,
+      lifecycle: "persistent",
+      idle_timeout_seconds: nil,
+      unavailable_timeout_seconds: nil,
+      soft_max_runtime_seconds: nil,
+      hard_max_runtime_seconds: nil,
+      soft_max_spend_usd: nil,
+      hard_max_spend_usd: nil
+    }
+    OptionParser.new do |o|
+      o.on("--fleet KEY") { |v| opts[:fleet] = v }
+      o.on("--lifecycle TYPE", "persistent|ephemeral") { |v| opts[:lifecycle] = v }
+      o.on("--idle-timeout-seconds SECONDS", Float) { |v| opts[:idle_timeout_seconds] = v }
+      o.on("--unavailable-timeout-seconds SECONDS", Float) { |v| opts[:unavailable_timeout_seconds] = v }
+      o.on("--soft-max-runtime-minutes MINUTES", Float) { |v| opts[:soft_max_runtime_seconds] = v * 60.0 }
+      o.on("--hard-max-runtime-minutes MINUTES", Float) { |v| opts[:hard_max_runtime_seconds] = v * 60.0 }
+      o.on("--soft-max-spend-usd USD", Float) { |v| opts[:soft_max_spend_usd] = v }
+      o.on("--hard-max-spend-usd USD", Float) { |v| opts[:hard_max_spend_usd] = v }
+    end.parse!(ARGV)
+    abort "Usage: bin/rpof cost configure --fleet KEY [options]" unless ARGV.empty? && opts[:fleet]
+    control = build_control
+    control.configure_fleet!(
+      fleet_key: opts.fetch(:fleet),
+      lifecycle: opts.fetch(:lifecycle),
+      idle_timeout_seconds: opts[:idle_timeout_seconds],
+      unavailable_timeout_seconds: opts[:unavailable_timeout_seconds],
+      soft_max_runtime_seconds: opts[:soft_max_runtime_seconds],
+      hard_max_runtime_seconds: opts[:hard_max_runtime_seconds],
+      soft_max_spend_usd: opts[:soft_max_spend_usd],
+      hard_max_spend_usd: opts[:hard_max_spend_usd]
+    )
+    $stdout.write(control.render)
+
+  when "unconfigure"
+    opts = { fleet: nil }
+    OptionParser.new { |o| o.on("--fleet KEY") { |v| opts[:fleet] = v } }.parse!(ARGV)
+    abort "Usage: bin/rpof cost unconfigure --fleet KEY" unless ARGV.empty? && opts[:fleet]
+    build_control.unconfigure_fleet!(opts.fetch(:fleet))
+    $stdout.write(build_control.render)
+
+  when "enable"
+    opts = { max_total_hourly_usd: nil, poll_seconds: LocalModelEvaluation::RunpodCostControl::DEFAULT_POLL_SECONDS }
+    OptionParser.new do |o|
+      o.on("--max-total-hourly-usd USD", Float) { |v| opts[:max_total_hourly_usd] = v }
+      o.on("--poll-seconds SECONDS", Float) { |v| opts[:poll_seconds] = v }
+    end.parse!(ARGV)
+    abort "Usage: bin/rpof cost enable [--max-total-hourly-usd USD] [--poll-seconds SECONDS]" unless ARGV.empty?
+
+    control = build_control
+    existing_pid = control.watchdog_pid
+    runpod_client! unless existing_pid # Validate credentials before enabling destructive enforcement.
+    control.enable!(max_total_hourly_usd: opts[:max_total_hourly_usd])
+    if existing_pid
+      puts "RunPod cost watchdog already running (pid #{existing_pid})."
+    else
+      FileUtils.mkdir_p(STATE_ROOT)
+      log = File.open(control.log_path, "a")
+      begin
+        pid = Process.spawn(
+          RbConfig.ruby,
+          File.expand_path(__FILE__),
+          "watch",
+          "--poll-seconds", opts.fetch(:poll_seconds).to_s,
+          chdir: ROOT,
+          in: File::NULL,
+          out: log,
+          err: [:child, :out],
+          pgroup: true
+        )
+        Process.detach(pid)
+      rescue SystemCallError => e
+        control.disable!
+        raise LocalModelEvaluation::RunpodCostControl::Error,
+              "could not start cost watchdog: #{e.message}; runtime cost control was disabled"
+      ensure
+        log.close
+      end
+      puts "RunPod cost watchdog started: pid #{pid}; log #{control.log_path}"
+    end
+    $stdout.write(control.render)
+
+  when "disable"
+    abort "Usage: bin/rpof cost disable" unless ARGV.empty?
+    control = build_control
+    control.disable!
+    if (pid = control.watchdog_pid)
+      begin
+        Process.kill("TERM", pid) if process_alive?(pid)
+        puts "Stopped RunPod cost watchdog pid #{pid}."
+      rescue Errno::ESRCH
+        nil
+      end
+    end
+    File.delete(control.pid_path) if File.file?(control.pid_path)
+    $stdout.write(control.render)
+
+  when "watch"
+    opts = { poll_seconds: LocalModelEvaluation::RunpodCostControl::DEFAULT_POLL_SECONDS }
+    OptionParser.new do |o|
+      o.on("--poll-seconds SECONDS", Float) { |v| opts[:poll_seconds] = v }
+    end.parse!(ARGV)
+    abort "Usage: bin/rpof cost watch [--poll-seconds SECONDS]" unless ARGV.empty?
+
+    control = build_control(client: runpod_client!)
+    begin
+      FileUtils.mkdir_p(STATE_ROOT)
+      existing = control.watchdog_pid
+      if existing && existing != Process.pid
+        raise LocalModelEvaluation::RunpodCostControl::Error, "cost watchdog is already running (pid #{existing})"
+      end
+      File.write(control.pid_path, "#{Process.pid}\n")
+      stopping = false
+      trap("TERM") { stopping = true }
+      trap("INT") { stopping = true }
+      puts format("RunPod cost watchdog started (poll %.1fs).", opts.fetch(:poll_seconds))
+      until stopping
+        snapshot = control.watch_once
+        if snapshot["over_aggregate_cap"]
+          puts format(
+            "WARNING: managed RunPod rate $%.4f/hr exceeds runtime cap $%.4f/hr; new dispatch is blocked.",
+            snapshot.fetch("current_total_hourly_usd"),
+            snapshot.fetch("effective_max_total_hourly_usd")
+          )
+        end
+        sleep opts.fetch(:poll_seconds)
+      end
+      puts "RunPod cost watchdog stopped."
+    ensure
+      if File.file?(control.pid_path) && File.read(control.pid_path).strip == Process.pid.to_s
+        File.delete(control.pid_path)
+      end
+    end
+
+  else
+    warn <<~USAGE
+      Usage: bin/rpof cost COMMAND [options]
+
+      Commands:
+        status
+        limit --max-total-hourly-usd USD
+        override --max-total-hourly-usd USD --minutes MINUTES
+        clear-override
+        configure --fleet KEY [--lifecycle persistent|ephemeral] [threshold options]
+        unconfigure --fleet KEY
+        enable [--max-total-hourly-usd USD] [--poll-seconds SECONDS]
+        disable
+        watch [--poll-seconds SECONDS]
+    USAGE
+    exit 2
+  end
+rescue LocalModelEvaluation::RunpodCostControl::Error,
+       LocalModelEvaluation::RunpodClient::Error,
+       LocalModelEvaluation::RunpodFleetNamespace::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end

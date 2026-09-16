@@ -13,6 +13,7 @@ require "local_model_evaluation/runpod_fleet_namespace"
 require "local_model_evaluation/runpod_fleet_state"
 require "local_model_evaluation/runpod_status"
 require "local_model_evaluation/runpod_status_all"
+require "local_model_evaluation/runpod_cost_control"
 
 all_fleets = ARGV == ["--all"]
 unless ARGV.empty? || all_fleets
@@ -74,6 +75,9 @@ begin
     overview = LocalModelEvaluation::RunpodStatusAll.new
     snapshot = overview.snapshot(entries)
     $stdout.write(overview.render(snapshot))
+    cost = LocalModelEvaluation::RunpodCostControl.new(root: state_root, repo_root: ROOT)
+    $stdout.write("\n")
+    $stdout.write(cost.render)
   else
     namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
       root: state_root,
@@ -86,6 +90,7 @@ begin
 rescue LocalModelEvaluation::RunpodFleetNamespace::Error,
        LocalModelEvaluation::RunpodStatus::Error,
        LocalModelEvaluation::RunpodFleetState::Error,
+       LocalModelEvaluation::RunpodCostControl::Error,
        ArgumentError => e
   warn "ERROR: #{e.message}"
   exit 1

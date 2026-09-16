@@ -175,7 +175,12 @@ begin
               end
   scale_down = command == "scale" && preflight.scale_direction == "down"
   ssh_public_key = scale_down ? nil : fleet.read_ssh_public_key(opts[:ssh_public_key])
-  max_total_rate = positive_cap(opts[:max_total_hourly_usd], "aggregate managed RunPod hourly safety cap")
+  requested_total_rate = positive_cap(opts[:max_total_hourly_usd], "aggregate managed RunPod hourly safety cap")
+  cost_control = LocalModelEvaluation::RunpodCostControl.new(
+    root: File.join(ROOT, "output", "runpod-fleets"),
+    repo_root: ROOT
+  )
+  max_total_rate = cost_control.provisioning_cap(requested_total_rate)
   current_total_rate = namespace.total_active_hourly_usd
   projected_total_rate = current_total_rate - preflight.current_fleet_hourly_rate + preflight.projected_fleet_hourly_rate
   if !scale_down && projected_total_rate > max_total_rate

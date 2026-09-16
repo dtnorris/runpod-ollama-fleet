@@ -10,6 +10,7 @@ $LOAD_PATH.unshift File.join(ROOT, "lib")
 require "runpod_ollama_fleet"
 require "local_model_evaluation/runpod_fleet_namespace"
 require "local_model_evaluation/runpod_fleet_state"
+require "local_model_evaluation/runpod_cost_control"
 
 opts = { request: nil, output: nil }
 parser = OptionParser.new do |o|
@@ -52,6 +53,32 @@ begin
     fleet_key: request.fetch("fleet_key"),
     client: client
   ).check(request)
+
+  begin
+    cost = LocalModelEvaluation::RunpodCostControl.new(
+      root: File.join(ROOT, "output", "runpod-fleets"),
+      repo_root: ROOT
+    )
+    gate = cost.dispatch_gate(
+      fleet_key: request.fetch("fleet_key"),
+      fleet_id: result["fleet_id"]
+    )
+    unless gate.fetch("code") == "cost.disabled"
+      result.fetch("diagnostics") << {
+        "code" => gate.fetch("code"),
+        "status" => gate.fetch("allowed") ? "PASS" : "FAIL",
+        "detail" => gate.fetch("detail")
+      }
+    end
+    result["ready"] = false unless gate.fetch("allowed")
+  rescue LocalModelEvaluation::RunpodCostControl::Error => e
+    result.fetch("diagnostics") << {
+      "code" => "cost.policy",
+      "status" => "FAIL",
+      "detail" => e.message
+    }
+    result["ready"] = false
+  end
 rescue LocalModelEvaluation::RunpodFleetNamespace::Error => e
   result = {
     "contract_version" => RunpodOllamaFleet::ContractV01::CAPABILITY_RESULT_VERSION,

@@ -234,7 +234,12 @@ begin
   cloud = opts[:cloud].to_s.upcase
   max_per_worker = positive_float(opts[:max_hourly_per_worker_usd], "max hourly per worker")
   max_fleet = positive_float(opts[:max_hourly_usd], "max fleet hourly cost")
-  max_total = positive_float(opts[:max_total_hourly_usd], "aggregate managed hourly cost")
+  requested_max_total = positive_float(opts[:max_total_hourly_usd], "aggregate managed hourly cost")
+  cost_control = LocalModelEvaluation::RunpodCostControl.new(
+    root: File.join(ROOT, "output", "runpod-fleets"),
+    repo_root: ROOT
+  )
+  max_total = cost_control.provisioning_cap(requested_max_total)
 
   provisional_namespace = namespace_for(fleet_key, provisional: true)
   client = client_for(api_key)

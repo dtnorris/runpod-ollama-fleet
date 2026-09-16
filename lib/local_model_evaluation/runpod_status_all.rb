@@ -34,6 +34,10 @@ module LocalModelEvaluation
       end
 
       inference_statuses = workers.map { |worker| worker.fetch("inference_status") }
+      inference_rates = INFERENCE_STATUSES.to_h do |status|
+        [status, workers.select { |worker| worker.fetch("inference_status") == status }.sum { |worker| worker.fetch("hourly_rate_usd") }]
+      end
+      unproductive_rate = %w[idle unavailable unknown].sum { |status| inference_rates.fetch(status) }
 
       {
         "active_fleet_count" => fleets.length,
@@ -47,6 +51,9 @@ module LocalModelEvaluation
         "inference_counts" => INFERENCE_STATUSES.to_h do |status|
           [status, inference_statuses.count(status)]
         end,
+        "inference_hourly_rates_usd" => inference_rates,
+        "productive_hourly_rate_usd" => inference_rates.fetch("active"),
+        "unproductive_hourly_rate_usd" => unproductive_rate,
         "fleet_aliases" => fleets.map do |entry|
           { "alias" => entry.fetch("fleet_alias"), "fleet_key" => entry.fetch("fleet_key") }
         end,
@@ -65,6 +72,13 @@ module LocalModelEvaluation
       lines << "  Active fleets: #{snapshot.fetch('active_fleet_count')}"
       lines << "  Active workers: #{snapshot.fetch('active_worker_count')}"
       lines << format("  Current managed rate: $%.4f/hr", snapshot.fetch("current_tracked_hourly_rate_usd"))
+      lines << format("  Productive ACTIVE rate: $%.4f/hr", snapshot.fetch("productive_hourly_rate_usd"))
+      lines << format("  Unproductive burn: $%.4f/hr", snapshot.fetch("unproductive_hourly_rate_usd"))
+      rates = snapshot.fetch("inference_hourly_rates_usd")
+      lines << format(
+        "    idle $%.4f/hr; unavailable $%.4f/hr; unknown $%.4f/hr",
+        rates.fetch("idle"), rates.fetch("unavailable"), rates.fetch("unknown")
+      )
       lines << format("  Estimated accrued cost: $%.4f", snapshot.fetch("estimated_accrued_cost_usd"))
       lines << format(
         "  Ollama inference: %d active; %d idle; %d unavailable; %d unknown",

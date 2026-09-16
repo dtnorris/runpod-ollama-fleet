@@ -99,7 +99,7 @@ module LocalModelEvaluation
 
     def initialize(fleet_state:, output_dir:, repo_root:, out: $stdout,
                    endpoint_checker: nil, command_runner: nil,
-                   wall_clock: nil, monotonic_clock: nil, workdir: nil)
+                   wall_clock: nil, monotonic_clock: nil, workdir: nil, drain_checker: nil)
       @fleet_state = fleet_state
       @output_dir = File.expand_path(output_dir)
       @repo_root = File.expand_path(repo_root)
@@ -109,6 +109,7 @@ module LocalModelEvaluation
       @command_runner = command_runner || SystemCommandRunner.new
       @wall_clock = wall_clock || -> { Time.now.utc }
       @monotonic_clock = monotonic_clock || -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+      @drain_checker = drain_checker
       @state_mutex = Mutex.new
       @results = []
       @infrastructure_failures = []
@@ -183,6 +184,7 @@ module LocalModelEvaluation
         @results.clear
         @infrastructure_failures.clear
         @stop_requested = false
+        @drained = false
       end
     end
 
@@ -192,6 +194,22 @@ module LocalModelEvaluation
 
     def stop_requested?
       @state_mutex.synchronize { @stop_requested == true }
+    end
+
+    def mark_drained!
+      @state_mutex.synchronize { @drained = true }
+    end
+
+    def drained?
+      @state_mutex.synchronize { @drained == true }
+    end
+
+    def drain_requested?
+      return false unless @drain_checker
+
+      @drain_checker.call == true
+    rescue StandardError => e
+      raise InfrastructureError, "cost drain check failed: #{e.class}: #{e.message}"
     end
 
     def normalize_jobs(values)
@@ -286,6 +304,11 @@ module LocalModelEvaluation
     def worker_loop(queue, fleet_id, planned_worker)
       loop do
         break if stop_requested?
+        if drain_requested?
+          mark_drained!
+          break
+        end
+
 
         begin
           worker = ready_worker!(fleet_id, planned_worker)
@@ -616,7 +639,7 @@ module LocalModelEvaluation
         "status" => if integrity_errors.any?
                       "integrity_failed"
                     elsif not_started_job_ids.any?
-                      "infrastructure_failed"
+                      drained? ? "drained" : "infrastructure_failed"
                     elsif countable_results.any? { |result| result["status"] == "failed" }
                       "workload_failed"
                     else

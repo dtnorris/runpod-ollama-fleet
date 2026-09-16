@@ -5,6 +5,7 @@ require "json"
 require "time"
 require_relative "contract_v0_1"
 require_relative "../local_model_evaluation/runpod_dispatcher"
+require_relative "../local_model_evaluation/runpod_cost_control"
 
 module RunpodOllamaFleet
   class DispatchV01
@@ -28,12 +29,19 @@ module RunpodOllamaFleet
       target = request.fetch("target")
       fleet, workers = validate_target!(target)
       validate_resume_target!(target)
+      cost = cost_control
+      validate_cost_gate!(cost, fleet)
+      drain_checker = lambda do
+        gate = cost.dispatch_gate(fleet_key: @fleet_key, fleet_id: fleet.fetch("fleet_id"))
+        !gate.fetch("allowed")
+      end
       dispatcher = @dispatcher_class.new(
         fleet_state: @fleet_state,
         output_dir: output_dir,
         repo_root: @provider_repo_root,
         workdir: @workdir,
-        out: @out
+        out: @out,
+        drain_checker: drain_checker
       )
       private_summary = dispatcher.run(
         jobs: request.fetch("jobs"),
@@ -45,6 +53,7 @@ module RunpodOllamaFleet
       public_summary
     rescue LocalModelEvaluation::RunpodDispatcher::InfrastructureError,
            LocalModelEvaluation::RunpodFleetState::Error,
+           LocalModelEvaluation::RunpodCostControl::Error,
            KeyError, ArgumentError, TypeError => e
       summary = infrastructure_failure_summary(request, started || utc_now, e)
       write_summary(summary)
@@ -100,6 +109,21 @@ module RunpodOllamaFleet
     rescue JSON::ParserError, ArgumentError, TypeError => e
       raise LocalModelEvaluation::RunpodDispatcher::InfrastructureError,
             "existing dispatch target evidence is invalid: #{e.message}"
+    end
+
+    def cost_control
+      LocalModelEvaluation::RunpodCostControl.new(
+        root: File.join(@provider_repo_root, "output", "runpod-fleets"),
+        repo_root: @provider_repo_root
+      )
+    end
+
+    def validate_cost_gate!(cost, fleet)
+      gate = cost.dispatch_gate(fleet_key: @fleet_key, fleet_id: fleet.fetch("fleet_id"))
+      return if gate.fetch("allowed")
+
+      raise LocalModelEvaluation::RunpodDispatcher::InfrastructureError,
+            "#{gate.fetch('code')}: #{gate.fetch('detail')}"
     end
 
     def public_summary(private_summary)

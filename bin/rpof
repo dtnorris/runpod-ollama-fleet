@@ -30,6 +30,8 @@ when "dispatch-legacy"
   exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-dispatch"), *ARGV
 when "lease"
   exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-lease"), *ARGV
+when "cost"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-cost"), *ARGV
 when "scale"
   exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-lifecycle"), "scale", *ARGV
 when "replace"
@@ -53,6 +55,7 @@ else
       bootstrap
       dispatch-legacy
       lease
+      cost
       scale
       replace
       status
