@@ -28,6 +28,7 @@ module LocalModelEvaluation
       :max_fleet_hourly_rate,
       :container_disk_gb,
       :volume_gb,
+      :network_volume_id,
       :current_worker,
       keyword_init: true
     )
@@ -47,11 +48,15 @@ module LocalModelEvaluation
       raise Error, "local port base must be an integer"
     end
 
-    def preflight_scale(target_worker_count:, max_fleet_hourly_usd: RunpodFleet::DEFAULT_MAX_FLEET_HOURLY_USD)
+    def preflight_scale(target_worker_count:, gpu_id: nil,
+                        max_fleet_hourly_usd: RunpodFleet::DEFAULT_MAX_FLEET_HOURLY_USD)
       target = validate_worker_count(target_worker_count)
       fleet = lifecycle_fleet!(enforce_lease: false)
       current_count = Integer(fleet.fetch("worker_count"))
       raise Error, "scale target already equals current worker count #{current_count}" if target == current_count
+      if target < current_count && gpu_id
+        raise Error, "GPU override applies only when scaling up"
+      end
 
       assert_contiguous_slots!(fleet, current_count)
       current_rate = active_hourly_rate(fleet)
@@ -67,8 +72,9 @@ module LocalModelEvaluation
 
         indices = ((current_count + 1)..target).to_a
         profile = provisioning_profile!(fleet)
+        selected_gpu_id = normalize_gpu_id(gpu_id || fleet_gpu_id!(fleet))
         reject_duplicate_names!(indices)
-        gpu, availability, rate = capacity!(fleet, count: indices.length)
+        gpu, availability, rate = capacity!(fleet, count: indices.length, gpu_id: selected_gpu_id)
         projected_rate = current_rate + (rate * indices.length)
         enforce_fleet_cap!(projected_rate, cap)
 
@@ -87,7 +93,8 @@ module LocalModelEvaluation
           projected_fleet_hourly_rate: projected_rate,
           max_fleet_hourly_rate: cap,
           container_disk_gb: profile.fetch("container_disk_gb"),
-          volume_gb: profile.fetch("volume_gb")
+          volume_gb: profile["volume_gb"],
+          network_volume_id: profile["network_volume_id"]
         )
       end
 
@@ -127,7 +134,8 @@ module LocalModelEvaluation
         projected_fleet_hourly_rate: projected_rate,
         max_fleet_hourly_rate: cap,
         container_disk_gb: nil,
-        volume_gb: nil
+        volume_gb: nil,
+        network_volume_id: nil
       )
     end
 
@@ -141,8 +149,9 @@ module LocalModelEvaluation
       end
 
       profile = provisioning_profile!(fleet)
+      selected_gpu_id = worker_gpu_id(fleet, worker)
       reject_unexpected_replacement_name!(worker)
-      gpu, availability, rate = capacity!(fleet, count: 1)
+      gpu, availability, rate = capacity!(fleet, count: 1, gpu_id: selected_gpu_id)
       current_rate = active_hourly_rate(fleet)
       existing_rate = worker.fetch("status") == "active" ? Float(worker.fetch("hourly_rate_usd")) : 0.0
       cap = positive_float(max_fleet_hourly_usd, "max fleet hourly cost")
@@ -163,7 +172,8 @@ module LocalModelEvaluation
         projected_fleet_hourly_rate: projected_rate,
         max_fleet_hourly_rate: cap,
         container_disk_gb: profile.fetch("container_disk_gb"),
-        volume_gb: profile.fetch("volume_gb"),
+        volume_gb: profile["volume_gb"],
+        network_volume_id: profile["network_volume_id"],
         current_worker: Marshal.load(Marshal.dump(worker))
       )
     end
@@ -183,6 +193,7 @@ module LocalModelEvaluation
         reject_duplicate_names!(preflight.worker_indices)
 
         profile = provisioning_profile!(fleet)
+        selected_gpu_id = preflight.gpu.fetch("id").to_s
         validate_public_key_value!(ssh_public_key)
         cap = positive_float(max_fleet_hourly_usd, "max fleet hourly cost")
         wait_seconds = nonnegative_float(wait_seconds, "wait seconds")
@@ -198,7 +209,7 @@ module LocalModelEvaluation
             ensure_lease_capacity!(current, pending_started_at: created_at, pending_rates:)
             created_at[index] = utc_now
             pod = @client.create_pod(
-              create_body(index, ssh_public_key, fleet.fetch("cloud"), profile:)
+              create_body(index, ssh_public_key, fleet.fetch("cloud"), profile:, gpu_id: selected_gpu_id)
             )
             pod_id = pod["id"].to_s
             raise Error, "RunPod create response for #{worker_name(index)} did not include a pod id" if pod_id.empty?
@@ -216,7 +227,10 @@ module LocalModelEvaluation
             pending_started_at: created_at,
             pending_rates:
           )
-          workers = wait_until_ready(created, cloud: fleet.fetch("cloud"), wait_seconds: effective_wait, poll_seconds:)
+          workers = wait_until_ready(
+            created, cloud: fleet.fetch("cloud"), gpu_id: selected_gpu_id,
+            wait_seconds: effective_wait, poll_seconds:
+          )
           current = lifecycle_fleet!(expected_fleet_id: preflight.fleet_id)
           actual_pending_rates = workers.to_h { |worker| [worker.index, worker.hourly_rate] }
           ensure_lease_capacity!(current, pending_started_at: created_at, pending_rates: actual_pending_rates)
@@ -225,7 +239,7 @@ module LocalModelEvaluation
 
           write_worker_env(workers, fleet_id: preflight.fleet_id)
           env_written = true
-          @fleet_state.add_workers(workers:, created_at_utc_by_index: created_at)
+          @fleet_state.add_workers(workers:, created_at_utc_by_index: created_at, gpu_id: selected_gpu_id)
           workers
         rescue Interrupt, StandardError => e
           remove_worker_env(preflight.worker_indices) if env_written
@@ -315,8 +329,9 @@ module LocalModelEvaluation
           ensure_lease_capacity!(current)
           started_at = utc_now
           profile = provisioning_profile!(current)
+          selected_gpu_id = preflight.gpu.fetch("id").to_s
           pod = @client.create_pod(
-            create_body(index, ssh_public_key, fleet.fetch("cloud"), profile:)
+            create_body(index, ssh_public_key, fleet.fetch("cloud"), profile:, gpu_id: selected_gpu_id)
           )
           pod_id = pod["id"].to_s
           raise Error, "RunPod create response for #{worker_name(index)} did not include a pod id" if pod_id.empty?
@@ -332,7 +347,10 @@ module LocalModelEvaluation
             pending_started_at:,
             pending_rates:
           )
-          worker = wait_until_ready(created, cloud: fleet.fetch("cloud"), wait_seconds: effective_wait, poll_seconds:).fetch(0)
+          worker = wait_until_ready(
+            created, cloud: fleet.fetch("cloud"), gpu_id: selected_gpu_id,
+            wait_seconds: effective_wait, poll_seconds:
+          ).fetch(0)
           current = lifecycle_fleet!(expected_fleet_id: preflight.fleet_id)
           ensure_lease_capacity!(
             current,
@@ -344,7 +362,7 @@ module LocalModelEvaluation
 
           write_worker_env([worker], fleet_id: preflight.fleet_id)
           env_written = true
-          @fleet_state.complete_replacement(worker:, created_at_utc: started_at)
+          @fleet_state.complete_replacement(worker:, created_at_utc: started_at, gpu_id: selected_gpu_id)
           worker
         rescue Interrupt, StandardError => e
           remove_worker_env([index]) if env_written
@@ -409,26 +427,36 @@ module LocalModelEvaluation
         raise Error,
               "current fleet predates recorded provisioning metadata; destroy/recreate it before scale/replace rather than guessing storage sizes"
       end
-      {
-        "container_disk_gb" => positive_integer(profile["container_disk_gb"], "recorded container disk size"),
-        "volume_gb" => positive_integer(profile["volume_gb"], "recorded workspace volume size")
+      result = {
+        "container_disk_gb" => positive_integer(profile["container_disk_gb"], "recorded container disk size")
       }
+      if profile["network_volume_id"]
+        id = profile.fetch("network_volume_id").to_s.strip
+        raise Error, "recorded network volume id is empty" if id.empty?
+        result["volume_gb"] = nil
+        result["network_volume_id"] = id
+      else
+        result["volume_gb"] = positive_integer(profile["volume_gb"], "recorded workspace volume size")
+        result["network_volume_id"] = nil
+      end
+      result
     end
 
-    def capacity!(fleet, count:)
+    def capacity!(fleet, count:, gpu_id:)
       cloud = normalize_cloud(fleet.fetch("cloud"))
-      gpu = @client.list_gpu_types(cloud:, count:).find { |candidate| candidate["id"] == fleet_gpu_id!(fleet) }
-      raise Error, "RunPod catalog did not return #{fleet_gpu_id!(fleet)}" unless gpu
+      selected_gpu_id = normalize_gpu_id(gpu_id)
+      gpu = @client.list_gpu_types(cloud:, count:).find { |candidate| candidate["id"] == selected_gpu_id }
+      raise Error, "RunPod catalog did not return #{selected_gpu_id}" unless gpu
       if gpu["memory"].to_i < RunpodFleet::GPU_MEMORY_GB
-        raise Error, "#{fleet_gpu_id!(fleet)} reports only #{gpu['memory']} GB VRAM; #{RunpodFleet::GPU_MEMORY_GB} GB is required"
+        raise Error, "#{selected_gpu_id} reports only #{gpu['memory']} GB VRAM; #{RunpodFleet::GPU_MEMORY_GB} GB is required"
       end
-      raise Error, "#{fleet_gpu_id!(fleet)} is not available on #{cloud} cloud" unless gpu[cloud.downcase] == true
+      raise Error, "#{selected_gpu_id} is not available on #{cloud} cloud" unless gpu[cloud.downcase] == true
 
       availability = gpu["availability"].to_s
       if availability.empty? || availability == "NONE"
-        raise Error, "#{fleet_gpu_id!(fleet)} #{cloud} availability is #{availability.empty? ? 'unknown' : availability}"
+        raise Error, "#{selected_gpu_id} #{cloud} availability is #{availability.empty? ? 'unknown' : availability}"
       end
-      rate = positive_float(gpu.dig("price", cloud.downcase), "#{fleet_gpu_id!(fleet)} #{cloud} hourly rate")
+      rate = positive_float(gpu.dig("price", cloud.downcase), "#{selected_gpu_id} #{cloud} hourly rate")
       [gpu, availability, rate]
     end
 
@@ -490,25 +518,25 @@ module LocalModelEvaluation
       raise Error, e.message
     end
 
-    def create_body(index, ssh_public_key, cloud, profile:)
+    def create_body(index, ssh_public_key, cloud, profile:, gpu_id:)
+      mounts = if profile["network_volume_id"]
+                 { "network" => [{ "volumeId" => profile.fetch("network_volume_id"), "path" => RunpodFleet::VOLUME_MOUNT_PATH }] }
+               else
+                 { "persistent" => { "size" => profile.fetch("volume_gb"), "path" => RunpodFleet::VOLUME_MOUNT_PATH } }
+               end
       {
         "name" => worker_name(index),
         "image" => RunpodFleet::IMAGE,
         "disk" => profile.fetch("container_disk_gb"),
         "ports" => ["22/tcp"],
         "env" => { "PUBLIC_KEY" => ssh_public_key },
-        "mounts" => {
-          "persistent" => {
-            "size" => profile.fetch("volume_gb"),
-            "path" => RunpodFleet::VOLUME_MOUNT_PATH
-          }
-        },
+        "mounts" => mounts,
         "cloud" => cloud,
-        "gpu" => { "id" => current_gpu_id!, "count" => 1 }
+        "gpu" => { "id" => normalize_gpu_id(gpu_id), "count" => 1 }
       }
     end
 
-    def wait_until_ready(created, cloud:, wait_seconds:, poll_seconds:)
+    def wait_until_ready(created, cloud:, gpu_id:, wait_seconds:, poll_seconds:)
       pending = created.to_h
       ready = {}
       deadline = @monotonic_clock.call + wait_seconds
@@ -517,7 +545,7 @@ module LocalModelEvaluation
         pending.keys.each do |index|
           pod_id = pending.fetch(index)
           pod = @client.get_pod(pod_id)
-          validate_pod!(pod, index, pod_id, cloud:)
+          validate_pod!(pod, index, pod_id, cloud:, gpu_id:)
           status = pod["status"].to_s
           raise Error, "#{worker_name(index)} entered terminal status #{status}" if %w[ERROR TERMINATED].include?(status)
           next unless status == "RUNNING"
@@ -553,13 +581,14 @@ module LocalModelEvaluation
       raise Error, e.message
     end
 
-    def validate_pod!(pod, index, pod_id, cloud:)
+    def validate_pod!(pod, index, pod_id, cloud:, gpu_id:)
       expected_name = worker_name(index)
       raise Error, "pod #{pod_id} name mismatch: expected #{expected_name.inspect}, got #{pod['name'].inspect}" unless pod["name"] == expected_name
       raise Error, "#{expected_name} cloud mismatch: expected #{cloud}, got #{pod['cloud'].inspect}" unless pod["cloud"] == cloud
+      expected_gpu_id = normalize_gpu_id(gpu_id)
       gpu = pod["gpu"] || {}
-      unless gpu["id"] == current_gpu_id! && gpu["count"].to_i == 1
-        raise Error, "#{expected_name} GPU mismatch: expected 1x #{current_gpu_id!}, got #{gpu.inspect}"
+      unless gpu["id"] == expected_gpu_id && gpu["count"].to_i == 1
+        raise Error, "#{expected_name} GPU mismatch: expected 1x #{expected_gpu_id}, got #{gpu.inspect}"
       end
     end
 
@@ -695,6 +724,18 @@ module LocalModelEvaluation
 
     def worker_by_index(fleet, index)
       Array(fleet.fetch("workers")).find { |worker| Integer(worker.fetch("index")) == index }
+    end
+
+    def worker_gpu_id(fleet, worker)
+      selected = worker["gpu_id"].to_s.strip
+      selected = fleet_gpu_id!(fleet) if selected.empty?
+      normalize_gpu_id(selected)
+    end
+
+    def normalize_gpu_id(value)
+      selected = value.to_s.strip
+      raise Error, "GPU id must not be empty" if selected.empty?
+      selected
     end
 
     def worker_name(index)

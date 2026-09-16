@@ -73,7 +73,7 @@ module LocalModelEvaluation
 
       worker_started_at = lease ? Time.parse(lease.fetch("started_at_utc")).utc : timestamp
       worker_records = workers.map do |worker|
-        worker_record(worker, created_at: worker_started_at, generation: 1)
+        worker_record(worker, created_at: worker_started_at, generation: 1, gpu_id: gpu_id)
       end
 
       record = {
@@ -112,7 +112,7 @@ module LocalModelEvaluation
       record
     end
 
-    def add_workers(workers:, created_at_utc_by_index:)
+    def add_workers(workers:, created_at_utc_by_index:, gpu_id: nil)
       record = active_record!
       workers = Array(workers).sort_by(&:index)
       raise Error, "cannot add an empty worker set" if workers.empty?
@@ -129,7 +129,7 @@ module LocalModelEvaluation
         started_at = parse_time(created_at_utc_by_index.fetch(index), "burst_#{worker.index} created_at_utc")
         retired = latest_retired_worker(record, index)
         generation = retired ? Integer(retired.fetch("generation", 1)) + 1 : 1
-        entry = worker_record(worker, created_at: started_at, generation:)
+        entry = worker_record(worker, created_at: started_at, generation:, gpu_id:)
         if retired
           history = Array(retired["history"]).map(&:dup)
           history << historical_worker(retired)
@@ -228,7 +228,7 @@ module LocalModelEvaluation
       record
     end
 
-    def complete_replacement(worker:, created_at_utc:)
+    def complete_replacement(worker:, created_at_utc:, gpu_id: nil)
       record = active_record!
       index = Integer(worker.index)
       old = fetch_worker!(record, index)
@@ -252,7 +252,8 @@ module LocalModelEvaluation
       replacement = worker_record(
         worker,
         created_at: parse_time(created_at_utc, "burst_#{index} replacement created_at_utc"),
-        generation: Integer(old.fetch("generation", 1)) + 1
+        generation: Integer(old.fetch("generation", 1)) + 1,
+        gpu_id: gpu_id || old["gpu_id"] || record.dig("gpu", "id")
       )
       replacement["history"] = history
       replacement["accrued_cost_offset_usd"] = accrued_offset.round(6)
@@ -405,8 +406,8 @@ module LocalModelEvaluation
         .max_by { |worker| Integer(worker.fetch("generation", 1)) }
     end
 
-    def worker_record(worker, created_at:, generation:)
-      {
+    def worker_record(worker, created_at:, generation:, gpu_id: nil)
+      record = {
         "index" => Integer(worker.index),
         "name" => worker.name,
         "pod_id" => worker.pod_id,
@@ -418,10 +419,13 @@ module LocalModelEvaluation
         "generation" => Integer(generation),
         "created_at_utc" => created_at.utc.iso8601
       }
+      selected_gpu = gpu_id.to_s.strip
+      record["gpu_id"] = selected_gpu unless selected_gpu.empty?
+      record
     end
 
     def historical_worker(worker)
-      %w[generation name pod_id host ssh_port hourly_rate_usd created_at_utc destroyed_at_utc].each_with_object({}) do |key, out|
+      %w[generation name pod_id host ssh_port hourly_rate_usd gpu_id created_at_utc destroyed_at_utc].each_with_object({}) do |key, out|
         out[key] = worker[key] if worker.key?(key)
       end
     end
@@ -525,6 +529,9 @@ module LocalModelEvaluation
       tracked_workers.each do |worker|
         RunpodWorkers.validate_index(worker.fetch("index"))
         Integer(worker.fetch("generation", 1))
+        if worker.key?("gpu_id") && worker.fetch("gpu_id").to_s.strip.empty?
+          raise Error, "worker gpu_id must not be empty"
+        end
         parse_time(worker["created_at_utc"], "worker created_at_utc") if worker["created_at_utc"]
         if worker["status"] == "destroyed" && worker["destroyed_at_utc"]
           parse_time(worker.fetch("destroyed_at_utc"), "worker destroyed_at_utc")

@@ -106,9 +106,17 @@ module RunpodOllamaFleet
       return [nil, "bootstrap context mismatch: expected #{required_context}, got #{bootstrap['context'].inspect}"] unless bootstrap["context"] == required_context
 
       required_gpu = requirements["required_gpu_id"]
-      fleet_gpu = fleet.dig("gpu", "id").to_s
-      return [nil, "current fleet does not record an exact GPU id"] if fleet_gpu.empty?
-      return [nil, "GPU mismatch: expected #{required_gpu.inspect}, got #{fleet_gpu.inspect}"] if required_gpu && required_gpu != fleet_gpu
+      worker_gpus = workers.to_h do |worker|
+        index = Integer(worker.fetch("index"))
+        [index, worker_gpu_id(fleet, worker)]
+      end
+      if required_gpu
+        mismatched = worker_gpus.select { |_index, gpu_id| gpu_id != required_gpu }
+        unless mismatched.empty?
+          detail = mismatched.map { |index, gpu_id| "burst_#{index}=#{gpu_id.inspect}" }.join(", ")
+          return [nil, "GPU mismatch: expected #{required_gpu.inspect}; #{detail}"]
+        end
+      end
 
       boot_by_index = Array(bootstrap.fetch("workers")).to_h { |worker| [Integer(worker.fetch("index")), worker] }
       capabilities = []
@@ -120,7 +128,10 @@ module RunpodOllamaFleet
           return [nil, "burst_#{index}: missing bootstrap provenance"] unless boot && boot["status"] == "passed"
           provenance = boot.fetch("provenance", {})
           gpu = provenance.dig("gpu", "name").to_s
-          return [nil, "burst_#{index}: GPU provenance mismatch"] unless gpu == fleet_gpu
+          expected_gpu = worker_gpus.fetch(index)
+          unless gpu == expected_gpu
+            return [nil, "burst_#{index}: GPU provenance mismatch: expected #{expected_gpu.inspect}, got #{gpu.inspect}"]
+          end
           observed = provenance.fetch("models", {})[name]
           return [nil, "burst_#{index}: missing model provenance for #{name}"] unless observed
           observed
@@ -143,13 +154,21 @@ module RunpodOllamaFleet
           "fully_gpu_resident" => true
         }
       end
+      selected_gpu_ids = worker_gpus.values.uniq
       [{
-        "gpu_id" => fleet_gpu,
+        "gpu_id" => selected_gpu_ids.length == 1 ? selected_gpu_ids.first : "mixed",
         "bootstrap_run_id" => bootstrap.fetch("run_id"),
         "models" => capabilities
       }, "exact bootstrap model/GPU/context provenance matches selected workers"]
     rescue KeyError, ArgumentError, TypeError => e
       [nil, "invalid bootstrap provenance: #{e.message}"]
+    end
+
+    def worker_gpu_id(fleet, worker)
+      selected = worker["gpu_id"].to_s.strip
+      selected = fleet.dig("gpu", "id").to_s.strip if selected.empty?
+      raise ArgumentError, "burst_#{worker.fetch('index')} does not record an exact GPU id" if selected.empty?
+      selected
     end
 
     def tunnel_diagnostic(fleet, workers)

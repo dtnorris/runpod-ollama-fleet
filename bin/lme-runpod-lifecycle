@@ -20,6 +20,7 @@ opts = {
   fleet: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY),
   workers: nil,
   worker: nil,
+  gpu_id: nil,
   dry_run: false,
   yes: false,
   max_hourly_usd: ENV.fetch("RUNPOD_MAX_FLEET_HOURLY_USD", LocalModelEvaluation::RunpodFleet::DEFAULT_MAX_FLEET_HOURLY_USD),
@@ -38,6 +39,7 @@ parser = OptionParser.new do |o|
   o.on("--fleet KEY", "Managed RunPod fleet key") { |v| opts[:fleet] = v }
   if command == "scale"
     o.on("--workers N", Integer, "Resize active fleet to N contiguous logical workers (1-16)") { |v| opts[:workers] = v }
+    o.on("--gpu GPU_ID", "GPU type for newly-added workers; defaults to the fleet GPU") { |v| opts[:gpu_id] = v }
   else
     o.on("--worker N", Integer, "Replace logical worker slot N (1-16)") { |v| opts[:worker] = v }
   end
@@ -162,6 +164,7 @@ begin
   preflight = if command == "scale"
                 lifecycle.preflight_scale(
                   target_worker_count: opts[:workers],
+                  gpu_id: opts[:gpu_id],
                   max_fleet_hourly_usd: opts[:max_hourly_usd]
                 )
               else
@@ -208,7 +211,11 @@ begin
   end
   unless scale_down
     puts "  Container disk: #{preflight.container_disk_gb} GB"
-    puts "  Workspace volume: #{preflight.volume_gb} GB at #{LocalModelEvaluation::RunpodFleet::VOLUME_MOUNT_PATH}"
+    if preflight.network_volume_id
+      puts "  Existing network volume: #{preflight.network_volume_id} at #{LocalModelEvaluation::RunpodFleet::VOLUME_MOUNT_PATH}"
+    else
+      puts "  Workspace volume: #{preflight.volume_gb} GB at #{LocalModelEvaluation::RunpodFleet::VOLUME_MOUNT_PATH}"
+    end
     puts format("  Catalog rate: $%.4f/hr per new worker", preflight.hourly_rate)
   end
   puts format("  Current fleet rate: $%.4f/hr", preflight.current_fleet_hourly_rate)

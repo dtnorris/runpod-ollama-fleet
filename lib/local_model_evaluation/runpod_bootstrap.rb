@@ -37,8 +37,9 @@ module LocalModelEvaluation
       workers = selected_workers(fleet, worker_indices)
       models = normalize_models(models)
       digests = normalize_digests(expected_digests, models)
-      expected_gpu = fleet.dig("gpu", "id").to_s
-      raise Error, "current fleet does not record an exact GPU id" if expected_gpu.empty?
+      expected_gpus = workers.to_h do |worker|
+        [Integer(worker.fetch("index")), worker_gpu_id(fleet, worker)]
+      end
       if clean && reuse_existing
         raise Error, "--clean cannot be combined with --reuse-existing"
       end
@@ -72,7 +73,7 @@ module LocalModelEvaluation
           workers:,
           models:,
           digests:,
-          expected_gpu:,
+          expected_gpus:,
           clean:,
           reuse_existing:,
           keep_root_models:,
@@ -89,7 +90,7 @@ module LocalModelEvaluation
 
     private
 
-    def execute_run(fleet:, workers:, models:, digests:, expected_gpu:, clean:, reuse_existing:,
+    def execute_run(fleet:, workers:, models:, digests:, expected_gpus:, clean:, reuse_existing:,
                     keep_root_models:, state_root:, context:, heartbeat_seconds:, poll_seconds:, bootstrap_root:)
       started_wall = utc_now
       started_mono = @monotonic_clock.call
@@ -101,7 +102,7 @@ module LocalModelEvaluation
         workers:,
         models:,
         digests:,
-        expected_gpu:,
+        expected_gpus:,
         clean:,
         reuse_existing:,
         keep_root_models:,
@@ -121,7 +122,7 @@ module LocalModelEvaluation
             worker:,
             models:,
             digests:,
-            expected_gpu:,
+            expected_gpu: expected_gpus.fetch(Integer(worker.fetch("index"))),
             clean:,
             reuse_existing:,
             keep_root_models:,
@@ -195,7 +196,7 @@ module LocalModelEvaluation
               models:,
               digests:,
               context:,
-              expected_gpu:
+              expected_gpu: expected_gpus.fetch(index)
             )
             worker["provenance_error"] = provenance_error
 
@@ -279,6 +280,13 @@ module LocalModelEvaluation
       raise Error, e.message
     rescue ArgumentError, TypeError
       raise Error, "worker indices must be integers"
+    end
+
+    def worker_gpu_id(fleet, worker)
+      selected = worker["gpu_id"].to_s.strip
+      selected = fleet.dig("gpu", "id").to_s.strip if selected.empty?
+      raise Error, "burst_#{worker.fetch('index')} does not record an exact GPU id" if selected.empty?
+      selected
     end
 
     def normalize_models(values)
@@ -535,8 +543,9 @@ module LocalModelEvaluation
       remaining.each { |pid| @process_supervisor.wait(pid) }
     end
 
-    def initial_record(fleet:, workers:, models:, digests:, expected_gpu:, clean:, reuse_existing:,
+    def initial_record(fleet:, workers:, models:, digests:, expected_gpus:, clean:, reuse_existing:,
                        keep_root_models:, state_root:, context:, heartbeat_seconds:, started_wall:, run_id:)
+      gpu_ids = expected_gpus.values.uniq
       {
         "schema_version" => 2,
         "bootstrap_run_id" => run_id,
@@ -546,7 +555,8 @@ module LocalModelEvaluation
         "finished_at_utc" => nil,
         "models" => models,
         "expected_digests" => digests,
-        "expected_gpu" => expected_gpu,
+        "expected_gpu" => gpu_ids.length == 1 ? gpu_ids.first : nil,
+        "expected_gpus" => expected_gpus.transform_keys(&:to_s),
         "clean" => clean,
         "reuse_existing" => reuse_existing,
         "keep_root_models" => keep_root_models,
@@ -560,6 +570,7 @@ module LocalModelEvaluation
             "pod_id" => worker.fetch("pod_id"),
             "host" => worker.fetch("host"),
             "ssh_port" => worker.fetch("ssh_port"),
+            "expected_gpu" => expected_gpus.fetch(Integer(worker.fetch("index"))),
             "status" => "pending",
             "stage" => "PENDING",
             "progress" => nil,
