@@ -2,6 +2,7 @@
 
 require "minitest/autorun"
 require "tmpdir"
+require "stringio"
 require_relative "../lib/local_model_evaluation/runpod_dispatcher"
 
 class RunpodDispatcherDrainTest < Minitest::Test
@@ -52,6 +53,7 @@ class RunpodDispatcherDrainTest < Minitest::Test
         fleet_state: FakeState.new,
         output_dir: File.join(root, "evidence"),
         repo_root: root,
+        out: StringIO.new,
         endpoint_checker: HealthyEndpoint.new,
         command_runner: runner,
         drain_checker: -> { runner.completed.positive? }

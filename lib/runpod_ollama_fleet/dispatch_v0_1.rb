@@ -27,7 +27,7 @@ module RunpodOllamaFleet
       ContractV01.validate_dispatch_request!(request)
       started = utc_now
       target = request.fetch("target")
-      fleet, workers = validate_target!(target)
+      fleet, _workers = validate_target!(target)
       validate_resume_target!(target)
       cost = cost_control
       validate_cost_gate!(cost, fleet)

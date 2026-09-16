@@ -4,6 +4,7 @@ require "minitest/autorun"
 require "tmpdir"
 require "fileutils"
 require "json"
+require "stringio"
 require_relative "../lib/local_model_evaluation/runpod_cost_control"
 
 class RunpodCostControlTest < Minitest::Test
@@ -112,6 +113,7 @@ class RunpodCostControlTest < Minitest::Test
         root: root,
         repo_root: root,
         client: Object.new,
+        out: StringIO.new,
         wall_clock: -> { now }
       )
       control.define_singleton_method(:active_entries) { [entry] }
