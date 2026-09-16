@@ -146,8 +146,11 @@ class RunpodStatusTest < Minitest::Test
         "models" => ["gemma4:26b"],
         "context" => 131_072,
         "workers" => [
-          { "index" => 1, "status" => "passed", "stage" => "READY" },
-          { "index" => 2, "status" => "running", "stage" => "WARMING" }
+          {
+            "index" => 1, "pod_id" => "pod_a", "status" => "passed", "stage" => "READY",
+            "provenance" => { "models" => { "gemma4:26b" => {} } }
+          },
+          { "index" => 2, "pod_id" => "pod_b", "status" => "running", "stage" => "WARMING" }
         ]
       }
     ))
@@ -161,6 +164,8 @@ class RunpodStatusTest < Minitest::Test
     bootstrap = snapshot.fetch("bootstrap")
     assert_equal "running", bootstrap.fetch("status")
     assert_equal ["gemma4:26b"], bootstrap.fetch("models")
+    assert_equal ["gemma4:26b"], snapshot.fetch("workers").first.fetch("available_models")
+    assert_empty snapshot.fetch("workers").last.fetch("available_models")
     assert_in_delta 1200.0, bootstrap.fetch("elapsed_seconds"), 0.001
 
     output = status.render(snapshot)
@@ -169,6 +174,8 @@ class RunpodStatusTest < Minitest::Test
     assert_includes output, "WARMING"
     assert_includes output, "Models: gemma4:26b"
     assert_includes output, "1 running; 1 passed; 0 failed; 0 interrupted"
+    assert_match(/burst_1.*NVIDIA A40.*gemma4:26b.*READY/, output)
+    assert_match(/burst_2.*NVIDIA A40.*-.*WARMING/, output)
   end
 
   def test_provider_missing_warns_without_hiding_local_billing_state
@@ -229,10 +236,13 @@ class RunpodStatusTest < Minitest::Test
     output = status.render(snapshot)
     assert_includes output, "Ollama inference: 1 active; 1 idle; 0 unavailable; 0 unknown"
     assert_includes output, "GPU profiles: NVIDIA A40 ×2"
-    assert_match(/burst_1.*NVIDIA A40.*gemma4:26b.*ACTIVE/, output)
-    assert_match(/burst_2.*NVIDIA A40.*-.*IDLE/, output)
+    assert_includes output, "AVAILABLE"
+    assert_includes output, "LOADED"
+    assert_match(/burst_1.*NVIDIA A40.*-.*gemma4:26b.*ACTIVE/, output)
+    assert_match(/burst_2.*NVIDIA A40.*-.*-.*IDLE/, output)
     assert_includes output, "Inference ACTIVE means an established local TCP client connection"
-    assert_includes output, "MODEL reports Ollama /api/ps residency"
+    assert_includes output, "AVAILABLE reports model(s) from passed bootstrap evidence"
+    assert_includes output, "LOADED reports Ollama /api/ps residency"
   end
 
   def test_status_reports_mixed_worker_gpu_profiles_with_legacy_fallback

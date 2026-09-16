@@ -48,6 +48,13 @@ module LocalModelEvaluation
       lease = RunpodLease.snapshot_for(fleet:, now:)
       lease = nil if lease["status"] == "unconfigured"
 
+      bootstrap = bootstrap_snapshot(fleet, now)
+      bootstrap_workers = bootstrap_workers_by_index(bootstrap)
+      workers.each do |worker|
+        bootstrap_worker = bootstrap_workers[worker.fetch("index")]
+        worker["available_models"] = available_models_from_bootstrap(bootstrap, bootstrap_worker, worker.fetch("pod_id"))
+      end
+
       {
         "fleet_id" => fleet.fetch("fleet_id"),
         "lme_status" => fleet.fetch("status"),
@@ -66,7 +73,7 @@ module LocalModelEvaluation
         "workers" => workers,
         "inference_activity" => activity && activity.fetch("counts"),
         "lease" => lease,
-        "bootstrap" => bootstrap_snapshot(fleet, now)
+        "bootstrap" => bootstrap
       }
     rescue KeyError, ArgumentError, TypeError => e
       raise Error, "invalid current fleet state: #{e.message}"
@@ -102,11 +109,11 @@ module LocalModelEvaluation
       lines << ""
       if snapshot["inference_activity"]
         lines << format(
-          "%-9s %-20s %-30s %-10s %-12s %-10s %-10s %-10s %-11s %s",
-          "WORKER", "GPU", "MODEL", "LME", "RUNPOD", "RATE", "ELAPSED", "EST.COST", "INFERENCE", "BOOTSTRAP"
+          "%-9s %-20s %-30s %-30s %-10s %-12s %-10s %-10s %-10s %-11s %s",
+          "WORKER", "GPU", "AVAILABLE", "LOADED", "LME", "RUNPOD", "RATE", "ELAPSED", "EST.COST", "INFERENCE", "BOOTSTRAP"
         )
       else
-        lines << format("%-9s %-20s %-10s %-12s %-10s %-10s %-10s %s", "WORKER", "GPU", "LME", "RUNPOD", "RATE", "ELAPSED", "EST.COST", "BOOTSTRAP")
+        lines << format("%-9s %-20s %-30s %-10s %-12s %-10s %-10s %-10s %s", "WORKER", "GPU", "AVAILABLE", "LME", "RUNPOD", "RATE", "ELAPSED", "EST.COST", "BOOTSTRAP")
       end
 
       bootstrap_workers = bootstrap_workers_by_index(snapshot["bootstrap"])
@@ -114,9 +121,10 @@ module LocalModelEvaluation
         boot = bootstrap_worker_label(bootstrap_workers[worker.fetch("index")])
         if snapshot["inference_activity"]
           lines << format(
-            "%-9s %-20s %-30s %-10s %-12s $%-9.4f %-10s $%-9.4f %-11s %s",
+            "%-9s %-20s %-30s %-30s %-10s %-12s $%-9.4f %-10s $%-9.4f %-11s %s",
             "burst_#{worker.fetch('index')}",
             worker.fetch("gpu_id"),
+            available_model_label(worker),
             loaded_model_label(worker),
             worker.fetch("lme_status").upcase,
             worker.fetch("provider_status"),
@@ -128,9 +136,10 @@ module LocalModelEvaluation
           )
         else
           lines << format(
-            "%-9s %-20s %-10s %-12s $%-9.4f %-10s $%-9.4f %s",
+            "%-9s %-20s %-30s %-10s %-12s $%-9.4f %-10s $%-9.4f %s",
             "burst_#{worker.fetch('index')}",
             worker.fetch("gpu_id"),
+            available_model_label(worker),
             worker.fetch("lme_status").upcase,
             worker.fetch("provider_status"),
             worker.fetch("hourly_rate_usd"),
@@ -151,8 +160,9 @@ module LocalModelEvaluation
       if snapshot["inference_activity"]
         lines << "Inference ACTIVE means an established local TCP client connection to the worker's managed Ollama tunnel was observed at this snapshot."
         lines << "It indicates live Ollama request traffic (such as scoring), not AFIO job identity; short requests can be missed between snapshots."
-        lines << "MODEL reports Ollama /api/ps residency at this snapshot; '-' means the healthy worker reported no model currently loaded."
       end
+      lines << "AVAILABLE reports model(s) from passed bootstrap evidence for that worker; '-' means no passed bootstrap evidence is currently recorded."
+      lines << "LOADED reports Ollama /api/ps residency at this snapshot; '-' means the healthy worker reported no model currently loaded." if snapshot["inference_activity"]
       if snapshot["lease"]
         lines << "Lease spend is a conservative guard estimate that starts before the first paid pod create and uses recorded worker rates."
         lines << "Lease enforcement is a local watchdog, not a provider-side billing cap; it cannot enforce limits while the control-plane Mac is offline."
@@ -408,6 +418,25 @@ module LocalModelEvaluation
 
       lines << ""
       lines.concat(warnings)
+    end
+
+    def available_models_from_bootstrap(bootstrap, worker, pod_id)
+      return [] unless bootstrap && bootstrap["status"] != "unavailable"
+      return [] unless worker && worker["status"].to_s == "passed"
+      return [] unless worker["pod_id"].to_s == pod_id.to_s
+
+      provenance_models = worker.dig("provenance", "models")
+      models = if provenance_models.is_a?(Hash) && !provenance_models.empty?
+                 provenance_models.keys
+               else
+                 Array(bootstrap["models"])
+               end
+      models.map { |model| model.to_s.strip }.reject(&:empty?).uniq.sort
+    end
+
+    def available_model_label(worker)
+      models = Array(worker["available_models"])
+      models.empty? ? "-" : models.join(",")
     end
 
     def loaded_model_label(worker)
