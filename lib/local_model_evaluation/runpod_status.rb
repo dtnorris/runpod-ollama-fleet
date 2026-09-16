@@ -25,7 +25,7 @@ module LocalModelEvaluation
       activity = @activity_monitor&.snapshot(fleet)
       activity_workers = activity ? activity.fetch("workers") : {}
       workers = fleet.fetch("workers").sort_by { |worker| Integer(worker.fetch("index")) }.map do |worker|
-        row = worker_snapshot(worker, created_at, now)
+        row = worker_snapshot(worker, fleet, created_at, now)
         if activity
           observation = activity_workers.fetch(row.fetch("index")) do
             { "status" => "unknown", "detail" => "activity observation is missing" }
@@ -33,6 +33,9 @@ module LocalModelEvaluation
           row["inference_status"] = observation.fetch("status")
           row["inference_detail"] = observation["detail"]
           row["inference_endpoint"] = observation["endpoint"]
+          row["loaded_models"] = Array(observation["loaded_models"])
+          row["model_status"] = observation["model_status"] || "unknown"
+          row["model_detail"] = observation["model_detail"]
         end
         row
       end
@@ -52,6 +55,7 @@ module LocalModelEvaluation
         "tracked_elapsed_seconds" => nonnegative_seconds(created_at, stopped_at),
         "cloud" => fleet.fetch("cloud"),
         "gpu_id" => fleet.dig("gpu", "id").to_s,
+        "gpu_profiles" => gpu_profile_counts(active_workers),
         "worker_count" => workers.length,
         "active_worker_count" => active_workers.length,
         "destroyed_worker_count" => workers.count { |worker| worker.fetch("lme_status") == "destroyed" },
@@ -80,7 +84,8 @@ module LocalModelEvaluation
       lines << "  Fleet: #{snapshot.fetch('fleet_id')}"
       lines << "  LME state: #{snapshot.fetch('lme_status').upcase}"
       lines << "  Created: #{snapshot.fetch('created_at_utc')}"
-      lines << "  Cloud/GPU: #{snapshot.fetch('cloud')} / #{snapshot.fetch('gpu_id')}"
+      lines << "  Cloud: #{snapshot.fetch('cloud')}"
+      lines << "  GPU profiles: #{gpu_profiles_label(snapshot.fetch('gpu_profiles'))}"
       lines << format(
         "  Workers: %d total; %d active; %d destroyed",
         snapshot.fetch("worker_count"),
@@ -97,11 +102,11 @@ module LocalModelEvaluation
       lines << ""
       if snapshot["inference_activity"]
         lines << format(
-          "%-9s %-10s %-12s %-10s %-10s %-10s %-11s %s",
-          "WORKER", "LME", "RUNPOD", "RATE", "ELAPSED", "EST.COST", "INFERENCE", "BOOTSTRAP"
+          "%-9s %-20s %-30s %-10s %-12s %-10s %-10s %-10s %-11s %s",
+          "WORKER", "GPU", "MODEL", "LME", "RUNPOD", "RATE", "ELAPSED", "EST.COST", "INFERENCE", "BOOTSTRAP"
         )
       else
-        lines << format("%-9s %-10s %-12s %-10s %-10s %-10s %s", "WORKER", "LME", "RUNPOD", "RATE", "ELAPSED", "EST.COST", "BOOTSTRAP")
+        lines << format("%-9s %-20s %-10s %-12s %-10s %-10s %-10s %s", "WORKER", "GPU", "LME", "RUNPOD", "RATE", "ELAPSED", "EST.COST", "BOOTSTRAP")
       end
 
       bootstrap_workers = bootstrap_workers_by_index(snapshot["bootstrap"])
@@ -109,8 +114,10 @@ module LocalModelEvaluation
         boot = bootstrap_worker_label(bootstrap_workers[worker.fetch("index")])
         if snapshot["inference_activity"]
           lines << format(
-            "%-9s %-10s %-12s $%-9.4f %-10s $%-9.4f %-11s %s",
+            "%-9s %-20s %-30s %-10s %-12s $%-9.4f %-10s $%-9.4f %-11s %s",
             "burst_#{worker.fetch('index')}",
+            worker.fetch("gpu_id"),
+            loaded_model_label(worker),
             worker.fetch("lme_status").upcase,
             worker.fetch("provider_status"),
             worker.fetch("hourly_rate_usd"),
@@ -121,8 +128,9 @@ module LocalModelEvaluation
           )
         else
           lines << format(
-            "%-9s %-10s %-12s $%-9.4f %-10s $%-9.4f %s",
+            "%-9s %-20s %-10s %-12s $%-9.4f %-10s $%-9.4f %s",
             "burst_#{worker.fetch('index')}",
+            worker.fetch("gpu_id"),
             worker.fetch("lme_status").upcase,
             worker.fetch("provider_status"),
             worker.fetch("hourly_rate_usd"),
@@ -136,12 +144,14 @@ module LocalModelEvaluation
       append_bootstrap(lines, snapshot["bootstrap"])
       append_provider_warnings(lines, snapshot)
       append_inference_warnings(lines, snapshot)
+      append_model_warnings(lines, snapshot)
       lines << ""
       lines << "Billing estimate uses per-worker lifecycle timestamps when available; legacy fleets fall back to LME fleet activation."
       lines << "It remains an estimate and can differ because of provider billing granularity, storage/network charges, credits, or rate changes."
       if snapshot["inference_activity"]
         lines << "Inference ACTIVE means an established local TCP client connection to the worker's managed Ollama tunnel was observed at this snapshot."
         lines << "It indicates live Ollama request traffic (such as scoring), not AFIO job identity; short requests can be missed between snapshots."
+        lines << "MODEL reports Ollama /api/ps residency at this snapshot; '-' means the healthy worker reported no model currently loaded."
       end
       if snapshot["lease"]
         lines << "Lease spend is a conservative guard estimate that starts before the first paid pod create and uses recorded worker rates."
@@ -152,7 +162,7 @@ module LocalModelEvaluation
 
     private
 
-    def worker_snapshot(worker, fleet_created_at, now)
+    def worker_snapshot(worker, fleet, fleet_created_at, now)
       status = worker.fetch("status").to_s
       stopped_at = if status == "destroyed"
                      value = worker["destroyed_at_utc"]
@@ -173,6 +183,7 @@ module LocalModelEvaluation
       {
         "index" => Integer(worker.fetch("index")),
         "pod_id" => worker.fetch("pod_id").to_s,
+        "gpu_id" => worker_gpu_id(fleet, worker),
         "lme_status" => status,
         "provider_status" => provider.fetch("status"),
         "provider_detail" => provider["detail"],
@@ -381,6 +392,55 @@ module LocalModelEvaluation
       else
         "-"
       end
+    end
+
+    def append_model_warnings(lines, snapshot)
+      return unless snapshot["inference_activity"]
+
+      warnings = snapshot.fetch("workers").filter_map do |worker|
+        next unless worker["model_status"].to_s == "unknown"
+
+        detail = worker["model_detail"].to_s
+        suffix = detail.empty? ? "" : ": #{detail}"
+        "NOTE: burst_#{worker.fetch('index')} loaded-model visibility is UNKNOWN#{suffix}"
+      end
+      return if warnings.empty?
+
+      lines << ""
+      lines.concat(warnings)
+    end
+
+    def loaded_model_label(worker)
+      case worker["model_status"].to_s
+      when "ok"
+        models = Array(worker["loaded_models"])
+        models.empty? ? "-" : models.join(",")
+      when "unavailable"
+        "UNAVAILABLE"
+      when "unknown"
+        "UNKNOWN"
+      else
+        "-"
+      end
+    end
+
+    def worker_gpu_id(fleet, worker)
+      selected = worker["gpu_id"].to_s.strip
+      selected = fleet.dig("gpu", "id").to_s.strip if selected.empty?
+      selected.empty? ? "UNKNOWN" : selected
+    end
+
+    def gpu_profile_counts(workers)
+      workers.each_with_object({}) do |worker, out|
+        gpu_id = worker.fetch("gpu_id")
+        out[gpu_id] = out.fetch(gpu_id, 0) + 1
+      end
+    end
+
+    def gpu_profiles_label(profiles)
+      return "none active" if profiles.empty?
+
+      profiles.map { |gpu_id, count| "#{gpu_id} ×#{count}" }.join("; ")
     end
 
     def parse_time(value, label)

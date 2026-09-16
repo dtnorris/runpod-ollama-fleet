@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "json"
+require "net/http"
 require "open3"
 require "uri"
 
@@ -65,9 +66,57 @@ module LocalModelEvaluation
       end
     end
 
-    def initialize(fleet_state:, connection_probe: nil, process_alive: nil)
+    class OllamaProbe
+      def initialize(http_get: nil)
+        @http_get = http_get || method(:get)
+      end
+
+      def check(endpoint)
+        uri = URI.join("#{endpoint}/", "api/ps")
+        response = @http_get.call(uri)
+        code = Integer(response.code)
+        unless (200..299).cover?(code)
+          return observation("unknown", [], "HTTP #{code}")
+        end
+
+        data = JSON.parse(response.body.to_s)
+        models = Array(data["models"]).filter_map do |model|
+          name = model["name"].to_s
+          name = model["model"].to_s if name.empty?
+          name unless name.empty?
+        end.uniq.sort
+        observation("ok", models, nil)
+      rescue JSON::ParserError => e
+        observation("unknown", [], "invalid /api/ps JSON: #{e.message}")
+      rescue URI::InvalidURIError, ArgumentError, TypeError => e
+        observation("unknown", [], "invalid Ollama endpoint: #{e.message}")
+      rescue StandardError => e
+        observation("unknown", [], "#{e.class}: #{e.message}")
+      end
+
+      private
+
+      def get(uri)
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = uri.scheme == "https"
+        http.open_timeout = 0.5
+        http.read_timeout = 1.0
+        http.get(uri.request_uri)
+      end
+
+      def observation(status, models, detail)
+        {
+          "status" => status,
+          "loaded_models" => Array(models),
+          "detail" => detail
+        }
+      end
+    end
+
+    def initialize(fleet_state:, connection_probe: nil, ollama_probe: nil, process_alive: nil)
       @fleet_state = fleet_state
       @connection_probe = connection_probe || ConnectionProbe.new
+      @ollama_probe = ollama_probe || OllamaProbe.new
       @process_alive = process_alive || method(:process_alive?)
     end
 
@@ -126,7 +175,15 @@ module LocalModelEvaluation
       result = @connection_probe.check(endpoint)
       status = result["status"].to_s
       status = "unknown" unless %w[active idle unknown].include?(status)
-      observation(status, result["detail"], endpoint: endpoint)
+      model_result = @ollama_probe.check(endpoint)
+      observation(
+        status,
+        result["detail"],
+        endpoint: endpoint,
+        loaded_models: model_result["loaded_models"],
+        model_status: model_result["status"],
+        model_detail: model_result["detail"]
+      )
     rescue KeyError, ArgumentError, TypeError => e
       observation("unknown", "invalid worker/tunnel activity state: #{e.message}")
     end
@@ -162,10 +219,22 @@ module LocalModelEvaluation
       false
     end
 
-    def observation(status, detail, endpoint: nil)
+    def observation(status, detail, endpoint: nil, loaded_models: [], model_status: nil, model_detail: nil)
       result = { "status" => status, "detail" => detail.to_s }
       result["endpoint"] = endpoint if endpoint
+      result["loaded_models"] = Array(loaded_models)
+      result["model_status"] = model_status || default_model_status(status)
+      result["model_detail"] = model_detail if model_detail
       result
+    end
+
+    def default_model_status(inference_status)
+      case inference_status.to_s
+      when "not_applicable"
+        "not_applicable"
+      else
+        "unavailable"
+      end
     end
   end
 end

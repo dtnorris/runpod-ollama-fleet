@@ -33,6 +33,24 @@ class RunpodActivityTest < Minitest::Test
     end
   end
 
+  class FakeOllamaProbe
+    attr_reader :checked
+
+    def initialize(results = {})
+      @results = results
+      @checked = []
+    end
+
+    def check(endpoint)
+      @checked << endpoint
+      @results.fetch(endpoint) do
+        { "status" => "ok", "loaded_models" => [], "detail" => nil }
+      end
+    end
+  end
+
+  FakeHttpResponse = Struct.new(:code, :body)
+
   class FakeCommandStatus
     attr_reader :exitstatus
 
@@ -76,9 +94,17 @@ class RunpodActivityTest < Minitest::Test
         "detail" => "established client connection observed"
       }
     )
+    ollama = FakeOllamaProbe.new(
+      "http://127.0.0.1:11489" => {
+        "status" => "ok",
+        "loaded_models" => ["gemma4:26b"],
+        "detail" => nil
+      }
+    )
     monitor = LocalModelEvaluation::RunpodActivity.new(
       fleet_state: @state,
       connection_probe: probe,
+      ollama_probe: ollama,
       process_alive: ->(_pid) { true }
     )
 
@@ -86,18 +112,24 @@ class RunpodActivityTest < Minitest::Test
 
     assert_equal "active", snapshot.fetch("workers").fetch(1).fetch("status")
     assert_equal "idle", snapshot.fetch("workers").fetch(2).fetch("status")
+    assert_equal ["gemma4:26b"], snapshot.fetch("workers").fetch(1).fetch("loaded_models")
+    assert_empty snapshot.fetch("workers").fetch(2).fetch("loaded_models")
+    assert_equal "ok", snapshot.fetch("workers").fetch(1).fetch("model_status")
     assert_equal 1, snapshot.fetch("counts").fetch("active")
     assert_equal 1, snapshot.fetch("counts").fetch("idle")
     assert_equal 0, snapshot.fetch("counts").fetch("unavailable")
     assert_equal 0, snapshot.fetch("counts").fetch("unknown")
     assert_equal ["http://127.0.0.1:11489", "http://127.0.0.1:11490"], probe.checked
+    assert_equal ["http://127.0.0.1:11489", "http://127.0.0.1:11490"], ollama.checked
   end
 
   def test_reports_unavailable_without_managed_tunnel_state_and_does_not_probe
     probe = FakeProbe.new
+    ollama = FakeOllamaProbe.new
     monitor = LocalModelEvaluation::RunpodActivity.new(
       fleet_state: @state,
       connection_probe: probe,
+      ollama_probe: ollama,
       process_alive: ->(_pid) { true }
     )
 
@@ -105,8 +137,10 @@ class RunpodActivityTest < Minitest::Test
 
     assert_equal 2, snapshot.fetch("counts").fetch("unavailable")
     assert_equal "unavailable", snapshot.fetch("workers").fetch(1).fetch("status")
+    assert_equal "unavailable", snapshot.fetch("workers").fetch(1).fetch("model_status")
     assert_includes snapshot.fetch("workers").fetch(1).fetch("detail"), "tunnel state is missing"
     assert_empty probe.checked
+    assert_empty ollama.checked
   end
 
   def test_reports_unavailable_for_stale_or_wrong_generation_tunnel
@@ -118,9 +152,11 @@ class RunpodActivityTest < Minitest::Test
       ]
     )
     probe = FakeProbe.new
+    ollama = FakeOllamaProbe.new
     monitor = LocalModelEvaluation::RunpodActivity.new(
       fleet_state: @state,
       connection_probe: probe,
+      ollama_probe: ollama,
       process_alive: ->(_pid) { true }
     )
 
@@ -130,6 +166,7 @@ class RunpodActivityTest < Minitest::Test
     assert_includes snapshot.fetch("workers").fetch(1).fetch("detail"), "different pod generation"
     assert_includes snapshot.fetch("workers").fetch(2).fetch("detail"), "stale"
     assert_empty probe.checked
+    assert_empty ollama.checked
   end
 
   def test_connection_probe_maps_lsof_established_and_empty_results
@@ -152,6 +189,27 @@ class RunpodActivityTest < Minitest::Test
     assert_equal "/test/lsof", calls.first.first
     assert_includes calls.first, "-iTCP@127.0.0.1:11489"
     assert_includes calls.first, "-sTCP:ESTABLISHED"
+  end
+
+  def test_ollama_probe_reports_loaded_models_and_empty_residency
+    responses = [
+      FakeHttpResponse.new("200", JSON.generate("models" => [
+        { "name" => "gemma4:26b" },
+        { "model" => "qwen3.6:35b-a3b" }
+      ])),
+      FakeHttpResponse.new("200", JSON.generate("models" => []))
+    ]
+    probe = LocalModelEvaluation::RunpodActivity::OllamaProbe.new(
+      http_get: ->(_uri) { responses.shift }
+    )
+
+    loaded = probe.check("http://127.0.0.1:11489")
+    empty = probe.check("http://127.0.0.1:11490")
+
+    assert_equal "ok", loaded.fetch("status")
+    assert_equal ["gemma4:26b", "qwen3.6:35b-a3b"], loaded.fetch("loaded_models")
+    assert_equal "ok", empty.fetch("status")
+    assert_empty empty.fetch("loaded_models")
   end
 
   private

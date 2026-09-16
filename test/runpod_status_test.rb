@@ -208,8 +208,14 @@ class RunpodStatusTest < Minitest::Test
           "unknown" => 0
         },
         "workers" => {
-          1 => { "status" => "active", "detail" => "established client connection observed" },
-          2 => { "status" => "idle", "detail" => "no established client connection observed" }
+          1 => {
+            "status" => "active", "detail" => "established client connection observed",
+            "loaded_models" => ["gemma4:26b"], "model_status" => "ok"
+          },
+          2 => {
+            "status" => "idle", "detail" => "no established client connection observed",
+            "loaded_models" => [], "model_status" => "ok"
+          }
         }
       }
     )
@@ -218,12 +224,44 @@ class RunpodStatusTest < Minitest::Test
     snapshot = status.snapshot
     assert_equal "active", snapshot.fetch("workers").first.fetch("inference_status")
     assert_equal "idle", snapshot.fetch("workers").last.fetch("inference_status")
+    assert_equal ["gemma4:26b"], snapshot.fetch("workers").first.fetch("loaded_models")
 
     output = status.render(snapshot)
     assert_includes output, "Ollama inference: 1 active; 1 idle; 0 unavailable; 0 unknown"
-    assert_match(/burst_1.*ACTIVE/, output)
-    assert_match(/burst_2.*IDLE/, output)
+    assert_includes output, "GPU profiles: NVIDIA A40 ×2"
+    assert_match(/burst_1.*NVIDIA A40.*gemma4:26b.*ACTIVE/, output)
+    assert_match(/burst_2.*NVIDIA A40.*-.*IDLE/, output)
     assert_includes output, "Inference ACTIVE means an established local TCP client connection"
+    assert_includes output, "MODEL reports Ollama /api/ps residency"
+  end
+
+  def test_status_reports_mixed_worker_gpu_profiles_with_legacy_fallback
+    fleet = fleet_record(
+      workers: [
+        worker(1, "pod_a", 0.44),
+        worker(2, "pod_b", 0.49, gpu_id: "NVIDIA L4")
+      ]
+    )
+    activity = FakeActivity.new(
+      {
+        "counts" => { "active" => 0, "idle" => 2, "unavailable" => 0, "unknown" => 0 },
+        "workers" => {
+          1 => { "status" => "idle", "loaded_models" => ["gemma4:26b"], "model_status" => "ok" },
+          2 => { "status" => "idle", "loaded_models" => ["gpt-oss:20b"], "model_status" => "ok" }
+        }
+      }
+    )
+    status = build_status(fleet, activity_monitor: activity)
+
+    snapshot = status.snapshot
+    assert_equal ["NVIDIA A40", "NVIDIA L4"], snapshot.fetch("workers").map { |row| row.fetch("gpu_id") }
+    assert_equal({ "NVIDIA A40" => 1, "NVIDIA L4" => 1 }, snapshot.fetch("gpu_profiles"))
+
+    output = status.render(snapshot)
+    assert_includes output, "Cloud: SECURE"
+    assert_includes output, "GPU profiles: NVIDIA A40 ×1; NVIDIA L4 ×1"
+    assert_match(/burst_1.*NVIDIA A40.*gemma4:26b/, output)
+    assert_match(/burst_2.*NVIDIA L4.*gpt-oss:20b/, output)
   end
 
   def test_no_current_fleet_is_a_clean_zero_state
@@ -259,7 +297,7 @@ class RunpodStatusTest < Minitest::Test
     }
   end
 
-  def worker(index, pod_id, rate, status: "active", destroyed_at: nil)
+  def worker(index, pod_id, rate, status: "active", destroyed_at: nil, gpu_id: nil)
     {
       "index" => index,
       "name" => "af-lme-burst-#{index}",
@@ -268,6 +306,7 @@ class RunpodStatusTest < Minitest::Test
       "ssh_port" => 22_000 + index,
       "hourly_rate_usd" => rate,
       "status" => status,
+      "gpu_id" => gpu_id,
       "destroyed_at_utc" => destroyed_at
     }.compact
   end
