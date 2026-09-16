@@ -195,6 +195,9 @@ class RunpodBootstrapTest < Minitest::Test
         {output: "[1/8] Preflight host, GPU, and required utilities\n", polls: 1_000}
       when :bad_provenance
         {output: success_output(worker_index, digest: OTHER_DIGEST)}
+      when :heterogeneous_gpu
+        gpu = command.fetch(command.index("--expect-gpu") + 1)
+        {output: success_output(worker_index, gpu:)}
       when :must_not_run
         {output: "", must_not_run: true}
       else
@@ -215,10 +218,10 @@ class RunpodBootstrapTest < Minitest::Test
       TEXT
     end
 
-    def success_output(worker_index, digest: DIGEST, context: 131_072, prefix: "")
+    def success_output(worker_index, digest: DIGEST, context: 131_072, prefix: "", gpu: "NVIDIA A40")
       <<~TEXT
         #{prefix}gemma4:26b verification PASS: context=#{context} and 100% model residency in VRAM.
-        LME_PROVENANCE_GPU\tNVIDIA A40\t46068
+        LME_PROVENANCE_GPU\t#{gpu}\t46068
         LME_PROVENANCE_MODEL\tgemma4:26b\t#{digest}\t#{context}\t2566893074\t2566893074
         Worker setup PASS.
         Worker #{worker_index} remote setup PASS.
@@ -380,6 +383,33 @@ class RunpodBootstrapTest < Minitest::Test
       ],
       @process_supervisor.commands.fetch(0).fetch(:command)
     )
+  end
+
+
+  def test_bootstrap_uses_per_worker_gpu_contracts_in_mixed_fleet
+    @fleet.fetch("workers")[1]["gpu_id"] = "NVIDIA RTX A6000"
+    script = fake_remote_script("puts 'heterogeneous gpu fixture'\n")
+
+    record = build_runner(script).run(
+      worker_indices: [1, 2],
+      models: ["gemma4:26b"],
+      expected_digests: ["gemma4:26b=#{DIGEST}"],
+      poll_seconds: 0.005
+    )
+
+    commands = @process_supervisor.commands.to_h do |entry|
+      [entry.fetch(:worker_index), entry.fetch(:command)]
+    end
+    assert_equal "NVIDIA A40", commands.fetch(1).fetch(commands.fetch(1).index("--expect-gpu") + 1)
+    assert_equal "NVIDIA RTX A6000", commands.fetch(2).fetch(commands.fetch(2).index("--expect-gpu") + 1)
+    assert_nil record.fetch("expected_gpu")
+    assert_equal(
+      { "1" => "NVIDIA A40", "2" => "NVIDIA RTX A6000" },
+      record.fetch("expected_gpus")
+    )
+    recorded_workers = record.fetch("workers").to_h { |worker| [worker.fetch("index"), worker] }
+    assert_equal "NVIDIA A40", recorded_workers.fetch(1).fetch("expected_gpu")
+    assert_equal "NVIDIA RTX A6000", recorded_workers.fetch(2).fetch("expected_gpu")
   end
 
   def test_reuse_existing_is_forwarded_and_recorded_without_clean
@@ -612,6 +642,8 @@ class RunpodBootstrapTest < Minitest::Test
         :worker_failure
       elsif body.include?('"b" * 64')
         :bad_provenance
+      elsif body.include?("heterogeneous gpu fixture")
+        :heterogeneous_gpu
       elsif body.include?("raise 'must not run'")
         :must_not_run
       elsif body.include?('[1/4] Loading worker')

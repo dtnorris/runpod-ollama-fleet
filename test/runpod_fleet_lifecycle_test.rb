@@ -37,13 +37,22 @@ class RunpodFleetLifecycleTest < Minitest::Test
 
     def list_gpu_types(cloud:, count:)
       @catalog_calls << [cloud, count]
-      [{
-        "id" => "NVIDIA A40",
-        "memory" => 48,
-        cloud.downcase => true,
-        "availability" => "HIGH",
-        "price" => { cloud.downcase => 0.50 }
-      }]
+      [
+        {
+          "id" => "NVIDIA A40",
+          "memory" => 48,
+          cloud.downcase => true,
+          "availability" => "HIGH",
+          "price" => { cloud.downcase => 0.50 }
+        },
+        {
+          "id" => "NVIDIA RTX A6000",
+          "memory" => 48,
+          cloud.downcase => true,
+          "availability" => "HIGH",
+          "price" => { cloud.downcase => 0.60 }
+        }
+      ]
     end
 
     def create_pod(body)
@@ -58,7 +67,12 @@ class RunpodFleetLifecycleTest < Minitest::Test
       @sequence += 1
       index = body.fetch("name")[/burst-(\d+)\z/, 1].to_i
       id = "new_#{index}_#{@sequence}"
-      @pods[id] = ready_pod(index, id, "198.51.100.#{50 + index}", 23_000 + index, 0.50, cloud: body.fetch("cloud"))
+      gpu_id = body.dig("gpu", "id") || "NVIDIA A40"
+      rate = gpu_id == "NVIDIA RTX A6000" ? 0.60 : 0.50
+      @pods[id] = ready_pod(
+        index, id, "198.51.100.#{50 + index}", 23_000 + index, rate,
+        cloud: body.fetch("cloud"), gpu_id:
+      )
       { "id" => id }
     end
 
@@ -75,13 +89,13 @@ class RunpodFleetLifecycleTest < Minitest::Test
 
     private
 
-    def ready_pod(index, id, host, port, rate, cloud: "SECURE")
+    def ready_pod(index, id, host, port, rate, cloud: "SECURE", gpu_id: "NVIDIA A40")
       {
         "id" => id,
         "name" => "af-lme-burst-#{index}",
         "status" => "RUNNING",
         "cloud" => cloud,
-        "gpu" => { "id" => "NVIDIA A40", "count" => 1 },
+        "gpu" => { "id" => gpu_id, "count" => 1 },
         "cost" => rate,
         "runtime" => {
           "ports" => [{ "private" => 22, "public" => port, "type" => "tcp", "ip" => host }]
@@ -176,6 +190,52 @@ class RunpodFleetLifecycleTest < Minitest::Test
     assert_includes env, "LME_BURST_4_URL=http://127.0.0.1:11444"
   end
 
+
+
+  def test_scale_can_add_different_gpu_workers_on_existing_network_volume
+    initial = [worker(1, "old_1"), worker(2, "old_2")]
+    initial.each { |entry| @client.seed(entry) }
+    @state.activate(
+      workers: initial,
+      cloud: "SECURE",
+      gpu_id: "NVIDIA A40",
+      image: LocalModelEvaluation::RunpodFleet::IMAGE,
+      provisioning: {
+        "container_disk_gb" => 50,
+        "volume_gb" => nil,
+        "network_volume_id" => "nv-shared-001",
+        "volume_mount_path" => LocalModelEvaluation::RunpodFleet::VOLUME_MOUNT_PATH
+      }
+    )
+
+    preflight = @lifecycle.preflight_scale(
+      target_worker_count: 3,
+      gpu_id: "NVIDIA RTX A6000",
+      max_fleet_hourly_usd: 3.0
+    )
+    assert_equal "NVIDIA RTX A6000", preflight.gpu.fetch("id")
+    assert_equal "nv-shared-001", preflight.network_volume_id
+    assert_nil preflight.volume_gb
+
+    added = @lifecycle.scale(
+      target_worker_count: 3,
+      ssh_public_key: public_key,
+      preflight:,
+      max_fleet_hourly_usd: 3.0
+    )
+
+    assert_equal [3], added.map(&:index)
+    body = @client.created_bodies.last
+    assert_equal "NVIDIA RTX A6000", body.dig("gpu", "id")
+    assert_equal(
+      [{ "volumeId" => "nv-shared-001", "path" => LocalModelEvaluation::RunpodFleet::VOLUME_MOUNT_PATH }],
+      body.dig("mounts", "network")
+    )
+    refute body.fetch("mounts").key?("persistent")
+
+    record = @state.current.fetch("workers").find { |entry| entry.fetch("index") == 3 }
+    assert_equal "NVIDIA RTX A6000", record.fetch("gpu_id")
+  end
 
   def test_scale_rolls_back_only_newly_created_pods_and_leaves_state_unchanged
     activate([worker(1, "old_1"), worker(2, "old_2")])
