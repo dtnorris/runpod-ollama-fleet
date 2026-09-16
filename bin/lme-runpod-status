@@ -12,28 +12,15 @@ require "local_model_evaluation/runpod_activity"
 require "local_model_evaluation/runpod_fleet_namespace"
 require "local_model_evaluation/runpod_fleet_state"
 require "local_model_evaluation/runpod_status"
+require "local_model_evaluation/runpod_status_all"
 
-unless ARGV.empty?
-  warn "Usage: bin/lme runpod-status"
+all_fleets = ARGV == ["--all"]
+unless ARGV.empty? || all_fleets
+  warn "Usage: bin/rpof status [--all]"
   exit 2
 end
 
-begin
-  namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
-    root: File.join(ROOT, "output", "runpod-fleets"),
-    repo_root: ROOT,
-    fleet_key: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY)
-  )
-rescue LocalModelEvaluation::RunpodFleetNamespace::Error => e
-  warn "ERROR: #{e.message}"
-  exit 1
-end
-
-state = LocalModelEvaluation::RunpodFleetState.new(
-  root: namespace.state_root,
-  local_port_base: namespace.local_port_base
-)
-
+state_root = File.join(ROOT, "output", "runpod-fleets")
 api_key = ENV["RUNPOD_API_KEY"].to_s
 client = unless api_key.empty?
            LocalModelEvaluation::RunpodClient.new(
@@ -42,20 +29,64 @@ client = unless api_key.empty?
            )
          end
 
-activity_monitor = LocalModelEvaluation::RunpodActivity.new(
-  fleet_state: state
-)
-
-status = LocalModelEvaluation::RunpodStatus.new(
-  fleet_state: state,
-  client: client,
-  activity_monitor: activity_monitor
-)
+build_status = lambda do |namespace|
+  state = LocalModelEvaluation::RunpodFleetState.new(
+    root: namespace.state_root,
+    local_port_base: namespace.local_port_base
+  )
+  activity_monitor = LocalModelEvaluation::RunpodActivity.new(fleet_state: state)
+  status = LocalModelEvaluation::RunpodStatus.new(
+    fleet_state: state,
+    client: client,
+    activity_monitor: activity_monitor
+  )
+  [status, status.snapshot]
+end
 
 begin
-  snapshot = status.snapshot
-  $stdout.write(status.render(snapshot))
-rescue LocalModelEvaluation::RunpodStatus::Error => e
+  if all_fleets
+    root_namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
+      root: state_root,
+      repo_root: ROOT,
+      fleet_key: LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY
+    )
+    fleet_keys = [
+      LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY,
+      *root_namespace.registered_fleet_keys
+    ].uniq
+
+    entries = fleet_keys.filter_map do |fleet_key|
+      namespace = if fleet_key == LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY
+                    root_namespace
+                  else
+                    LocalModelEvaluation::RunpodFleetNamespace.new(
+                      root: state_root,
+                      repo_root: ROOT,
+                      fleet_key: fleet_key
+                    )
+                  end
+      _status, snapshot = build_status.call(namespace)
+      next unless snapshot
+
+      { "fleet_key" => fleet_key, "snapshot" => snapshot }
+    end
+
+    overview = LocalModelEvaluation::RunpodStatusAll.new
+    snapshot = overview.snapshot(entries)
+    $stdout.write(overview.render(snapshot))
+  else
+    namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
+      root: state_root,
+      repo_root: ROOT,
+      fleet_key: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY)
+    )
+    status, snapshot = build_status.call(namespace)
+    $stdout.write(status.render(snapshot))
+  end
+rescue LocalModelEvaluation::RunpodFleetNamespace::Error,
+       LocalModelEvaluation::RunpodStatus::Error,
+       LocalModelEvaluation::RunpodFleetState::Error,
+       ArgumentError => e
   warn "ERROR: #{e.message}"
   exit 1
 end
