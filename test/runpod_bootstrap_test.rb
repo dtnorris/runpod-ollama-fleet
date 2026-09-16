@@ -294,6 +294,7 @@ class RunpodBootstrapTest < Minitest::Test
     )
 
     assert_equal "passed", record.fetch("status")
+    assert_equal 360, record.fetch("pull_timeout_seconds")
     assert_equal 3, record.fetch("workers").count { |worker| worker["status"] == "passed" }
     assert_includes @out.string, "Starting gemma4:26b bootstrap on burst_1"
     assert_includes @out.string, "heartbeat:"
@@ -365,11 +366,13 @@ class RunpodBootstrapTest < Minitest::Test
       expected_digests: ["gemma4:26b=#{DIGEST}"],
       clean: true,
       context: 262_144,
+      pull_timeout_seconds: 420,
       heartbeat_seconds: 1,
       poll_seconds: 0.005
     )
 
     assert_equal "passed", record.fetch("status")
+    assert_equal 420, record.fetch("pull_timeout_seconds")
     assert_equal(
       [
         script,
@@ -379,6 +382,7 @@ class RunpodBootstrapTest < Minitest::Test
         "--clean",
         "--model", "gemma4:26b",
         "--expect-digest", "gemma4:26b=#{DIGEST}",
+        "--pull-timeout-seconds", "420",
         "--context", "262144"
       ],
       @process_supervisor.commands.fetch(0).fetch(:command)

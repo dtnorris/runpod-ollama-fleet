@@ -15,6 +15,21 @@ class RunpodBootstrapCliTest < Minitest::Test
     assert_includes out, "--reuse-existing"
     assert_includes out, "--copy-to-workspace"
     assert_includes out, "--keep-root-models"
+    assert_includes out, "--pull-timeout-seconds"
+  end
+
+  def test_pull_timeout_must_be_positive_before_fleet_access
+    out, err, status = Open3.capture3(
+      RbConfig.ruby,
+      BIN,
+      "--workers", "1",
+      "--model", "gemma4:26b",
+      "--pull-timeout-seconds", "0"
+    )
+
+    refute status.success?, out + err
+    assert_equal 2, status.exitstatus
+    assert_includes err, "--pull-timeout-seconds must be a positive integer"
   end
 
   def test_clean_and_reuse_existing_fail_before_fleet_access

@@ -13,6 +13,7 @@ set -euo pipefail
 # - emit incremental console feedback for every long-running step.
 
 CONTEXT_LENGTH=131072
+PULL_TIMEOUT_SECONDS=360
 STAGING_DIR=/root/.ollama/models
 SHARED_DIR=/workspace/ollama-models
 STATE_ROOT=/workspace/lme-worker-state
@@ -46,6 +47,7 @@ Required:
 
 Options:
   --context N                   Ollama context length (default: 131072)
+  --pull-timeout-seconds N      Per-model ollama pull timeout (default: 360)
   --staging-dir PATH            Fast local staging store (default: /root/.ollama/models)
   --shared-dir PATH             Shared/workspace store (default: /workspace/ollama-models)
   --state-root PATH             Worker evidence directory (default: /workspace/lme-worker-state)
@@ -82,6 +84,9 @@ while (($#)); do
     --context)
       [[ $# -ge 2 ]] || die "--context requires a value"
       CONTEXT_LENGTH="$2"; shift 2 ;;
+    --pull-timeout-seconds)
+      [[ $# -ge 2 ]] || die "--pull-timeout-seconds requires a value"
+      PULL_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --staging-dir)
       [[ $# -ge 2 ]] || die "--staging-dir requires a value"
       STAGING_DIR="$2"; shift 2 ;;
@@ -120,6 +125,7 @@ done
 
 ((${#MODELS[@]} > 0)) || { usage >&2; die "at least one --model is required"; }
 [[ "$CONTEXT_LENGTH" =~ ^[0-9]+$ ]] || die "--context must be an integer"
+[[ "$PULL_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "--pull-timeout-seconds must be a positive integer"
 [[ "$MIN_VRAM_GB" =~ ^[0-9]+$ ]] || die "--min-vram-gb must be an integer"
 if [[ $REUSE_EXISTING -eq 1 && $CLEAN -eq 1 ]]; then
   die "--clean cannot be combined with --reuse-existing"
@@ -235,6 +241,9 @@ model_ps_json() {
 step "Preflight host, GPU, and required utilities"
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is required"
+if [[ $REUSE_EXISTING -eq 0 ]]; then
+  command -v timeout >/dev/null 2>&1 || die "timeout is required for bounded model pulls"
+fi
 
 GPU_LINE="$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits | head -n 1)"
 GPU_NAME="${GPU_LINE%,*}"
@@ -341,7 +350,17 @@ else
 
     start_ollama "$STAGING_DIR" "staging-${safe}"
     info "Pulling $model to fast local/root disk. Ollama will print download progress below."
-    OLLAMA_HOST="$CLIENT_URL" ollama pull "$model"
+    info "Pull timeout: ${PULL_TIMEOUT_SECONDS}s"
+    if timeout --signal=TERM --kill-after=10s "${PULL_TIMEOUT_SECONDS}s" \
+      env OLLAMA_HOST="$CLIENT_URL" ollama pull "$model"; then
+      :
+    else
+      rc=$?
+      if [[ $rc -eq 124 || $rc -eq 137 ]]; then
+        die "ollama pull timed out after ${PULL_TIMEOUT_SECONDS}s for $model"
+      fi
+      die "ollama pull failed for $model (exit $rc)"
+    fi
 
     digest="$(model_digest "$model")"
     [[ -n "$digest" && "$digest" != "null" ]] || die "could not read digest for $model after pull"
@@ -442,6 +461,7 @@ step "Write durable worker evidence"
   echo "gpu_mig_profile=$EXPECTED_MIG_PROFILE"
   echo "gpu_vram_mib=$GPU_VRAM_MIB"
   echo "context_length=$CONTEXT_LENGTH"
+  echo "pull_timeout_seconds=$PULL_TIMEOUT_SECONDS"
   echo "model_store_mode=$MODEL_STORE_MODE"
   echo "final_model_store=$FINAL_MODEL_STORE"
   echo "shared_model_store=$SHARED_DIR"

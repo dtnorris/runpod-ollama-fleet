@@ -27,6 +27,7 @@ opts = {
   keep_root_models: false,
   context: nil,
   state_root: nil,
+  pull_timeout_seconds: LocalModelEvaluation::RunpodBootstrap::DEFAULT_PULL_TIMEOUT_SECONDS,
   fleet_key: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY),
   heartbeat_seconds: ENV.fetch(
     "LME_RUNPOD_BOOTSTRAP_HEARTBEAT_SECONDS",
@@ -46,6 +47,7 @@ parser = OptionParser.new do |o|
   o.on("--fleet KEY", "Select the managed fleet") { |v| opts[:fleet_key] = v }
   o.on("--state-root PATH", "Remote worker evidence root (default: /workspace/lme-worker-state)") { |v| opts[:state_root] = v }
   o.on("--context N", Integer, "Ollama context length; remote default is 131072") { |v| opts[:context] = v }
+  o.on("--pull-timeout-seconds N", Integer, "Per-model ollama pull timeout in seconds (default: 360)") { |v| opts[:pull_timeout_seconds] = v }
   o.on("--heartbeat-seconds N", Float, "Fleet heartbeat interval (default: 10)") { |v| opts[:heartbeat_seconds] = v }
 end
 
@@ -53,6 +55,9 @@ begin
   parser.parse!(ARGV)
   raise OptionParser::MissingArgument, "--workers" unless opts[:workers]
   raise OptionParser::MissingArgument, "--model" if opts[:models].empty?
+  if opts[:pull_timeout_seconds] <= 0
+    raise OptionParser::InvalidArgument, "--pull-timeout-seconds must be a positive integer"
+  end
   if opts[:clean] && opts[:reuse_existing]
     raise OptionParser::InvalidArgument, "--clean cannot be combined with --reuse-existing"
   end
@@ -104,6 +109,7 @@ begin
     keep_root_models: opts[:keep_root_models],
     context: opts[:context],
     state_root: opts[:state_root],
+    pull_timeout_seconds: opts[:pull_timeout_seconds],
     heartbeat_seconds: opts[:heartbeat_seconds]
   )
 rescue Interrupt

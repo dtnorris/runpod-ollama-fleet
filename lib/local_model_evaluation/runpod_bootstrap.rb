@@ -9,6 +9,7 @@ require_relative "runpod_workers"
 module LocalModelEvaluation
   class RunpodBootstrap
     DEFAULT_HEARTBEAT_SECONDS = 10.0
+    DEFAULT_PULL_TIMEOUT_SECONDS = 360
     DEFAULT_POLL_SECONDS = 0.25
     LOG_TAIL_BYTES = 131_072
     TERMINATION_GRACE_SECONDS = 3.0
@@ -32,6 +33,7 @@ module LocalModelEvaluation
 
     def run(worker_indices:, models:, expected_digests: [], clean: false, reuse_existing: false,
             copy_to_workspace: false, keep_root_models: false, context: nil, state_root: nil,
+            pull_timeout_seconds: DEFAULT_PULL_TIMEOUT_SECONDS,
             heartbeat_seconds: DEFAULT_HEARTBEAT_SECONDS, poll_seconds: DEFAULT_POLL_SECONDS)
       fleet = active_fleet!
       workers = selected_workers(fleet, worker_indices)
@@ -73,6 +75,7 @@ module LocalModelEvaluation
       heartbeat_seconds = positive_float(heartbeat_seconds, "heartbeat seconds")
       poll_seconds = positive_float(poll_seconds, "poll seconds")
       context = context ? positive_integer(context, "context") : 131_072
+      pull_timeout_seconds = positive_integer(pull_timeout_seconds, "pull timeout seconds")
       validate_remote_setup!
 
       bootstrap_root = @fleet_state.artifact_dir(fleet.fetch("fleet_id"), "bootstrap")
@@ -89,6 +92,7 @@ module LocalModelEvaluation
           keep_root_models:,
           state_root:,
           context:,
+          pull_timeout_seconds:,
           heartbeat_seconds:,
           poll_seconds:,
           bootstrap_root:
@@ -101,8 +105,8 @@ module LocalModelEvaluation
     private
 
     def execute_run(fleet:, workers:, models:, digests:, expected_gpus:, clean:, reuse_existing:,
-                    copy_to_workspace:, keep_root_models:, state_root:, context:, heartbeat_seconds:, poll_seconds:,
-                    bootstrap_root:)
+                    copy_to_workspace:, keep_root_models:, state_root:, context:, pull_timeout_seconds:,
+                    heartbeat_seconds:, poll_seconds:, bootstrap_root:)
       started_wall = utc_now
       started_mono = @monotonic_clock.call
       run_id = build_run_id(started_wall)
@@ -120,6 +124,7 @@ module LocalModelEvaluation
         keep_root_models:,
         state_root:,
         context:,
+        pull_timeout_seconds:,
         heartbeat_seconds:,
         started_wall:,
         run_id:
@@ -141,6 +146,7 @@ module LocalModelEvaluation
             keep_root_models:,
             state_root:,
             context:,
+            pull_timeout_seconds:,
             run_dir:
           )
           children[worker.fetch("index")] = child
@@ -332,7 +338,7 @@ module LocalModelEvaluation
     end
 
     def spawn_worker(worker:, models:, digests:, expected_gpu:, clean:, reuse_existing:, copy_to_workspace:,
-                     keep_root_models:, context:, state_root:, run_dir:)
+                     keep_root_models:, context:, pull_timeout_seconds:, state_root:, run_dir:)
       index = worker.fetch("index")
       command = [@remote_setup_path, "--worker", index.to_s]
       command.concat(["--expect-gpu", expected_gpu])
@@ -346,6 +352,7 @@ module LocalModelEvaluation
         command.concat(["--model", model])
         command.concat(["--expect-digest", "#{model}=#{digests.fetch(model)}"])
       end
+      command.concat(["--pull-timeout-seconds", pull_timeout_seconds.to_s])
       command.concat(["--context", context.to_s])
 
       log = @store.open_worker_log(run_dir:, worker_index: index)
@@ -558,8 +565,8 @@ module LocalModelEvaluation
     end
 
     def initial_record(fleet:, workers:, models:, digests:, expected_gpus:, clean:, reuse_existing:,
-                       copy_to_workspace:, keep_root_models:, state_root:, context:, heartbeat_seconds:, started_wall:,
-                       run_id:)
+                       copy_to_workspace:, keep_root_models:, state_root:, context:, pull_timeout_seconds:,
+                       heartbeat_seconds:, started_wall:, run_id:)
       gpu_ids = expected_gpus.values.uniq
       {
         "schema_version" => 2,
@@ -579,6 +586,7 @@ module LocalModelEvaluation
         "keep_root_models" => keep_root_models,
         "state_root" => state_root || "/workspace/lme-worker-state",
         "context" => context,
+        "pull_timeout_seconds" => pull_timeout_seconds,
         "heartbeat_seconds" => heartbeat_seconds,
         "fleet_hourly_rate_usd" => fleet.fetch("fleet_hourly_rate_usd"),
         "workers" => workers.map do |worker|
