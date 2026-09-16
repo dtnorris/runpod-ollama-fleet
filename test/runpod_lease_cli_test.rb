@@ -31,7 +31,7 @@ class RunpodLeaseCliTest < Minitest::Test
       "RUNPOD_API_KEY" => "rpa_test_only",
       "RUNPOD_API_BASE_URL" => "http://127.0.0.1:#{port}/v2",
       "RUNPOD_MAX_FLEET_HOURLY_USD" => "3.00",
-      "RUNPOD_MAX_TOTAL_HOURLY_USD" => "6.00"
+      "RUNPOD_MAX_TOTAL_HOURLY_USD" => "1000.00"
     }
 
     stdout, stderr, status = Open3.capture3(
@@ -39,6 +39,7 @@ class RunpodLeaseCliTest < Minitest::Test
       RbConfig.ruby,
       File.join(REPO_ROOT, "bin", "rpof"),
       "create",
+      "--fleet", "lease-cli-#{Process.pid}",
       "--workers", "2",
       "--max-runtime-minutes", "360",
       "--max-spend-usd", "60",

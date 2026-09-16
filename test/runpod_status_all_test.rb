@@ -112,6 +112,33 @@ class RunpodStatusAllTest < Minitest::Test
     refute_match(/replacement.*READY/, output)
   end
 
+  def test_render_truncates_long_fleet_gpu_and_model_labels
+    fleet = entry(
+      "batch31-qwen35-main",
+      rate: 1.09,
+      accrued: 0.10,
+      workers: [
+        worker(
+          1,
+          "pod_a",
+          "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb",
+          1.09,
+          available: ["qwen3.6:35b-a3b-q4_K_M"],
+          loaded: ["qwen3.6:35b-a3b-q4_K_M"],
+          inference: "active"
+        )
+      ],
+      bootstrap_workers: [bootstrap_worker(1, "pod_a")]
+    )
+
+    output = @overview.render(@overview.snapshot([fleet]))
+
+    assert_includes output, "batch31-qwen35-..."
+    assert_includes output, "NVIDIA RTX PRO ..."
+    assert_includes output, "qwen3.6:35b-a3b..."
+    refute_includes output, "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb"
+  end
+
   private
 
   def entry(key, rate:, accrued:, workers:, bootstrap_workers:, lme_status: "active")

@@ -2,6 +2,11 @@
 
 module LocalModelEvaluation
   class RunpodStatusAll
+    FLEET_WIDTH = 18
+    GPU_WIDTH = 18
+    MODEL_WIDTH = 18
+    RUNPOD_WIDTH = 8
+
     INFERENCE_STATUSES = %w[active idle unavailable unknown].freeze
 
     def snapshot(entries)
@@ -62,19 +67,19 @@ module LocalModelEvaluation
       )
       lines << ""
       lines << format(
-        "%-26s %-9s %-27s %-30s %-30s %-12s %-10s %-11s %s",
+        "%-18s %-8s %-18s %-18s %-18s %-8s %-8s %-11s %s",
         "FLEET", "WORKER", "GPU", "AVAILABLE", "LOADED", "RUNPOD", "RATE", "INFERENCE", "BOOTSTRAP"
       )
 
       snapshot.fetch("workers").each do |worker|
         lines << format(
-          "%-26s %-9s %-27s %-30s %-30s %-12s $%-9.4f %-11s %s",
-          worker.fetch("fleet_key"),
+          "%-18s %-8s %-18s %-18s %-18s %-8s $%-7.4f %-11s %s",
+          truncate(worker.fetch("fleet_key"), FLEET_WIDTH),
           "burst_#{worker.fetch('index')}",
-          worker.fetch("gpu_id"),
-          available_model_label(worker),
-          loaded_model_label(worker),
-          worker.fetch("provider_status"),
+          truncate(worker.fetch("gpu_id"), GPU_WIDTH),
+          truncate(available_model_label(worker), MODEL_WIDTH),
+          truncate(loaded_model_label(worker), MODEL_WIDTH),
+          truncate(worker.fetch("provider_status"), RUNPOD_WIDTH),
           worker.fetch("hourly_rate_usd"),
           inference_label(worker.fetch("inference_status")),
           worker.fetch("bootstrap_status")
@@ -82,9 +87,7 @@ module LocalModelEvaluation
       end
 
       lines << ""
-      lines << "AVAILABLE is passed bootstrap evidence for that worker in its current fleet generation."
-      lines << "LOADED is live Ollama /api/ps residency at this snapshot."
-      lines << "Current managed rate sums active workers across the displayed fleets."
+      lines << "AVAILABLE=bootstrap-qualified; LOADED=live Ollama residency; rate=active managed workers."
       lines.join("\n") + "\n"
     end
 
@@ -131,6 +134,14 @@ module LocalModelEvaluation
 
     def inference_label(status)
       status.to_s.upcase
+    end
+
+    def truncate(value, width)
+      text = value.to_s
+      return text if text.length <= width
+      return text[0, width] if width <= 3
+
+      "#{text[0, width - 3]}..."
     end
 
     def bootstrap_label(bootstrap, worker)
