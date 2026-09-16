@@ -474,10 +474,11 @@ module LocalModelEvaluation
         end
 
         accepted = contiguous_ready_prefix(ready)
-        break if accepted.length >= min_ready_workers
         break if pending.empty?
 
         if @clock.call >= deadline
+          break if accepted.length >= min_ready_workers
+
           waiting = pending.keys.map { |i| worker_name(i) }
           if min_ready_workers == created.length
             raise Error, "timed out waiting for RunPod SSH endpoints: #{waiting.join(', ')}"

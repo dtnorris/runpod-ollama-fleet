@@ -83,7 +83,7 @@ def create_options(argv)
   }
   OptionParser.new do |o|
     o.on("--workers N", Integer) { |v| opts[:workers] = v }
-    o.on("--min-ready-workers N", Integer, "Accept once this many leading workers are ready") { |v| opts[:min_ready_workers] = v }
+    o.on("--min-ready-workers N", Integer, "Minimum contiguous ready workers required after the readiness window") { |v| opts[:min_ready_workers] = v }
     o.on("--cloud TIER") { |v| opts[:cloud] = v }
     o.on("--gpu GPU_ID") { |v| opts[:gpu_id] = v }
     o.on("--container-disk-gb N", Integer) { |v| opts[:container_disk_gb] = v }
@@ -185,7 +185,8 @@ when "create"
     minimum_ready_workers = opts[:min_ready_workers] || preflight.worker_count
     puts "  Minimum ready workers: #{minimum_ready_workers}"
     if minimum_ready_workers < preflight.worker_count
-      puts "  Partial acceptance: activate once that many leading workers are ready"
+      puts format("  Partial acceptance: wait up to %.1f seconds for requested workers,", opts[:wait_seconds].to_f)
+      puts "  then activate the largest contiguous ready prefix meeting the minimum"
       puts "  and delete any unaccepted requested tail workers before fleet activation."
     end
     puts "  Container disk: #{preflight.container_disk_gb} GB"

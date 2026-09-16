@@ -348,7 +348,8 @@ class RunpodFleetTest < Minitest::Test
       ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest test@example",
       preflight:,
       max_fleet_hourly_usd: 3.0,
-      min_ready_workers: 2
+      min_ready_workers: 2,
+      wait_seconds: 0
     )
 
     assert_equal [1, 2], workers.map(&:index)
@@ -357,6 +358,49 @@ class RunpodFleetTest < Minitest::Test
     assert_equal 2, state.fetch("worker_count")
     assert_equal [1, 2], state.fetch("workers").map { |worker| worker.fetch("index") }
     assert_includes @out.string, "Partial fleet accepted: 2/3 requested worker(s); minimum was 2."
+  end
+
+  def test_partial_acceptance_uses_full_readiness_window_before_accepting_prefix
+    @client.create_responses = [{ "id" => "pod_a" }, { "id" => "pod_b" }, { "id" => "pod_c" }]
+    pending_b = ready_pod(2, "pod_b", "198.51.100.12", 22012, 0.69, cloud: "SECURE")
+    pending_b["status"] = "CREATED"
+    pending_b["runtime"] = { "ports" => [] }
+    pending_c = ready_pod(3, "pod_c", "198.51.100.13", 22013, 0.69, cloud: "SECURE")
+    pending_c["status"] = "CREATED"
+    pending_c["runtime"] = { "ports" => [] }
+    pod_b_polls = 0
+    @client.pod_details = {
+      "pod_a" => ready_pod(1, "pod_a", "198.51.100.11", 22011, 0.69, cloud: "SECURE"),
+      "pod_b" => lambda do
+        pod_b_polls += 1
+        pod_b_polls == 1 ? pending_b : ready_pod(2, "pod_b", "198.51.100.12", 22012, 0.69, cloud: "SECURE")
+      end,
+      "pod_c" => pending_c
+    }
+    now = 0.0
+    fleet = LocalModelEvaluation::RunpodFleet.new(
+      client: @client,
+      env_path: @env_path,
+      out: @out,
+      sleeper: ->(seconds) { now += seconds },
+      clock: -> { now }
+    )
+    preflight = fleet.preflight(worker_count: 3, max_fleet_hourly_usd: 3.0)
+
+    workers = fleet.create(
+      worker_count: 3,
+      ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest test@example",
+      preflight:,
+      max_fleet_hourly_usd: 3.0,
+      min_ready_workers: 1,
+      wait_seconds: 2,
+      poll_seconds: 1
+    )
+
+    assert_operator pod_b_polls, :>=, 2
+    assert_equal [1, 2], workers.map(&:index)
+    assert_equal ["pod_c"], @client.deleted_ids
+    assert_in_delta 2.0, now, 0.001
   end
 
   def test_partial_acceptance_refuses_noncontiguous_ready_workers
