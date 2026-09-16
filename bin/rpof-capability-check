@@ -11,6 +11,7 @@ require "runpod_ollama_fleet"
 require "local_model_evaluation/runpod_fleet_namespace"
 require "local_model_evaluation/runpod_fleet_state"
 require "local_model_evaluation/runpod_cost_control"
+require "local_model_evaluation/runpod_shutdown_control"
 
 opts = { request: nil, output: nil }
 parser = OptionParser.new do |o|
@@ -74,6 +75,33 @@ begin
   rescue LocalModelEvaluation::RunpodCostControl::Error => e
     result.fetch("diagnostics") << {
       "code" => "cost.policy",
+      "status" => "FAIL",
+      "detail" => e.message
+    }
+    result["ready"] = false
+  end
+
+  begin
+    shutdown = LocalModelEvaluation::RunpodShutdownControl.new(
+      root: File.join(ROOT, "output", "runpod-fleets"),
+      repo_root: ROOT
+    )
+    gate = shutdown.dispatch_gate(
+      fleet_key: request.fetch("fleet_key"),
+      fleet_id: result["fleet_id"],
+      worker_indices: result.fetch("selected_worker_indices", [])
+    )
+    unless gate.fetch("code") == "shutdown.ready"
+      result.fetch("diagnostics") << {
+        "code" => gate.fetch("code"),
+        "status" => gate.fetch("allowed") ? "PASS" : "FAIL",
+        "detail" => gate.fetch("detail")
+      }
+    end
+    result["ready"] = false unless gate.fetch("allowed")
+  rescue LocalModelEvaluation::RunpodShutdownControl::Error => e
+    result.fetch("diagnostics") << {
+      "code" => "shutdown.state",
       "status" => "FAIL",
       "detail" => e.message
     }

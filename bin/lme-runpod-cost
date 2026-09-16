@@ -86,7 +86,7 @@ begin
   when "configure"
     opts = {
       fleet: nil,
-      lifecycle: "persistent",
+      lifecycle: "managed",
       idle_timeout_seconds: nil,
       unavailable_timeout_seconds: nil,
       soft_max_runtime_seconds: nil,
@@ -96,7 +96,7 @@ begin
     }
     OptionParser.new do |o|
       o.on("--fleet KEY") { |v| opts[:fleet] = v }
-      o.on("--lifecycle TYPE", "persistent|ephemeral") { |v| opts[:lifecycle] = v }
+      o.on("--lifecycle TYPE", "managed|persistent|ephemeral") { |v| opts[:lifecycle] = v }
       o.on("--idle-timeout-seconds SECONDS", Float) { |v| opts[:idle_timeout_seconds] = v }
       o.on("--unavailable-timeout-seconds SECONDS", Float) { |v| opts[:unavailable_timeout_seconds] = v }
       o.on("--soft-max-runtime-minutes MINUTES", Float) { |v| opts[:soft_max_runtime_seconds] = v * 60.0 }
@@ -227,7 +227,7 @@ begin
         limit --max-total-hourly-usd USD
         override --max-total-hourly-usd USD --minutes MINUTES
         clear-override
-        configure --fleet KEY [--lifecycle persistent|ephemeral] [threshold options]
+        configure --fleet KEY [--lifecycle managed|persistent|ephemeral] [threshold options]
         unconfigure --fleet KEY
         enable [--max-total-hourly-usd USD] [--poll-seconds SECONDS]
         disable

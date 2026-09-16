@@ -8,13 +8,15 @@ Nothing changes until `bin/rpof cost enable` is run.
 
 ## Recommended production pattern
 
-For a persistent production fleet, use soft limits to stop assigning new jobs
-between inference requests and hard limits as the final emergency teardown:
+For a lifecycle-managed production fleet, use soft limits to stop assigning new jobs
+between inference requests and hard limits as the final emergency teardown. Managed is
+the default; use `persistent` only when automatic AFIO terminal retirement should be
+disabled:
 
 ```bash
 bin/rpof cost configure \
   --fleet batch31-qwen35-main \
-  --lifecycle persistent \
+  --lifecycle managed \
   --soft-max-runtime-minutes 60 \
   --hard-max-runtime-minutes 75 \
   --soft-max-spend-usd 5.00 \

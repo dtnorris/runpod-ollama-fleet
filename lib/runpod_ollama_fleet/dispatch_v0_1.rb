@@ -6,6 +6,7 @@ require "time"
 require_relative "contract_v0_1"
 require_relative "../local_model_evaluation/runpod_dispatcher"
 require_relative "../local_model_evaluation/runpod_cost_control"
+require_relative "../local_model_evaluation/runpod_shutdown_control"
 
 module RunpodOllamaFleet
   class DispatchV01
@@ -30,10 +31,17 @@ module RunpodOllamaFleet
       fleet, _workers = validate_target!(target)
       validate_resume_target!(target)
       cost = cost_control
+      shutdown = shutdown_control
       validate_cost_gate!(cost, fleet)
+      validate_shutdown_gate!(shutdown, fleet, target.fetch("worker_indices"))
       drain_checker = lambda do
-        gate = cost.dispatch_gate(fleet_key: @fleet_key, fleet_id: fleet.fetch("fleet_id"))
-        !gate.fetch("allowed")
+        cost_gate = cost.dispatch_gate(fleet_key: @fleet_key, fleet_id: fleet.fetch("fleet_id"))
+        shutdown_gate = shutdown.dispatch_gate(
+          fleet_key: @fleet_key,
+          fleet_id: fleet.fetch("fleet_id"),
+          worker_indices: target.fetch("worker_indices")
+        )
+        !cost_gate.fetch("allowed") || !shutdown_gate.fetch("allowed")
       end
       dispatcher = @dispatcher_class.new(
         fleet_state: @fleet_state,
@@ -54,6 +62,7 @@ module RunpodOllamaFleet
     rescue LocalModelEvaluation::RunpodDispatcher::InfrastructureError,
            LocalModelEvaluation::RunpodFleetState::Error,
            LocalModelEvaluation::RunpodCostControl::Error,
+           LocalModelEvaluation::RunpodShutdownControl::Error,
            KeyError, ArgumentError, TypeError => e
       summary = infrastructure_failure_summary(request, started || utc_now, e)
       write_summary(summary)
@@ -120,6 +129,25 @@ module RunpodOllamaFleet
 
     def validate_cost_gate!(cost, fleet)
       gate = cost.dispatch_gate(fleet_key: @fleet_key, fleet_id: fleet.fetch("fleet_id"))
+      return if gate.fetch("allowed")
+
+      raise LocalModelEvaluation::RunpodDispatcher::InfrastructureError,
+            "#{gate.fetch('code')}: #{gate.fetch('detail')}"
+    end
+
+    def shutdown_control
+      LocalModelEvaluation::RunpodShutdownControl.new(
+        root: File.join(@provider_repo_root, "output", "runpod-fleets"),
+        repo_root: @provider_repo_root
+      )
+    end
+
+    def validate_shutdown_gate!(shutdown, fleet, worker_indices)
+      gate = shutdown.dispatch_gate(
+        fleet_key: @fleet_key,
+        fleet_id: fleet.fetch("fleet_id"),
+        worker_indices: worker_indices
+      )
       return if gate.fetch("allowed")
 
       raise LocalModelEvaluation::RunpodDispatcher::InfrastructureError,

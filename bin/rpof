@@ -32,6 +32,10 @@ when "lease"
   exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-lease"), *ARGV
 when "cost"
   exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-cost"), *ARGV
+when "shutdown"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-shutdown"), "shutdown", *ARGV
+when "keep"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-shutdown"), "keep", *ARGV
 when "scale"
   exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-lifecycle"), "scale", *ARGV
 when "replace"
@@ -56,6 +60,8 @@ else
       dispatch-legacy
       lease
       cost
+      shutdown
+      keep
       scale
       replace
       status

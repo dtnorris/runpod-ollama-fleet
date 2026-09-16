@@ -1,0 +1,217 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "dotenv"
+require "fileutils"
+require "optparse"
+require "rbconfig"
+
+ROOT = File.expand_path("..", __dir__)
+Dotenv.load(File.join(ROOT, ".env"))
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "local_model_evaluation"
+
+STATE_ROOT = File.join(ROOT, "output", "runpod-fleets")
+
+
+def runpod_client!
+  key = ENV["RUNPOD_API_KEY"].to_s
+  raise LocalModelEvaluation::RunpodShutdownControl::Error, "RUNPOD_API_KEY is missing" if key.empty?
+  LocalModelEvaluation::RunpodClient.new(
+    api_key: key,
+    base_url: ENV.fetch("RUNPOD_API_BASE_URL", LocalModelEvaluation::RunpodClient::DEFAULT_BASE_URL)
+  )
+end
+
+
+def control(client: nil)
+  LocalModelEvaluation::RunpodShutdownControl.new(root: STATE_ROOT, repo_root: ROOT, client: client)
+end
+
+
+def ensure_watchdog!
+  watcher = control
+  return watcher.watchdog_pid if watcher.watchdog_pid
+
+  runpod_client! # validate credentials before arming an automatic destructive action
+  FileUtils.mkdir_p(STATE_ROOT)
+  log = File.open(watcher.log_path, "a")
+  begin
+    pid = Process.spawn(
+      RbConfig.ruby, File.expand_path(__FILE__), "watch",
+      chdir: ROOT, in: File::NULL, out: log, err: [:child, :out], pgroup: true
+    )
+    Process.detach(pid)
+    pid
+  ensure
+    log.close
+  end
+end
+
+
+def parse_selector(opts, fleet_key)
+  raise LocalModelEvaluation::RunpodShutdownControl::Error, "use either --workers or --all, not both" if opts[:workers] && opts[:all]
+  raise LocalModelEvaluation::RunpodShutdownControl::Error, "use --workers LIST or --all" unless opts[:workers] || opts[:all]
+
+  namespace = LocalModelEvaluation::RunpodFleetNamespace.new(root: STATE_ROOT, repo_root: ROOT, fleet_key:)
+  state = LocalModelEvaluation::RunpodFleetState.new(root: namespace.state_root, local_port_base: namespace.local_port_base)
+  fleet = state.current
+  return [] unless fleet && fleet["status"] == "active"
+  by_index = Array(fleet.fetch("workers")).to_h { |worker| [Integer(worker.fetch("index")), worker] }
+  requested = opts[:workers] ? LocalModelEvaluation::RunpodWorkers.parse_selector(opts.fetch(:workers)) : by_index.keys.sort
+  unknown = requested.reject { |index| by_index.key?(index) }
+  unless unknown.empty?
+    raise LocalModelEvaluation::RunpodShutdownControl::Error,
+          "fleet #{fleet_key} does not contain worker index(es): #{unknown.join(', ')}"
+  end
+  requested.select { |index| by_index.fetch(index)["status"] == "active" }
+end
+
+
+def confirm_graceful!(fleet_key, indices, assume_yes:)
+  return if assume_yes
+  $stdout.print "Gracefully shut down #{fleet_key} #{indices.map { |i| "burst_#{i}" }.join(', ')}? [y/N] "
+  $stdout.flush
+  abort "Aborted; no shutdown state changed." unless %w[y yes].include?($stdin.gets.to_s.strip.downcase)
+end
+
+
+def confirm_force!(fleet_key, indices)
+  unless $stdin.tty? && $stdout.tty?
+    raise LocalModelEvaluation::RunpodShutdownControl::Error,
+          "--force requires an interactive terminal; there is no --yes bypass"
+  end
+  $stdout.puts "FORCE shutdown will interrupt active inference if necessary and permanently delete paid RunPod workers."
+  $stdout.puts "Fleet: #{fleet_key}; workers: #{indices.map { |i| "burst_#{i}" }.join(', ')}"
+  $stdout.print "Continue? [y/N] "
+  $stdout.flush
+  answer = $stdin.gets.to_s.strip
+  abort "Aborted; no forced shutdown was performed." unless answer == "y"
+end
+
+command = ARGV.shift || "shutdown"
+
+begin
+  case command
+  when "keep"
+    fleet_key = ARGV.shift || ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY)
+    raise LocalModelEvaluation::RunpodShutdownControl::Error, "Usage: bin/rpof keep [FLEET]" unless ARGV.empty?
+    removed = control.keep!(fleet_key)
+    if removed
+      puts "Kept #{fleet_key}: lifecycle shutdown gate cancelled; new work is allowed again."
+      puts "Hard lease and runtime cost controls still apply."
+    else
+      puts "#{fleet_key}: no lifecycle shutdown gate was pending."
+    end
+
+  when "shutdown"
+    opts = {
+      fleet: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY),
+      workers: nil,
+      all: false,
+      terminal: false,
+      force: false,
+      yes: false,
+      idle_seconds: LocalModelEvaluation::RunpodShutdownControl::DEFAULT_TERMINAL_IDLE_SECONDS,
+      drain_timeout_seconds: LocalModelEvaluation::RunpodShutdownControl::DEFAULT_DRAIN_TIMEOUT_SECONDS,
+      reason: nil
+    }
+    parser = OptionParser.new do |o|
+      o.banner = "Usage: bin/rpof shutdown --fleet KEY (--workers LIST|--all) [--terminal|--force]"
+      o.on("--fleet KEY") { |v| opts[:fleet] = v }
+      o.on("--workers LIST") { |v| opts[:workers] = v }
+      o.on("--all") { opts[:all] = true }
+      o.on("--terminal", "Arm the no-input terminal gate instead of draining immediately") { opts[:terminal] = true }
+      o.on("--force", "Interrupt if necessary; requires interactive lowercase y confirmation") { opts[:force] = true }
+      o.on("--yes", "Skip confirmation for graceful shutdown only") { opts[:yes] = true }
+      o.on("--inactive-minutes MINUTES", Float) { |v| opts[:idle_seconds] = v * 60.0 }
+      o.on("--drain-timeout-minutes MINUTES", Float) { |v| opts[:drain_timeout_seconds] = v * 60.0 }
+      o.on("--reason REASON") { |v| opts[:reason] = v }
+    end
+    parser.parse!(ARGV)
+    raise LocalModelEvaluation::RunpodShutdownControl::Error, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+    raise LocalModelEvaluation::RunpodShutdownControl::Error, "--terminal and --force are mutually exclusive" if opts[:terminal] && opts[:force]
+    raise LocalModelEvaluation::RunpodShutdownControl::Error, "--force never accepts --yes" if opts[:force] && opts[:yes]
+
+    fleet_key = LocalModelEvaluation::RunpodFleetNamespace.normalize_key(opts.fetch(:fleet))
+    indices = parse_selector(opts, fleet_key)
+    if indices.empty?
+      puts "#{fleet_key}: no active managed workers remain; shutdown is already terminal."
+      exit 0
+    end
+
+    if opts[:terminal]
+      result = control.schedule_terminal!(
+        fleet_key:,
+        worker_indices: indices,
+        idle_seconds: opts.fetch(:idle_seconds),
+        drain_timeout_seconds: opts.fetch(:drain_timeout_seconds),
+        reason: opts[:reason] || "afio_campaign_terminal"
+      )
+      if result.fetch("status") == "persistent"
+        puts "#{fleet_key}: lifecycle is persistent; automatic terminal shutdown was not armed."
+      else
+        pid = ensure_watchdog!
+        puts format(
+          "%s: terminal shutdown gate armed for %s after %.1f continuous inactive minutes; watchdog pid %d.",
+          fleet_key,
+          indices.map { |index| "burst_#{index}" }.join(", "),
+          opts.fetch(:idle_seconds) / 60.0,
+          pid
+        )
+        puts "Keep it: bin/rpof keep #{fleet_key}"
+      end
+    elsif opts[:force]
+      confirm_force!(fleet_key, indices)
+      control(client: runpod_client!).force_shutdown!(
+        fleet_key:,
+        worker_indices: indices,
+        reason: opts[:reason] || "operator_force_shutdown"
+      )
+      puts "Verified forced shutdown complete for #{fleet_key}: #{indices.map { |i| "burst_#{i}" }.join(', ')}"
+    else
+      confirm_graceful!(fleet_key, indices, assume_yes: opts[:yes])
+      ok = control(client: runpod_client!).run_graceful!(
+        fleet_key:,
+        worker_indices: indices,
+        drain_timeout_seconds: opts.fetch(:drain_timeout_seconds),
+        reason: opts[:reason] || "operator_graceful_shutdown"
+      )
+      if ok
+        puts "Verified graceful shutdown complete for #{fleet_key}: #{indices.map { |i| "burst_#{i}" }.join(', ')}"
+      else
+        warn "ERROR: graceful drain timed out; workers remain alive and DRAINING."
+        warn "Use `bin/rpof keep #{fleet_key}` to reopen them or rerun with --force for an interactive emergency stop."
+        exit 1
+      end
+    end
+
+  when "watch"
+    raise LocalModelEvaluation::RunpodShutdownControl::Error, "Usage: internal shutdown watch" unless ARGV.empty?
+    watcher = control(client: runpod_client!)
+    FileUtils.mkdir_p(STATE_ROOT)
+    existing = watcher.watchdog_pid
+    if existing && existing != Process.pid
+      raise LocalModelEvaluation::RunpodShutdownControl::Error, "shutdown watchdog is already running (pid #{existing})"
+    end
+    File.write(watcher.pid_path, "#{Process.pid}\n")
+    begin
+      watcher.watch
+    ensure
+      if File.file?(watcher.pid_path) && File.read(watcher.pid_path).strip == Process.pid.to_s
+        File.delete(watcher.pid_path)
+      end
+    end
+
+  else
+    raise LocalModelEvaluation::RunpodShutdownControl::Error,
+          "Usage: bin/rpof (shutdown --fleet KEY (--workers LIST|--all) [--terminal|--force] | keep [FLEET])"
+  end
+rescue LocalModelEvaluation::RunpodShutdownControl::Error,
+       LocalModelEvaluation::RunpodFleetNamespace::Error,
+       LocalModelEvaluation::RunpodFleetState::Error,
+       LocalModelEvaluation::RunpodWorkers::Error,
+       LocalModelEvaluation::RunpodClient::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end

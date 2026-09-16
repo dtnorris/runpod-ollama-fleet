@@ -14,6 +14,7 @@ require "local_model_evaluation/runpod_fleet_state"
 require "local_model_evaluation/runpod_status"
 require "local_model_evaluation/runpod_status_all"
 require "local_model_evaluation/runpod_cost_control"
+require "local_model_evaluation/runpod_shutdown_control"
 
 all_fleets = ARGV == ["--all"]
 unless ARGV.empty? || all_fleets
@@ -75,6 +76,9 @@ begin
     overview = LocalModelEvaluation::RunpodStatusAll.new
     snapshot = overview.snapshot(entries)
     $stdout.write(overview.render(snapshot))
+    shutdown = LocalModelEvaluation::RunpodShutdownControl.new(root: state_root, repo_root: ROOT)
+    $stdout.write("\n")
+    $stdout.write(shutdown.render(fleet_aliases: snapshot.fetch("fleet_aliases")))
     cost = LocalModelEvaluation::RunpodCostControl.new(root: state_root, repo_root: ROOT)
     $stdout.write("\n")
     $stdout.write(cost.render)
@@ -91,6 +95,7 @@ rescue LocalModelEvaluation::RunpodFleetNamespace::Error,
        LocalModelEvaluation::RunpodStatus::Error,
        LocalModelEvaluation::RunpodFleetState::Error,
        LocalModelEvaluation::RunpodCostControl::Error,
+       LocalModelEvaluation::RunpodShutdownControl::Error,
        ArgumentError => e
   warn "ERROR: #{e.message}"
   exit 1

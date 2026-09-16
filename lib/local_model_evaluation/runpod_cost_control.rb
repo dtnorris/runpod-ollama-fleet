@@ -29,7 +29,7 @@ module LocalModelEvaluation
     DEFAULT_POLL_SECONDS = 15.0
     DEFAULT_IDLE_TIMEOUT_SECONDS = 180.0
     DEFAULT_UNAVAILABLE_TIMEOUT_SECONDS = 90.0
-    LIFECYCLES = %w[persistent ephemeral].freeze
+    LIFECYCLES = %w[managed persistent ephemeral].freeze
 
     class Error < StandardError; end
 
@@ -128,6 +128,14 @@ module LocalModelEvaluation
         data.fetch("worker_observations", {}).delete(key)
         data.fetch("policy_baselines", {}).delete(key)
       end
+    end
+
+    def fleet_lifecycle(fleet_key)
+      key = RunpodFleetNamespace.normalize_key(fleet_key)
+      lifecycle = policy.fetch("fleets", {}).dig(key, "lifecycle").to_s
+      lifecycle = "managed" if lifecycle.empty?
+      raise Error, "invalid lifecycle #{lifecycle.inspect} for fleet #{key}" unless LIFECYCLES.include?(lifecycle)
+      lifecycle
     end
 
     def effective_max_total_hourly_usd(now: utc_now)
@@ -429,7 +437,7 @@ module LocalModelEvaluation
       fleet_id = fleet.fetch("fleet_id")
       snapshot = entry.fetch("status")
       policy = fleet_policy.transform_keys(&:to_s)
-      lifecycle = policy.fetch("lifecycle", "persistent").to_s
+      lifecycle = policy.fetch("lifecycle", "managed").to_s
       raise Error, "invalid lifecycle #{lifecycle.inspect} for fleet #{fleet_key}" unless LIFECYCLES.include?(lifecycle)
 
       baseline = state_data.fetch("policy_baselines").fetch(fleet_key)

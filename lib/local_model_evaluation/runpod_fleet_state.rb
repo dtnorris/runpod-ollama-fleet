@@ -268,7 +268,7 @@ module LocalModelEvaluation
       raise Error, "could not complete replacement: #{e.message}"
     end
 
-    def mark_destroyed(indices)
+    def mark_destroyed(indices, reason: nil)
       record = current
       return nil unless record
 
@@ -278,16 +278,19 @@ module LocalModelEvaluation
       unknown = requested.reject { |index| known.key?(index) }
       raise Error, "fleet state does not contain worker index(es): #{unknown.join(', ')}" unless unknown.empty?
 
+      teardown_reason = reason.to_s.strip
       requested.each do |index|
         worker = known.fetch(index)
         worker["status"] = "destroyed"
         worker["destroyed_at_utc"] ||= timestamp
+        worker["teardown_reason"] = teardown_reason unless teardown_reason.empty?
       end
       refresh_fleet_totals!(record)
 
       if record.fetch("workers").all? { |worker| worker["status"] == "destroyed" }
         record["status"] = "destroyed"
         record["destroyed_at_utc"] ||= timestamp
+        record["teardown_reason"] = teardown_reason unless teardown_reason.empty?
       end
 
       write_record(record)

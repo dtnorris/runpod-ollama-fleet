@@ -352,7 +352,7 @@ module LocalModelEvaluation
       end
     end
 
-    def destroy(worker_indices:)
+    def destroy(worker_indices:, verify_absent: false, destroy_reason: nil, verify_wait_seconds: 30.0, verify_poll_seconds: 1.0)
       indices = Array(worker_indices).map { |value| Integer(value) }.uniq.sort
       raise Error, "no workers selected" if indices.empty?
       indices.each { |index| validate_worker_index(index) }
@@ -382,6 +382,7 @@ module LocalModelEvaluation
 
           @client.delete_pod(actual_id)
           @out.puts "Deleted #{expected_name}: #{actual_id}"
+          verify_pod_absent!(actual_id, wait_seconds: verify_wait_seconds, poll_seconds: verify_poll_seconds) if verify_absent
           cleared << index
         rescue RunpodClient::Error => e
           if e.status == 404
@@ -396,7 +397,7 @@ module LocalModelEvaluation
       end
 
       unless cleared.empty?
-        fleet_record = with_fleet_state { @fleet_state.mark_destroyed(cleared) }
+        fleet_record = with_fleet_state { @fleet_state.mark_destroyed(cleared, reason: destroy_reason) }
         clear_fleet = fleet_record && fleet_record["status"] == "destroyed"
         remove_worker_env(cleared, clear_fleet:)
       end
@@ -406,6 +407,20 @@ module LocalModelEvaluation
     end
 
     private
+
+    def verify_pod_absent!(pod_id, wait_seconds:, poll_seconds:)
+      wait_seconds = positive_float(wait_seconds, "provider deletion verification wait")
+      poll_seconds = positive_float(poll_seconds, "provider deletion verification poll")
+      deadline = @clock.call + wait_seconds
+      loop do
+        live = @client.list_pods.any? { |pod| pod["id"].to_s == pod_id.to_s }
+        return true unless live
+        if @clock.call >= deadline
+          raise Error, "provider still reports deleted pod #{pod_id} after #{wait_seconds.round(1)} seconds"
+        end
+        @sleeper.call(poll_seconds)
+      end
+    end
 
     def create_body(index, ssh_public_key, cloud, container_disk_gb:, volume_gb:, network_volume_id: nil)
       {
