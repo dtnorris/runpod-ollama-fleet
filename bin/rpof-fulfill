@@ -1,0 +1,428 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "fileutils"
+require "json"
+require "optparse"
+require "rbconfig"
+
+ROOT = File.expand_path("..", __dir__)
+ENV["LME_REPO"] = ROOT
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "local_model_evaluation"
+
+opts = {
+  fleet: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY),
+  target_workers: nil,
+  minimum_workers: nil,
+  gpu_ids: [],
+  cloud: LocalModelEvaluation::RunpodFleet::DEFAULT_CLOUD,
+  max_hourly_per_worker_usd: nil,
+  max_hourly_usd: ENV.fetch("RUNPOD_MAX_FLEET_HOURLY_USD", LocalModelEvaluation::RunpodFleet::DEFAULT_MAX_FLEET_HOURLY_USD),
+  max_total_hourly_usd: ENV.fetch("RUNPOD_MAX_TOTAL_HOURLY_USD", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_MAX_TOTAL_HOURLY_USD),
+  max_runtime_seconds: nil,
+  max_spend_usd: nil,
+  container_disk_gb: LocalModelEvaluation::RunpodFleet::DEFAULT_CONTAINER_DISK_GB,
+  volume_gb: nil,
+  network_volume_id: nil,
+  ssh_public_key: ENV.fetch("RUNPOD_SSH_PUBLIC_KEY_PATH", "~/.ssh/id_ed25519.pub"),
+  wait_seconds: LocalModelEvaluation::RunpodFleet::DEFAULT_WAIT_SECONDS,
+  poll_seconds: LocalModelEvaluation::RunpodFleet::DEFAULT_POLL_SECONDS,
+  output: nil,
+  dry_run: false,
+  yes: false
+}
+
+parser = OptionParser.new do |o|
+  o.banner = "Usage: bin/rpof fulfill --target-workers N --minimum-workers N --gpu GPU_ID [--gpu GPU_ID ...] --max-hourly-per-worker USD [options]"
+  o.on("--fleet KEY", "Managed RPOF fleet key") { |v| opts[:fleet] = v }
+  o.on("--target-workers N", Integer, "Desired provisioned worker count") { |v| opts[:target_workers] = v }
+  o.on("--minimum-workers N", Integer, "Minimum useful provisioned worker count") { |v| opts[:minimum_workers] = v }
+  o.on("--gpu GPU_ID", "Qualified GPU id; repeatable") { |v| opts[:gpu_ids] << v }
+  o.on("--cloud TIER", "RunPod cloud tier (default: SECURE)") { |v| opts[:cloud] = v }
+  o.on("--max-hourly-per-worker USD", Float, "Never acquire a new worker above this rate") { |v| opts[:max_hourly_per_worker_usd] = v }
+  o.on("--max-hourly-usd USD", Float, "Fail closed above this fleet's hourly rate") { |v| opts[:max_hourly_usd] = v }
+  o.on("--max-total-hourly-usd USD", Float, "Fail closed above aggregate managed hourly rate") { |v| opts[:max_total_hourly_usd] = v }
+  o.on("--max-runtime-minutes MINUTES", Float, "Initial fleet runtime lease") { |v| opts[:max_runtime_seconds] = v * 60.0 }
+  o.on("--max-spend-usd USD", Float, "Initial fleet spend lease") { |v| opts[:max_spend_usd] = v }
+  o.on("--container-disk-gb N", Integer, "Initial worker container disk") { |v| opts[:container_disk_gb] = v }
+  o.on("--network-volume-id ID", "Attach an existing network volume at /workspace") { |v| opts[:network_volume_id] = v }
+  o.on("--volume-gb N", Integer, "Initial persistent /workspace volume") { |v| opts[:volume_gb] = v }
+  o.on("--ssh-public-key PATH", "OpenSSH public key file to authorize") { |v| opts[:ssh_public_key] = v }
+  o.on("--wait-seconds N", Integer, "Maximum wait for each one-worker acquisition") { |v| opts[:wait_seconds] = v }
+  o.on("--poll-seconds N", Float, "Provisioning poll interval") { |v| opts[:poll_seconds] = v }
+  o.on("--output PATH", "Write machine-readable fulfillment result JSON") { |v| opts[:output] = v }
+  o.on("--dry-run", "Read-only policy/capacity plan; create no pods") { opts[:dry_run] = true }
+  o.on("--yes", "Skip the paid fulfillment confirmation prompt") { opts[:yes] = true }
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+  raise OptionParser::MissingArgument, "--target-workers" unless opts[:target_workers]
+  raise OptionParser::MissingArgument, "--minimum-workers" unless opts[:minimum_workers]
+  raise OptionParser::MissingArgument, "--gpu" if opts[:gpu_ids].empty?
+  raise OptionParser::MissingArgument, "--max-hourly-per-worker" unless opts[:max_hourly_per_worker_usd]
+  if opts[:network_volume_id] && opts[:volume_gb]
+    raise OptionParser::InvalidArgument, "--network-volume-id cannot be combined with --volume-gb"
+  end
+rescue OptionParser::ParseError => e
+  warn "ERROR: #{e.message}"
+  warn parser
+  exit 2
+end
+
+def positive_float(value, label)
+  number = Float(value)
+  raise ArgumentError unless number.positive?
+  number
+rescue ArgumentError, TypeError
+  raise LocalModelEvaluation::RunpodFulfillment::Error, "#{label} must be a positive number"
+end
+
+def confirm_or_abort(prompt, assume_yes:)
+  return if assume_yes
+  $stdout.print "#{prompt} [y/N] "
+  $stdout.flush
+  abort "Aborted; no changes made." unless %w[y yes].include?($stdin.gets.to_s.strip.downcase)
+end
+
+def namespace_for(fleet_key, create: false, provisional: false)
+  LocalModelEvaluation::RunpodFleetNamespace.new(
+    root: File.join(ROOT, "output", "runpod-fleets"),
+    repo_root: ROOT,
+    fleet_key:,
+    create:,
+    provisional:
+  )
+end
+
+def client_for(api_key)
+  LocalModelEvaluation::RunpodClient.new(
+    api_key:,
+    base_url: ENV.fetch("RUNPOD_API_BASE_URL", LocalModelEvaluation::RunpodClient::DEFAULT_BASE_URL)
+  )
+end
+
+def state_for(namespace)
+  LocalModelEvaluation::RunpodFleetState.new(
+    root: namespace.state_root,
+    local_port_base: namespace.local_port_base
+  )
+end
+
+def fleet_for(namespace, client)
+  LocalModelEvaluation::RunpodFleet.new(
+    client:,
+    env_path: namespace.env_path,
+    state_root: namespace.state_root,
+    fleet_key: namespace.fleet_key,
+    local_port_base: namespace.local_port_base
+  )
+end
+
+def lifecycle_for(namespace, client, state)
+  LocalModelEvaluation::RunpodFleetLifecycle.new(
+    client:,
+    fleet_state: state,
+    env_path: namespace.env_path,
+    fleet_key: namespace.fleet_key,
+    local_port_base: namespace.local_port_base
+  )
+end
+
+def start_lease_watchdog!(namespace:, fleet:, workers:)
+  record = fleet.fleet_state.current
+  return unless record && record["lease"]
+
+  lease_dir = fleet.fleet_state.artifact_dir(record.fetch("fleet_id"), "lease")
+  FileUtils.mkdir_p(lease_dir)
+  log_path = File.join(lease_dir, LocalModelEvaluation::RunpodLease::LOG_FILE)
+  log = File.open(log_path, "a")
+  command = [
+    RbConfig.ruby,
+    File.join(ROOT, "bin", "lme-runpod-lease"),
+    "watch",
+    "--fleet", namespace.fleet_key,
+    "--expected-fleet-id", record.fetch("fleet_id")
+  ]
+  pid = Process.spawn(*command, chdir: ROOT, in: File::NULL, out: log, err: [:child, :out], pgroup: true)
+  Process.detach(pid)
+  puts "Lease watchdog: pid #{pid}; log #{log_path}"
+rescue SystemCallError => e
+  begin
+    fleet.destroy(worker_indices: workers.map(&:index))
+  rescue StandardError => destroy_error
+    raise LocalModelEvaluation::RunpodFulfillment::Error,
+          "could not start lease watchdog: #{e.message}; emergency teardown also failed: #{destroy_error.message}"
+  end
+  raise LocalModelEvaluation::RunpodFulfillment::Error,
+        "could not start lease watchdog: #{e.message}; newly-created fleet was torn down"
+ensure
+  log&.close
+end
+
+def write_result(path, document)
+  return unless path
+  expanded = File.expand_path(path, ROOT)
+  FileUtils.mkdir_p(File.dirname(expanded))
+  tmp = "#{expanded}.tmp.#{$$}"
+  File.write(tmp, JSON.pretty_generate(document) + "\n")
+  File.rename(tmp, expanded)
+ensure
+  File.delete(tmp) if defined?(tmp) && tmp && File.exist?(tmp)
+end
+
+def existing_policy_check!(record, gpu_ids:, cloud:, max_per_worker:, max_fleet:, max_runtime_seconds:, max_spend_usd:)
+  return 0 unless record && record["status"] == "active"
+  unless record.fetch("cloud").to_s == cloud
+    raise LocalModelEvaluation::RunpodFulfillment::Error,
+          "existing fleet cloud #{record.fetch('cloud').inspect} does not match requested #{cloud.inspect}"
+  end
+
+  workers = Array(record.fetch("workers"))
+  inactive = workers.reject { |worker| worker["status"] == "active" }
+  unless inactive.empty?
+    raise LocalModelEvaluation::RunpodFulfillment::Error,
+          "existing fleet has inactive worker slots; reconcile them before fulfillment"
+  end
+  workers.each do |worker|
+    gpu_id = worker["gpu_id"].to_s.strip
+    gpu_id = record.dig("gpu", "id").to_s.strip if gpu_id.empty?
+    unless gpu_ids.include?(gpu_id)
+      raise LocalModelEvaluation::RunpodFulfillment::Error,
+            "existing burst_#{worker.fetch('index')} uses unqualified GPU #{gpu_id.inspect}"
+    end
+    rate = Float(worker.fetch("hourly_rate_usd"))
+    if rate > max_per_worker
+      raise LocalModelEvaluation::RunpodFulfillment::Error,
+            format("existing burst_%d rate $%.4f/hr exceeds per-worker cap $%.4f/hr", worker.fetch("index"), rate, max_per_worker)
+    end
+  end
+  current_rate = Float(record.fetch("fleet_hourly_rate_usd"))
+  if current_rate > max_fleet
+    raise LocalModelEvaluation::RunpodFulfillment::Error,
+          format("existing fleet rate $%.4f/hr exceeds fleet cap $%.4f/hr", current_rate, max_fleet)
+  end
+
+  requested_lease = { "max_runtime_seconds" => max_runtime_seconds, "max_spend_usd" => max_spend_usd }
+  requested_lease.each do |key, requested|
+    next if requested.nil?
+    lease = record["lease"]
+    unless lease
+      raise LocalModelEvaluation::RunpodFulfillment::Error,
+            "existing fleet has no lease; cannot retrofit #{key} during fulfillment"
+    end
+    recorded = lease[key]
+    unless recorded && (Float(recorded) - Float(requested)).abs < 0.001
+      raise LocalModelEvaluation::RunpodFulfillment::Error,
+            "existing fleet #{key}=#{recorded.inspect} does not match requested #{requested.inspect}"
+    end
+  end
+
+  Integer(record.fetch("worker_count"))
+rescue KeyError, ArgumentError, TypeError => e
+  raise LocalModelEvaluation::RunpodFulfillment::Error, "invalid existing fleet state: #{e.message}"
+end
+
+api_key = ENV["RUNPOD_API_KEY"].to_s
+abort "ERROR: RUNPOD_API_KEY is missing" if api_key.empty?
+
+begin
+  fleet_key = LocalModelEvaluation::RunpodFleetNamespace.normalize_key(opts[:fleet])
+  gpu_ids = opts[:gpu_ids].map { |value| value.to_s.strip }.reject(&:empty?).uniq
+  cloud = opts[:cloud].to_s.upcase
+  max_per_worker = positive_float(opts[:max_hourly_per_worker_usd], "max hourly per worker")
+  max_fleet = positive_float(opts[:max_hourly_usd], "max fleet hourly cost")
+  max_total = positive_float(opts[:max_total_hourly_usd], "aggregate managed hourly cost")
+
+  provisional_namespace = namespace_for(fleet_key, provisional: true)
+  client = client_for(api_key)
+  provisional_state = state_for(provisional_namespace)
+  record = provisional_state.current
+  if record && !%w[active destroyed].include?(record["status"].to_s)
+    raise LocalModelEvaluation::RunpodFulfillment::Error,
+          "existing fleet is #{record['status'].inspect}; fulfillment requires active or destroyed state"
+  end
+  current_workers = existing_policy_check!(
+    record,
+    gpu_ids:,
+    cloud:,
+    max_per_worker:,
+    max_fleet:,
+    max_runtime_seconds: opts[:max_runtime_seconds],
+    max_spend_usd: opts[:max_spend_usd]
+  )
+  current_total = provisional_namespace.total_active_hourly_usd
+  if current_total > max_total
+    raise LocalModelEvaluation::RunpodFulfillment::Error,
+          format("existing managed RunPod rate $%.4f/hr exceeds aggregate cap $%.4f/hr", current_total, max_total)
+  end
+
+  policy = LocalModelEvaluation::RunpodCapacityPolicy.new(client:)
+  fulfillment = LocalModelEvaluation::RunpodFulfillment.new(capacity_policy: policy)
+
+  puts "RunPod deterministic capacity fulfillment"
+  puts "  Fleet: #{fleet_key}"
+  puts "  Cloud: #{cloud}"
+  puts "  Workers: #{current_workers} -> target #{opts[:target_workers]} (minimum #{opts[:minimum_workers]})"
+  puts "  Qualified GPUs: #{gpu_ids.join(', ')}"
+  puts format("  Per-worker cap: $%.4f/hr", max_per_worker)
+  puts format("  Per-fleet cap: $%.4f/hr", max_fleet)
+  puts format("  Aggregate managed cap: $%.4f/hr", max_total)
+  puts "  Acquisition: live catalog refresh; cheapest qualified first; one durable worker per attempt"
+  puts "  Capacity miss: retain prior successes and try the next qualified GPU"
+
+  if opts[:dry_run]
+    result = fulfillment.run(
+      target_workers: opts[:target_workers],
+      minimum_workers: opts[:minimum_workers],
+      gpu_ids:,
+      cloud:,
+      current_workers:,
+      max_hourly_per_worker_usd: max_per_worker,
+      dry_run: true
+    )
+  else
+    confirm_or_abort(
+      "Allow RPOF to create paid RunPod workers within these explicit policy bounds?",
+      assume_yes: opts[:yes]
+    )
+
+    provision_one = lambda do |candidate|
+      namespace = namespace_for(fleet_key, create: true)
+      state = state_for(namespace)
+      current = state.current
+      fleet = fleet_for(namespace, client)
+      fleet.gpu_id = candidate.gpu_id
+      ssh_public_key = fleet.read_ssh_public_key(opts[:ssh_public_key])
+
+      if current && current["status"] == "active"
+        lifecycle = lifecycle_for(namespace, client, state)
+        target = Integer(current.fetch("worker_count")) + 1
+        preflight = lifecycle.preflight_scale(
+          target_worker_count: target,
+          gpu_id: candidate.gpu_id,
+          max_fleet_hourly_usd: max_fleet
+        )
+        if preflight.hourly_rate > max_per_worker
+          raise LocalModelEvaluation::RunpodFulfillment::Error,
+                format("live rate $%.4f/hr exceeds per-worker cap $%.4f/hr", preflight.hourly_rate, max_per_worker)
+        end
+        total = namespace.total_active_hourly_usd - preflight.current_fleet_hourly_rate + preflight.projected_fleet_hourly_rate
+        if total > max_total
+          raise LocalModelEvaluation::RunpodFulfillment::Error,
+                format("projected managed total $%.4f/hr exceeds aggregate cap $%.4f/hr", total, max_total)
+        end
+        lifecycle.scale(
+          target_worker_count: target,
+          ssh_public_key:,
+          preflight:,
+          max_fleet_hourly_usd: max_fleet,
+          wait_seconds: opts[:wait_seconds],
+          poll_seconds: opts[:poll_seconds]
+        )
+      else
+        preflight = fleet.preflight(
+          worker_count: 1,
+          cloud:,
+          max_fleet_hourly_usd: max_fleet,
+          container_disk_gb: opts[:container_disk_gb],
+          volume_gb: opts[:volume_gb],
+          network_volume_id: opts[:network_volume_id],
+          max_runtime_seconds: opts[:max_runtime_seconds],
+          max_spend_usd: opts[:max_spend_usd]
+        )
+        if preflight.hourly_rate > max_per_worker
+          raise LocalModelEvaluation::RunpodFulfillment::Error,
+                format("live rate $%.4f/hr exceeds per-worker cap $%.4f/hr", preflight.hourly_rate, max_per_worker)
+        end
+        total = namespace.total_active_hourly_usd + preflight.fleet_hourly_rate
+        if total > max_total
+          raise LocalModelEvaluation::RunpodFulfillment::Error,
+                format("projected managed total $%.4f/hr exceeds aggregate cap $%.4f/hr", total, max_total)
+        end
+        workers = fleet.create(
+          worker_count: 1,
+          cloud:,
+          ssh_public_key:,
+          preflight:,
+          max_fleet_hourly_usd: max_fleet,
+          container_disk_gb: opts[:container_disk_gb],
+          volume_gb: opts[:volume_gb],
+          network_volume_id: opts[:network_volume_id],
+          max_runtime_seconds: opts[:max_runtime_seconds],
+          max_spend_usd: opts[:max_spend_usd],
+          min_ready_workers: 1,
+          wait_seconds: opts[:wait_seconds],
+          poll_seconds: opts[:poll_seconds]
+        )
+        start_lease_watchdog!(namespace:, fleet:, workers:)
+      end
+
+      updated = state.current
+      Integer(updated.fetch("worker_count"))
+    rescue LocalModelEvaluation::RunpodClient::Error,
+           LocalModelEvaluation::RunpodFleet::Error,
+           LocalModelEvaluation::RunpodFleetLifecycle::Error => e
+      if LocalModelEvaluation::RunpodFulfillment.capacity_error?(e)
+        raise LocalModelEvaluation::RunpodFulfillment::CandidateUnavailable, e.message
+      end
+      raise
+    end
+
+    result = fulfillment.run(
+      target_workers: opts[:target_workers],
+      minimum_workers: opts[:minimum_workers],
+      gpu_ids:,
+      cloud:,
+      current_workers:,
+      max_hourly_per_worker_usd: max_per_worker,
+      &provision_one
+    )
+  end
+
+  final_namespace = namespace_for(fleet_key, provisional: true)
+  final_record = state_for(final_namespace).current
+  document = {
+    "contract_version" => "rpof-capacity-fulfillment-result/v0.1",
+    "fleet_key" => fleet_key,
+    "fleet_id" => final_record && final_record["status"] == "active" ? final_record["fleet_id"] : nil,
+    "status" => result.status,
+    "target_workers" => result.target_workers,
+    "minimum_workers" => result.minimum_workers,
+    "initial_workers" => result.initial_workers,
+    "final_workers" => result.final_workers,
+    "stopped_reason" => result.stopped_reason,
+    "attempts" => result.attempts.map do |attempt|
+      {
+        "gpu_id" => attempt.gpu_id,
+        "hourly_rate_usd" => attempt.hourly_rate_usd,
+        "status" => attempt.status,
+        "detail" => attempt.detail
+      }
+    end
+  }
+  write_result(opts[:output], document)
+
+  puts ""
+  puts "Fulfillment result: #{result.status.upcase}"
+  puts "  Workers: #{result.initial_workers} -> #{result.final_workers}"
+  puts "  Reason: #{result.stopped_reason}"
+  puts "  Result JSON: #{File.expand_path(opts[:output], ROOT)}" if opts[:output]
+  if !opts[:dry_run] && result.final_workers.positive?
+    puts "Provisioned workers are not bootstrapped or tunneled by this command."
+    puts "Next layer: bootstrap exact model/digest, start tunnels, then run capability-check."
+  end
+
+  exit(%w[fulfilled minimum_met planned].include?(result.status) ? 0 : 1)
+rescue LocalModelEvaluation::RunpodClient::Error,
+       LocalModelEvaluation::RunpodCapacityPolicy::Error,
+       LocalModelEvaluation::RunpodFleet::Error,
+       LocalModelEvaluation::RunpodFleetState::Error,
+       LocalModelEvaluation::RunpodFleetNamespace::Error,
+       LocalModelEvaluation::RunpodFleetLifecycle::Error,
+       LocalModelEvaluation::RunpodFulfillment::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end

@@ -16,6 +16,10 @@ when "capability-check"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-capability-check"), *ARGV
 when "dispatch"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-dispatch"), *ARGV
+when "capacity"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-capacity"), *ARGV
+when "fulfill"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-fulfill"), *ARGV
 when "create"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-fleet"), "create", *ARGV
 when "destroy"
@@ -42,6 +46,8 @@ else
       version
       capability-check
       dispatch
+      capacity
+      fulfill
       create
       destroy
       bootstrap

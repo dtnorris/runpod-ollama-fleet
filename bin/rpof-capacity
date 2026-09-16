@@ -1,0 +1,105 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "local_model_evaluation"
+
+opts = {
+  gpu_ids: [],
+  cloud: LocalModelEvaluation::RunpodFleet::DEFAULT_CLOUD,
+  max_hourly_per_worker_usd: nil,
+  json: false
+}
+
+parser = OptionParser.new do |o|
+  o.banner = "Usage: bin/rpof capacity --gpu GPU_ID [--gpu GPU_ID ...] [options]"
+  o.on("--gpu GPU_ID", "Qualified GPU id; repeatable") { |v| opts[:gpu_ids] << v }
+  o.on("--cloud TIER", "RunPod cloud tier (default: SECURE)") { |v| opts[:cloud] = v }
+  o.on("--max-hourly-per-worker USD", Float, "Reject qualified GPUs above this hourly rate") do |v|
+    opts[:max_hourly_per_worker_usd] = v
+  end
+  o.on("--json", "Emit machine-readable JSON") { opts[:json] = true }
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+  raise OptionParser::MissingArgument, "--gpu" if opts[:gpu_ids].empty?
+rescue OptionParser::ParseError => e
+  warn "ERROR: #{e.message}"
+  warn parser
+  exit 2
+end
+
+api_key = ENV["RUNPOD_API_KEY"].to_s
+abort "ERROR: RUNPOD_API_KEY is missing" if api_key.empty?
+
+begin
+  client = LocalModelEvaluation::RunpodClient.new(
+    api_key:,
+    base_url: ENV.fetch("RUNPOD_API_BASE_URL", LocalModelEvaluation::RunpodClient::DEFAULT_BASE_URL)
+  )
+  ranking = LocalModelEvaluation::RunpodCapacityPolicy.new(client:).rank(
+    gpu_ids: opts[:gpu_ids],
+    cloud: opts[:cloud],
+    max_hourly_per_worker_usd: opts[:max_hourly_per_worker_usd]
+  )
+
+  if opts[:json]
+    document = {
+      "contract_version" => "rpof-capacity-snapshot/v0.1",
+      "cloud" => ranking.cloud,
+      "required_vram_gb" => LocalModelEvaluation::RunpodFleet::GPU_MEMORY_GB,
+      "candidates" => ranking.candidates.map do |candidate|
+        {
+          "gpu_id" => candidate.gpu_id,
+          "memory_gb" => candidate.memory_gb,
+          "availability" => candidate.availability,
+          "hourly_rate_usd" => candidate.hourly_rate_usd
+        }
+      end,
+      "rejections" => ranking.rejections.map do |rejection|
+        { "gpu_id" => rejection.gpu_id, "reason" => rejection.reason }
+      end
+    }
+    puts JSON.pretty_generate(document)
+    exit(ranking.candidates.empty? ? 1 : 0)
+  end
+
+  puts "RunPod qualified capacity"
+  puts "  Cloud: #{ranking.cloud}"
+  puts "  Required VRAM: #{LocalModelEvaluation::RunpodFleet::GPU_MEMORY_GB} GB"
+  if opts[:max_hourly_per_worker_usd]
+    puts format("  Per-worker cap: $%.4f/hr", opts[:max_hourly_per_worker_usd])
+  end
+  puts ""
+  if ranking.candidates.empty?
+    puts "No qualified GPU candidate is currently available within policy."
+  else
+    puts format("%-4s %-30s %-8s %-12s %s", "RANK", "GPU", "VRAM", "RATE", "AVAILABILITY")
+    ranking.candidates.each_with_index do |candidate, index|
+      puts format(
+        "%-4d %-30s %-8s $%-11.4f %s",
+        index + 1,
+        candidate.gpu_id,
+        "#{candidate.memory_gb} GB",
+        candidate.hourly_rate_usd,
+        candidate.availability
+      )
+    end
+  end
+  unless ranking.rejections.empty?
+    puts ""
+    puts "Rejected qualified profiles:"
+    ranking.rejections.each { |row| puts "  #{row.gpu_id}: #{row.reason}" }
+  end
+
+  exit(ranking.candidates.empty? ? 1 : 0)
+rescue LocalModelEvaluation::RunpodCapacityPolicy::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end
