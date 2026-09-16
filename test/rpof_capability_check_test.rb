@@ -52,9 +52,9 @@ class RpofCapabilityCheckTest < Minitest::Test
       FileUtils.mkdir_p(File.join(bootstrap_root, run_id))
       File.write(File.join(bootstrap_root, "current"), "#{run_id}\n")
       File.write(File.join(bootstrap_root, run_id, "bootstrap.json"), JSON.pretty_generate({
-        "fleet_id" => fleet.fetch("fleet_id"), "status" => "passed", "context" => 32_768,
+        "fleet_id" => fleet.fetch("fleet_id"), "status" => "interrupted", "context" => 32_768,
         "workers" => [{
-          "index" => 1, "status" => "passed",
+          "index" => 1, "pod_id" => "pod-1", "status" => "passed",
           "provenance" => {
             "gpu" => { "name" => "NVIDIA A40" },
             "models" => { "fixture-model" => {
@@ -62,6 +62,16 @@ class RpofCapabilityCheckTest < Minitest::Test
               "size_bytes" => 100, "size_vram_bytes" => 100, "fully_gpu_resident" => true
             } }
           }
+        }]
+      }) + "\n")
+      newer_run_id = "bootstrap-newer"
+      FileUtils.mkdir_p(File.join(bootstrap_root, newer_run_id))
+      File.write(File.join(bootstrap_root, "current"), "#{newer_run_id}\n")
+      File.write(File.join(bootstrap_root, newer_run_id, "bootstrap.json"), JSON.pretty_generate({
+        "fleet_id" => fleet.fetch("fleet_id"), "status" => "running", "context" => 32_768,
+        "workers" => [{
+          "index" => 2, "pod_id" => "other-pod", "status" => "running",
+          "provenance" => nil
         }]
       }) + "\n")
       tunnel_root = state.artifact_dir(fleet.fetch("fleet_id"), "tunnels")
@@ -124,6 +134,31 @@ class RpofCapabilityCheckTest < Minitest::Test
     end
   end
 
+  def test_rejects_passed_provenance_from_stale_pod_generation
+    Dir.mktmpdir("rpof-capability-stale-") do |root|
+      state = mixed_gpu_state(root)
+      bootstrap_root = state.artifact_dir(state.current.fetch("fleet_id"), "bootstrap")
+      run_id = File.read(File.join(bootstrap_root, "current")).strip
+      path = File.join(bootstrap_root, run_id, "bootstrap.json")
+      record = JSON.parse(File.read(path))
+      record.fetch("workers").find { |worker| worker.fetch("index") == 1 }["pod_id"] = "stale-pod"
+      File.write(path, JSON.pretty_generate(record) + "\n")
+
+      checker = RunpodOllamaFleet::CapabilityCheck.new(
+        fleet_state: state, fleet_key: "default", process_adapter: FakeProcess.new,
+        health_checker: FakeHealth.new, wall_clock: -> { Time.utc(2026, 9, 14, 12, 5, 0) }
+      )
+      request = mixed_gpu_request
+      request.fetch("worker_selector")["indices"] = [1]
+
+      result = checker.check(request)
+      refute result.fetch("ready")
+      diagnostic = result.fetch("diagnostics").find { |row| row.fetch("code") == "bootstrap.provenance" }
+      assert_equal "FAIL", diagnostic.fetch("status")
+      assert_includes diagnostic.fetch("detail"), "current pod generation"
+    end
+  end
+
   private
 
   def mixed_gpu_state(root)
@@ -181,6 +216,7 @@ class RpofCapabilityCheckTest < Minitest::Test
   def mixed_bootstrap_worker(index, gpu_id)
     {
       "index" => index,
+      "pod_id" => "pod-#{index}",
       "status" => "passed",
       "provenance" => {
         "gpu" => { "name" => gpu_id },

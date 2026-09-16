@@ -40,7 +40,7 @@ module RunpodOllamaFleet
       diagnostics << provider_diagnostic(status, indices)
       capabilities, provenance_detail = verify_provenance(
         fleet: fleet,
-        bootstrap: status && status["bootstrap"],
+        bootstraps: bootstrap_records(fleet),
         workers: workers,
         requirements: request.fetch("requirements")
       )
@@ -99,11 +99,28 @@ module RunpodOllamaFleet
       diagnostic("provider.running", "FAIL", bad.join("; "))
     end
 
-    def verify_provenance(fleet:, bootstrap:, workers:, requirements:)
-      return [nil, "no bootstrap evidence recorded for current fleet"] unless bootstrap
-      return [nil, "bootstrap state is #{bootstrap['status'].inspect}"] unless bootstrap["status"] == "passed"
+    def bootstrap_records(fleet)
+      root = @fleet_state.artifact_dir(fleet.fetch("fleet_id"), "bootstrap")
+      Dir.glob(File.join(root, "*", "bootstrap.json")).sort.reverse.filter_map do |path|
+        begin
+          record = JSON.parse(File.read(path))
+        rescue JSON::ParserError, SystemCallError
+          next
+        end
+        next unless record["fleet_id"] == fleet.fetch("fleet_id")
+
+        record = record.dup
+        run_id = record["bootstrap_run_id"].to_s
+        run_id = File.basename(File.dirname(path)) if run_id.empty?
+        record["run_id"] = run_id
+        record
+      end
+    end
+
+    def verify_provenance(fleet:, bootstraps:, workers:, requirements:)
+      return [nil, "no bootstrap evidence recorded for current fleet"] if bootstraps.empty?
+
       required_context = Integer(requirements.fetch("required_context_length"))
-      return [nil, "bootstrap context mismatch: expected #{required_context}, got #{bootstrap['context'].inspect}"] unless bootstrap["context"] == required_context
 
       required_gpu = requirements["required_gpu_id"]
       worker_gpus = workers.to_h do |worker|
@@ -118,14 +135,31 @@ module RunpodOllamaFleet
         end
       end
 
-      boot_by_index = Array(bootstrap.fetch("workers")).to_h { |worker| [Integer(worker.fetch("index")), worker] }
+      evidence_by_index = {}
+      workers.each do |worker|
+        index = Integer(worker.fetch("index"))
+        evidence = matching_bootstrap_evidence(
+          bootstraps:,
+          worker:,
+          expected_gpu: worker_gpus.fetch(index),
+          requirements:,
+          required_context:
+        )
+        unless evidence
+          return [
+            nil,
+            "burst_#{index}: no passed bootstrap provenance for current pod generation matching requested GPU/model/context"
+          ]
+        end
+        evidence_by_index[index] = evidence
+      end
+
       capabilities = []
       requirements.fetch("models").each do |requirement|
         name = requirement.fetch("name")
         observations = workers.map do |worker|
           index = Integer(worker.fetch("index"))
-          boot = boot_by_index[index]
-          return [nil, "burst_#{index}: missing bootstrap provenance"] unless boot && boot["status"] == "passed"
+          boot = evidence_by_index.fetch(index).fetch("worker")
           provenance = boot.fetch("provenance", {})
           gpu = provenance.dig("gpu", "name").to_s
           expected_gpu = worker_gpus.fetch(index)
@@ -154,14 +188,57 @@ module RunpodOllamaFleet
           "fully_gpu_resident" => true
         }
       end
+
+      run_ids = evidence_by_index.values.map { |evidence| evidence.fetch("run_id") }.uniq.sort
       selected_gpu_ids = worker_gpus.values.uniq
       [{
         "gpu_id" => selected_gpu_ids.length == 1 ? selected_gpu_ids.first : "mixed",
-        "bootstrap_run_id" => bootstrap.fetch("run_id"),
+        "bootstrap_run_id" => run_ids.join(","),
         "models" => capabilities
-      }, "exact bootstrap model/GPU/context provenance matches selected workers"]
+      }, "exact bootstrap model/GPU/context provenance matches selected workers from run(s): #{run_ids.join(', ')}"]
     rescue KeyError, ArgumentError, TypeError => e
       [nil, "invalid bootstrap provenance: #{e.message}"]
+    end
+
+    def matching_bootstrap_evidence(bootstraps:, worker:, expected_gpu:, requirements:, required_context:)
+      index = Integer(worker.fetch("index"))
+      pod_id = worker.fetch("pod_id").to_s
+
+      bootstraps.each do |bootstrap|
+        next unless bootstrap["context"] == required_context
+
+        boot = Array(bootstrap["workers"]).find do |candidate|
+          Integer(candidate.fetch("index")) == index
+        rescue KeyError, ArgumentError, TypeError
+          false
+        end
+        next unless boot
+        next unless boot["status"] == "passed"
+        next unless boot["pod_id"].to_s == pod_id
+
+        provenance = boot.fetch("provenance", {})
+        next unless provenance.dig("gpu", "name").to_s == expected_gpu
+
+        models = provenance.fetch("models", {})
+        matches = requirements.fetch("models").all? do |requirement|
+          observed = models[requirement.fetch("name")]
+          next false unless observed
+
+          digest = observed["digest"].to_s.downcase
+          expected_digest = requirement["expected_digest"]&.downcase
+          digest.match?(ContractV01::DIGEST) &&
+            (!expected_digest || digest == expected_digest) &&
+            observed["context_length"] == required_context &&
+            observed["fully_gpu_resident"] == true &&
+            observed["size_bytes"] &&
+            observed["size_bytes"] == observed["size_vram_bytes"]
+        end
+        next unless matches
+
+        return { "run_id" => bootstrap.fetch("run_id"), "worker" => boot }
+      end
+
+      nil
     end
 
     def worker_gpu_id(fleet, worker)
