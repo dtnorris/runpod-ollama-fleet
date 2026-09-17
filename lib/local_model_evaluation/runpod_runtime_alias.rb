@@ -1,12 +1,15 @@
 # frozen_string_literal: true
 
+require "fileutils"
 require "json"
 require "net/http"
 require "timeout"
+require "time"
 require "uri"
 
 module LocalModelEvaluation
   class RunpodRuntimeAlias
+    EVIDENCE_FILE = "runtime-aliases.json"
     class Error < StandardError; end
 
     Response = Struct.new(:status, :body, keyword_init: true)
@@ -27,7 +30,7 @@ module LocalModelEvaluation
       raise Error, "expected digest must be exactly 64 hexadecimal characters" unless digest.match?(/\A[0-9a-f]{64}\z/)
       required_context = positive_integer(context, "context")
 
-      workers.map do |worker|
+      evidence = workers.map do |worker|
         verify_worker_alias(
           worker:,
           source_model: source,
@@ -36,6 +39,8 @@ module LocalModelEvaluation
           context: required_context
         )
       end
+      persist_runtime_evidence!(fleet, evidence)
+      evidence
     end
 
     private
@@ -120,6 +125,7 @@ module LocalModelEvaluation
 
       {
         "worker_index" => index,
+        "pod_id" => worker["pod_id"].to_s,
         "runtime_model" => runtime_model,
         "source_model" => source_model,
         "digest" => runtime_digest,
@@ -130,6 +136,59 @@ module LocalModelEvaluation
       }
     rescue KeyError, ArgumentError, TypeError => e
       raise Error, "burst_#{index}: invalid Ollama runtime evidence: #{e.message}"
+    end
+
+    def persist_runtime_evidence!(fleet, evidence)
+      return evidence unless @fleet_state.respond_to?(:artifact_dir)
+      fleet_id = fleet["fleet_id"].to_s
+      return evidence if fleet_id.empty?
+
+      root = @fleet_state.artifact_dir(fleet_id, "runtime-alias")
+      FileUtils.mkdir_p(root)
+      path = File.join(root, EVIDENCE_FILE)
+      existing = if File.file?(path)
+                   JSON.parse(File.read(path))
+                 else
+                   { "schema_version" => 1, "fleet_id" => fleet_id, "workers" => [] }
+                 end
+      unless existing.is_a?(Hash) && existing["fleet_id"].to_s == fleet_id
+        raise Error, "runtime alias evidence belongs to a different fleet"
+      end
+
+      workers = Array(existing["workers"])
+      evidence.each do |row|
+        key = [Integer(row.fetch("worker_index")), row.fetch("pod_id").to_s, row.fetch("runtime_model").to_s]
+        workers.reject! do |candidate|
+          [
+            Integer(candidate.fetch("worker_index")),
+            candidate.fetch("pod_id").to_s,
+            candidate.fetch("runtime_model").to_s
+          ] == key
+        rescue KeyError, ArgumentError, TypeError
+          false
+        end
+        workers << row.merge("verified_at_utc" => Time.now.utc.iso8601)
+      end
+      document = {
+        "schema_version" => 1,
+        "fleet_id" => fleet_id,
+        "workers" => workers.sort_by do |row|
+          [Integer(row.fetch("worker_index")), row.fetch("runtime_model").to_s]
+        end
+      }
+      write_json_atomic(path, document)
+      evidence
+    rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError, TypeError => e
+      raise Error, "could not persist runtime alias evidence: #{e.message}"
+    end
+
+    def write_json_atomic(path, document)
+      tmp = "#{path}.tmp.#{$$}.#{Thread.current.object_id}"
+      File.write(tmp, JSON.pretty_generate(document) + "\n")
+      File.chmod(0o600, tmp)
+      File.rename(tmp, path)
+    ensure
+      File.delete(tmp) if defined?(tmp) && tmp && File.exist?(tmp)
     end
 
     def digest_for(tags, model)

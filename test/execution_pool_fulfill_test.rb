@@ -20,6 +20,7 @@ class ExecutionPoolFulfillTest < Minitest::Test
   end
 
   class FakeRunner
+    attr_reader :capability_request
     attr_reader :calls
     attr_accessor :capacity_status, :capacity_initial, :capacity_final, :capability_ready
 
@@ -70,6 +71,7 @@ class ExecutionPoolFulfillTest < Minitest::Test
         0
       when "capability-check"
         request = JSON.parse(File.read(value_after(argv, "--request")))
+        @capability_request = request
         output = value_after(argv, "--output")
         selected = request.dig("worker_selector", "indices")
         File.write(output, JSON.pretty_generate(
@@ -147,6 +149,10 @@ class ExecutionPoolFulfillTest < Minitest::Test
 
     alias_call = runner.calls.find { |row| row.fetch(:argv)[1] == "runtime-alias" }.fetch(:argv)
     assert_equal "qwen3.6:35b-a3b", alias_call.fetch(alias_call.index("--runtime-model") + 1)
+    assert_equal "afio-rpof-capability-check-request/v0.2", runner.capability_request.fetch("contract_version")
+    capability_model = runner.capability_request.dig("requirements", "models", 0)
+    assert_equal "qwen3.6:35b-a3b", capability_model.fetch("name")
+    assert_equal DIGEST, capability_model.fetch("expected_digest")
   end
 
   def test_failed_readiness_tears_down_only_new_capacity

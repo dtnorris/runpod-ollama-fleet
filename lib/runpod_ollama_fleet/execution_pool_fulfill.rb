@@ -236,12 +236,12 @@ module RunpodOllamaFleet
 
     def invoke_capability(handle, worker_indices, requirements)
       request = {
-        "contract_version" => ContractV01::CAPABILITY_REQUEST_VERSION,
+        "contract_version" => ContractV01::CAPABILITY_REQUEST_V2_VERSION,
         "fleet_key" => handle,
         "worker_selector" => { "mode" => "indices", "indices" => worker_indices },
         "requirements" => {
           "models" => [{
-            "name" => requirements.fetch("pull_model"),
+            "name" => requirements.fetch("ollama_model"),
             "expected_digest" => requirements.fetch("expected_digest")
           }],
           "required_context_length" => requirements.fetch("required_context_length"),

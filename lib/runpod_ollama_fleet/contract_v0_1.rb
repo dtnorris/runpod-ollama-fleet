@@ -3,6 +3,7 @@
 module RunpodOllamaFleet
   module ContractV01
     CAPABILITY_REQUEST_VERSION = "afio-rpof-capability-check-request/v0.1"
+    CAPABILITY_REQUEST_V2_VERSION = "afio-rpof-capability-check-request/v0.2"
     CAPABILITY_RESULT_VERSION = "afio-rpof-capability-check-result/v0.1"
     DISPATCH_REQUEST_VERSION = "afio-rpof-dispatch-request/v0.1"
     DISPATCH_SUMMARY_VERSION = "afio-rpof-dispatch-summary/v0.1"
@@ -20,7 +21,12 @@ module RunpodOllamaFleet
 
     def validate_capability_request!(document)
       object!(document, %w[contract_version fleet_key worker_selector requirements], [])
-      const!(document, "contract_version", CAPABILITY_REQUEST_VERSION)
+      version = document.fetch("contract_version")
+      unless [CAPABILITY_REQUEST_VERSION, CAPABILITY_REQUEST_V2_VERSION].include?(version)
+        raise Error,
+              "unsupported contract_version #{version.inspect}; expected " \
+              "#{CAPABILITY_REQUEST_VERSION.inspect} or #{CAPABILITY_REQUEST_V2_VERSION.inspect}"
+      end
       string!(document, "fleet_key", pattern: FLEET_KEY, max: 64)
 
       selector = document.fetch("worker_selector")
@@ -40,9 +46,15 @@ module RunpodOllamaFleet
       models = requirements.fetch("models")
       raise Error, "requirements.models must be a non-empty array" unless models.is_a?(Array) && !models.empty?
       models.each_with_index do |model, index|
-        object!(model, %w[name], %w[expected_digest])
+        required = ["name"]
+        optional = ["expected_digest"]
+        if version == CAPABILITY_REQUEST_V2_VERSION
+          required << "expected_digest"
+          optional = []
+        end
+        object!(model, required, optional)
         string!(model, "name", max: 256)
-        if model.key?("expected_digest")
+        if version == CAPABILITY_REQUEST_V2_VERSION || model.key?("expected_digest")
           string!(model, "expected_digest", pattern: DIGEST, max: 64)
         end
       rescue Error => e

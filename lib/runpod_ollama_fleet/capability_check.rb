@@ -3,6 +3,7 @@
 require "json"
 require_relative "contract_v0_1"
 require_relative "../local_model_evaluation/runpod_client"
+require_relative "../local_model_evaluation/runpod_runtime_alias"
 require_relative "../local_model_evaluation/runpod_status"
 require_relative "../local_model_evaluation/runpod_tunnels"
 require_relative "../local_model_evaluation/runpod_workers"
@@ -38,13 +39,22 @@ module RunpodOllamaFleet
       ).snapshot
 
       diagnostics << provider_diagnostic(status, indices)
-      capabilities, provenance_detail = verify_provenance(
-        fleet: fleet,
-        bootstraps: bootstrap_records(fleet),
-        workers: workers,
-        requirements: request.fetch("requirements")
-      )
-      diagnostics << diagnostic("bootstrap.provenance", capabilities ? "PASS" : "FAIL", provenance_detail)
+      if request.fetch("contract_version") == ContractV01::CAPABILITY_REQUEST_V2_VERSION
+        capabilities, provenance_detail = verify_runtime_alias_provenance(
+          fleet: fleet,
+          workers: workers,
+          requirements: request.fetch("requirements")
+        )
+        diagnostics << diagnostic("runtime.provenance", capabilities ? "PASS" : "FAIL", provenance_detail)
+      else
+        capabilities, provenance_detail = verify_provenance(
+          fleet: fleet,
+          bootstraps: bootstrap_records(fleet),
+          workers: workers,
+          requirements: request.fetch("requirements")
+        )
+        diagnostics << diagnostic("bootstrap.provenance", capabilities ? "PASS" : "FAIL", provenance_detail)
+      end
       diagnostics << tunnel_diagnostic(fleet, workers)
       diagnostics << lease_diagnostic(status && status["lease"])
 
@@ -239,6 +249,64 @@ module RunpodOllamaFleet
       end
 
       nil
+    end
+
+    def verify_runtime_alias_provenance(fleet:, workers:, requirements:)
+      path = File.join(
+        @fleet_state.artifact_dir(fleet.fetch("fleet_id"), "runtime-alias"),
+        LocalModelEvaluation::RunpodRuntimeAlias::EVIDENCE_FILE
+      )
+      return [nil, "runtime alias evidence is missing"] unless File.file?(path)
+
+      document = JSON.parse(File.read(path))
+      return [nil, "runtime alias evidence belongs to a different fleet"] unless document["fleet_id"].to_s == fleet.fetch("fleet_id").to_s
+      rows = Array(document.fetch("workers"))
+      required_context = Integer(requirements.fetch("required_context_length"))
+      capabilities = []
+
+      requirements.fetch("models").each do |requirement|
+        name = requirement.fetch("name").to_s
+        digest = requirement.fetch("expected_digest").to_s.downcase
+        observations = workers.map do |worker|
+          index = Integer(worker.fetch("index"))
+          pod_id = worker.fetch("pod_id").to_s
+          row = rows.reverse.find do |candidate|
+            Integer(candidate.fetch("worker_index")) == index &&
+              candidate.fetch("pod_id").to_s == pod_id &&
+              candidate.fetch("runtime_model").to_s == name
+          rescue KeyError, ArgumentError, TypeError
+            false
+          end
+          return [nil, "burst_#{index}: no runtime alias evidence for #{name} on current pod generation"] unless row
+          return [nil, "burst_#{index}: #{name} digest mismatch"] unless row.fetch("digest").to_s.downcase == digest
+          return [nil, "burst_#{index}: #{name} context mismatch"] unless Integer(row.fetch("context_length")) == required_context
+          unless row["fully_gpu_resident"] == true &&
+                 row["size_bytes"] &&
+                 Integer(row["size_bytes"]) == Integer(row["size_vram_bytes"])
+            return [nil, "burst_#{index}: #{name} is not proven fully GPU-resident"]
+          end
+          row
+        end
+        capabilities << {
+          "name" => name,
+          "digest" => digest,
+          "context_length" => required_context,
+          "fully_gpu_resident" => true
+        }
+      end
+
+      worker_gpus = workers.map { |worker| worker_gpu_id(fleet, worker) }.uniq
+      required_gpu = requirements["required_gpu_id"]
+      if required_gpu && worker_gpus.any? { |gpu_id| gpu_id != required_gpu }
+        return [nil, "GPU mismatch: expected #{required_gpu.inspect}; selected #{worker_gpus.sort.inspect}"]
+      end
+      [{
+        "gpu_id" => worker_gpus.length == 1 ? worker_gpus.first : "mixed",
+        "runtime_alias_evidence" => File.basename(path),
+        "models" => capabilities
+      }, "exact runtime model/digest/context provenance matches selected current pod generation(s)"]
+    rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError, TypeError => e
+      [nil, "invalid runtime alias provenance: #{e.message}"]
     end
 
     def worker_gpu_id(fleet, worker)
