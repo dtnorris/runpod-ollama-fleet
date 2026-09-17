@@ -452,6 +452,32 @@ class RunpodBootstrapTest < Minitest::Test
     assert_equal "workspace", record.fetch("model_store_mode")
   end
 
+  def test_copy_from_shared_store_is_forwarded_and_recorded
+    script = fake_remote_script("puts 'shared store fixture'\n")
+
+    record = build_runner(script).run(
+      worker_indices: [1, 2, 3],
+      models: ["gemma4:26b"],
+      expected_digests: ["gemma4:26b=#{DIGEST}"],
+      copy_from_shared_store: "/workspace-global/ollama-models",
+      state_root: "/root/lme-worker-state",
+      poll_seconds: 0.005
+    )
+
+    assert_equal "passed", record.fetch("status")
+    assert_equal "/workspace-global/ollama-models", record.fetch("copy_from_shared_store")
+    assert_equal "shared_copy_to_root", record.fetch("model_store_mode")
+    @process_supervisor.commands.each do |entry|
+      command = entry.fetch(:command)
+      option_index = command.index("--copy-from-shared-store")
+      refute_nil option_index
+      assert_equal "/workspace-global/ollama-models", command.fetch(option_index + 1)
+      refute_includes command, "--reuse-existing"
+      refute_includes command, "--copy-to-workspace"
+      refute_includes command, "--clean"
+    end
+  end
+
   def test_keep_root_models_is_forwarded_and_recorded
     script = fake_remote_script("puts 'root model fixture'\n")
 
@@ -500,6 +526,36 @@ class RunpodBootstrapTest < Minitest::Test
     end
 
     assert_includes error.message, "--keep-root-models cannot be combined with --reuse-existing"
+    assert_empty @process_supervisor.commands
+  end
+
+  def test_copy_from_shared_store_rejects_reuse_existing_before_spawning
+    script = fake_remote_script("raise 'must not run'\n")
+
+    error = assert_raises(LocalModelEvaluation::RunpodBootstrap::Error) do
+      build_runner(script).run(
+        worker_indices: [1],
+        models: ["gemma4:26b"],
+        expected_digests: ["gemma4:26b=#{DIGEST}"],
+        reuse_existing: true,
+        copy_from_shared_store: "/workspace-global/ollama-models"
+      )
+    end
+
+    assert_includes error.message, "--copy-from-shared-store cannot be combined with --reuse-existing"
+    assert_empty @process_supervisor.commands
+  end
+
+  def test_copy_from_shared_store_rejects_relative_path_before_spawning
+    script = fake_remote_script("raise 'must not run'\n")
+
+    error = assert_raises(LocalModelEvaluation::RunpodBootstrap::Error) do
+      build_runner(script).run(
+        worker_indices: [1], models: ["gemma4:26b"], expected_digests: ["gemma4:26b=#{DIGEST}"],
+        copy_from_shared_store: "workspace-global/ollama-models"
+      )
+    end
+    assert_includes error.message, "--copy-from-shared-store must be an absolute remote path"
     assert_empty @process_supervisor.commands
   end
 

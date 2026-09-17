@@ -24,6 +24,7 @@ opts = {
   clean: false,
   reuse_existing: false,
   copy_to_workspace: false,
+  copy_from_shared_store: nil,
   keep_root_models: false,
   context: nil,
   state_root: nil,
@@ -43,6 +44,7 @@ parser = OptionParser.new do |o|
   o.on("--clean", "Delete staging/shared Ollama stores before bootstrap") { opts[:clean] = true }
   o.on("--reuse-existing", "Reuse and validate the existing /workspace Ollama cache; never pull or copy models") { opts[:reuse_existing] = true }
   o.on("--copy-to-workspace", "Persist pulled model data to /workspace; fresh single-model bootstrap stays on root by default") { opts[:copy_to_workspace] = true }
+  o.on("--copy-from-shared-store PATH", "Copy one model from an already-populated Ollama store to local/root storage; never pull") { |v| opts[:copy_from_shared_store] = v }
   o.on("--keep-root-models", "Compatibility flag; fresh single-model bootstrap already stays on root by default") { opts[:keep_root_models] = true }
   o.on("--fleet KEY", "Select the managed fleet") { |v| opts[:fleet_key] = v }
   o.on("--state-root PATH", "Remote worker evidence root (default: /workspace/lme-worker-state)") { |v| opts[:state_root] = v }
@@ -63,6 +65,26 @@ begin
   end
   if opts[:copy_to_workspace] && opts[:reuse_existing]
     raise OptionParser::InvalidArgument, "--copy-to-workspace cannot be combined with --reuse-existing"
+  end
+  if opts[:copy_from_shared_store]
+    unless opts[:copy_from_shared_store].start_with?("/")
+      raise OptionParser::InvalidArgument, "--copy-from-shared-store must be an absolute remote path"
+    end
+    if opts[:reuse_existing]
+      raise OptionParser::InvalidArgument, "--copy-from-shared-store cannot be combined with --reuse-existing"
+    end
+    if opts[:copy_to_workspace]
+      raise OptionParser::InvalidArgument, "--copy-from-shared-store cannot be combined with --copy-to-workspace"
+    end
+    if opts[:keep_root_models]
+      raise OptionParser::InvalidArgument, "--copy-from-shared-store cannot be combined with --keep-root-models"
+    end
+    if opts[:clean]
+      raise OptionParser::InvalidArgument, "--copy-from-shared-store cannot be combined with --clean"
+    end
+    if opts[:models].length != 1
+      raise OptionParser::InvalidArgument, "--copy-from-shared-store requires exactly one --model"
+    end
   end
   if opts[:copy_to_workspace] && opts[:keep_root_models]
     raise OptionParser::InvalidArgument, "--copy-to-workspace cannot be combined with --keep-root-models"
@@ -106,6 +128,7 @@ begin
     clean: opts[:clean],
     reuse_existing: opts[:reuse_existing],
     copy_to_workspace: opts[:copy_to_workspace],
+    copy_from_shared_store: opts[:copy_from_shared_store],
     keep_root_models: opts[:keep_root_models],
     context: opts[:context],
     state_root: opts[:state_root],

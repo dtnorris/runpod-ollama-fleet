@@ -14,6 +14,7 @@ class RunpodBootstrapCliTest < Minitest::Test
     assert status.success?, err
     assert_includes out, "--reuse-existing"
     assert_includes out, "--copy-to-workspace"
+    assert_includes out, "--copy-from-shared-store"
     assert_includes out, "--keep-root-models"
     assert_includes out, "--pull-timeout-seconds"
   end
@@ -75,6 +76,57 @@ class RunpodBootstrapCliTest < Minitest::Test
     refute status.success?, out + err
     assert_equal 2, status.exitstatus
     assert_includes err, "--keep-root-models cannot be combined with --reuse-existing"
+  end
+
+  def test_copy_from_shared_store_requires_absolute_path_before_fleet_access
+    out, err, status = Open3.capture3(
+      RbConfig.ruby,
+      BIN,
+      "--workers", "1",
+      "--model", "qwen3.6:35b-a3b-q4_K_M",
+      "--copy-from-shared-store", "workspace-global/ollama-models"
+    )
+
+    refute status.success?, out + err
+    assert_equal 2, status.exitstatus
+    assert_includes err, "--copy-from-shared-store must be an absolute remote path"
+  end
+
+  def test_copy_from_shared_store_rejects_pull_or_mutating_storage_modes_before_fleet_access
+    [
+      ["--reuse-existing", "--copy-from-shared-store cannot be combined with --reuse-existing"],
+      ["--copy-to-workspace", "--copy-from-shared-store cannot be combined with --copy-to-workspace"],
+      ["--keep-root-models", "--copy-from-shared-store cannot be combined with --keep-root-models"],
+      ["--clean", "--copy-from-shared-store cannot be combined with --clean"]
+    ].each do |conflicting_flag, expected_message|
+      out, err, status = Open3.capture3(
+        RbConfig.ruby,
+        BIN,
+        "--workers", "1",
+        "--model", "qwen3.6:35b-a3b-q4_K_M",
+        "--copy-from-shared-store", "/workspace-global/ollama-models",
+        conflicting_flag
+      )
+
+      refute status.success?, out + err
+      assert_equal 2, status.exitstatus
+      assert_includes err, expected_message
+    end
+  end
+
+  def test_copy_from_shared_store_requires_exactly_one_model_before_fleet_access
+    out, err, status = Open3.capture3(
+      RbConfig.ruby,
+      BIN,
+      "--workers", "1",
+      "--model", "qwen3.6:35b-a3b-q4_K_M",
+      "--model", "qwen3.6:27b-q4_K_M",
+      "--copy-from-shared-store", "/workspace-global/ollama-models"
+    )
+
+    refute status.success?, out + err
+    assert_equal 2, status.exitstatus
+    assert_includes err, "--copy-from-shared-store requires exactly one --model"
   end
 
   def test_keep_root_models_requires_exactly_one_model_before_fleet_access

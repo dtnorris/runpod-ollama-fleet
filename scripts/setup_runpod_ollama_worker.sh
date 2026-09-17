@@ -16,6 +16,7 @@ CONTEXT_LENGTH=131072
 PULL_TIMEOUT_SECONDS=360
 STAGING_DIR=/root/.ollama/models
 SHARED_DIR=/workspace/ollama-models
+SOURCE_SHARED_DIR=""
 STATE_ROOT=/workspace/lme-worker-state
 SERVER_HOST=127.0.0.1:11434
 CLIENT_URL=http://127.0.0.1:11434
@@ -56,6 +57,7 @@ Options:
   --expect-digest MODEL=DIGEST  Fail unless the requested model has this full digest. Repeatable.
   --clean                       Delete both staging and shared Ollama stores before setup.
   --reuse-existing              Reuse /workspace cache only; never pull, stage, or rsync model data.
+  --copy-from-shared-store PATH Copy one model from an already-populated Ollama store to local/root storage; never pull.
   --copy-to-workspace           Persist pulled model data to /workspace instead of serving from root.
   --keep-root-models            Compatibility flag; root storage is already the default for one model.
   -h, --help                    Show this help.
@@ -112,6 +114,10 @@ while (($#)); do
       CLEAN=1; shift ;;
     --reuse-existing)
       REUSE_EXISTING=1; shift ;;
+    --copy-from-shared-store)
+      [[ $# -ge 2 ]] || die "--copy-from-shared-store requires a value"
+      SOURCE_SHARED_DIR="$2"
+      shift 2 ;;
     --copy-to-workspace)
       COPY_TO_WORKSPACE=1; shift ;;
     --keep-root-models)
@@ -132,6 +138,20 @@ if [[ $REUSE_EXISTING -eq 1 && $CLEAN -eq 1 ]]; then
 fi
 if [[ $REUSE_EXISTING -eq 1 && $COPY_TO_WORKSPACE -eq 1 ]]; then
   die "--copy-to-workspace cannot be combined with --reuse-existing"
+fi
+if [[ -n "$SOURCE_SHARED_DIR" ]]; then
+  [[ "$SOURCE_SHARED_DIR" == /* ]] || die "--copy-from-shared-store must be an absolute path"
+  [[ $REUSE_EXISTING -eq 0 ]] || die "--copy-from-shared-store cannot be combined with --reuse-existing"
+  [[ $COPY_TO_WORKSPACE -eq 0 ]] || die "--copy-from-shared-store cannot be combined with --copy-to-workspace"
+  [[ $KEEP_ROOT_MODELS_EXPLICIT -eq 0 ]] || die "--copy-from-shared-store cannot be combined with --keep-root-models"
+  [[ $CLEAN -eq 0 ]] || die "--copy-from-shared-store cannot be combined with --clean"
+  [[ ${#MODELS[@]} -eq 1 ]] || die "--copy-from-shared-store requires exactly one --model"
+  [[ -d "$SOURCE_SHARED_DIR/manifests" && -d "$SOURCE_SHARED_DIR/blobs" ]] || \
+    die "shared source Ollama store is incomplete: $SOURCE_SHARED_DIR"
+  [[ -r "$SOURCE_SHARED_DIR" ]] || die "shared source Ollama store is not readable: $SOURCE_SHARED_DIR"
+  if [[ "$SOURCE_SHARED_DIR" == "$STAGING_DIR" ]]; then
+    die "--copy-from-shared-store must differ from the local staging store"
+  fi
 fi
 if [[ $KEEP_ROOT_MODELS_EXPLICIT -eq 1 && $COPY_TO_WORKSPACE -eq 1 ]]; then
   die "--copy-to-workspace cannot be combined with --keep-root-models"
@@ -241,7 +261,7 @@ model_ps_json() {
 step "Preflight host, GPU, and required utilities"
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is required"
-if [[ $REUSE_EXISTING -eq 0 ]]; then
+if [[ $REUSE_EXISTING -eq 0 && -z "$SOURCE_SHARED_DIR" ]]; then
   command -v timeout >/dev/null 2>&1 || die "timeout is required for bounded model pulls"
 fi
 
@@ -297,6 +317,9 @@ missing_packages=()
 if [[ $REUSE_EXISTING -eq 0 && $KEEP_ROOT_MODELS -eq 0 ]]; then
   command -v rsync >/dev/null 2>&1 || missing_packages+=(rsync)
 fi
+if [[ -n "$SOURCE_SHARED_DIR" ]]; then
+  command -v python3 >/dev/null 2>&1 || missing_packages+=(python3)
+fi
 command -v jq >/dev/null 2>&1 || missing_packages+=(jq)
 if ((${#missing_packages[@]})); then
   info "Installing required packages: ${missing_packages[*]}"
@@ -333,6 +356,88 @@ fi
 if [[ $REUSE_EXISTING -eq 1 ]]; then
   step "Reuse existing workspace model cache without pull or copy"
   info "Skipping staging, ollama pull, and rsync. Exact cached digests will be validated from the workspace-backed server."
+elif [[ -n "$SOURCE_SHARED_DIR" ]]; then
+  step "Copy requested model from shared store to fast local/root store"
+  model="${MODELS[0]}"
+  safe="${model//[^A-Za-z0-9._-]/_}"
+  stop_ollama
+  rm -rf "$STAGING_DIR"
+  mkdir -p "$STAGING_DIR"
+  df -h / | tee "$STATE_DIR/disk-before-${safe}.txt"
+  info "Copying only the manifest-referenced blobs for $model from $SOURCE_SHARED_DIR to $STAGING_DIR."
+  info "No ollama pull will be attempted in shared-store copy mode."
+  python3 - "$SOURCE_SHARED_DIR" "$STAGING_DIR" "$model" "$STATE_DIR/shared-copy-${safe}.tsv" <<'PY'
+import json
+import os
+import shutil
+import sys
+import time
+
+source, destination, model, metrics_path = sys.argv[1:]
+source = os.path.realpath(source)
+destination = os.path.realpath(destination)
+if source == destination:
+    raise SystemExit("source and destination Ollama stores must differ")
+
+repository, separator, tag = model.partition(":")
+if not separator:
+    tag = "latest"
+if not repository or not tag:
+    raise SystemExit(f"unsupported Ollama model name: {model!r}")
+
+manifest_rel = os.path.join(
+    "manifests", "registry.ollama.ai", "library", *repository.split("/"), tag
+)
+source_manifest = os.path.join(source, manifest_rel)
+destination_manifest = os.path.join(destination, manifest_rel)
+if not os.path.isfile(source_manifest):
+    raise SystemExit(f"source manifest not found for {model}: {source_manifest}")
+
+with open(source_manifest, "r", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+
+entries = [manifest.get("config", {})] + list(manifest.get("layers", []))
+digests = []
+for entry in entries:
+    digest = entry.get("digest")
+    if digest and digest not in digests:
+        digests.append(digest)
+if not digests:
+    raise SystemExit(f"source manifest for {model} contains no blob digests")
+
+blob_paths = []
+total_bytes = 0
+for digest in digests:
+    algorithm, separator, hex_digest = digest.partition(":")
+    if separator != ":" or not algorithm or not hex_digest:
+        raise SystemExit(f"invalid blob digest in source manifest: {digest!r}")
+    blob_name = f"{algorithm}-{hex_digest}"
+    source_blob = os.path.join(source, "blobs", blob_name)
+    if not os.path.isfile(source_blob):
+        raise SystemExit(f"source blob missing for {model}: {source_blob}")
+    blob_paths.append((blob_name, source_blob))
+    total_bytes += os.path.getsize(source_blob)
+
+started = time.monotonic()
+os.makedirs(os.path.dirname(destination_manifest), exist_ok=True)
+os.makedirs(os.path.join(destination, "blobs"), exist_ok=True)
+for blob_name, source_blob in blob_paths:
+    size = os.path.getsize(source_blob)
+    print(f"Copying {size / 1024**3:.2f} GiB: {blob_name}", flush=True)
+    destination_blob = os.path.join(destination, "blobs", blob_name)
+    temporary_blob = destination_blob + ".partial"
+    shutil.copyfile(source_blob, temporary_blob)
+    os.replace(temporary_blob, destination_blob)
+
+shutil.copyfile(source_manifest, destination_manifest)
+elapsed = max(time.monotonic() - started, 0.001)
+mib_per_second = (total_bytes / 1024**2) / elapsed
+print(f"LME_SHARED_COPY\t{model}\t{total_bytes}\t{elapsed:.3f}\t{mib_per_second:.3f}", flush=True)
+with open(metrics_path, "w", encoding="utf-8") as handle:
+    handle.write(f"model\tbytes\tseconds\tmib_per_second\n")
+    handle.write(f"{model}\t{total_bytes}\t{elapsed:.3f}\t{mib_per_second:.3f}\n")
+PY
+  info "Shared-store copy complete. Local model store now uses: $(du -sh "$STAGING_DIR" | awk '{print $1}')"
 else
   if [[ $KEEP_ROOT_MODELS -eq 1 ]]; then
     step "Pull requested model to fast local/root store and keep it there"
@@ -420,7 +525,7 @@ step "Warm each model and verify context plus full GPU residency"
 for model in "${MODELS[@]}"; do
   safe="${model//[^A-Za-z0-9._-]/_}"
   info "Preloading $model into VRAM without generating a response."
-  if [[ $REUSE_EXISTING -eq 1 ]]; then
+  if [[ $REUSE_EXISTING -eq 1 || -n "$SOURCE_SHARED_DIR" ]]; then
     # The CLI can pull on a missing model; the generate API fails instead.
     curl -fsS "$CLIENT_URL/api/generate" -H 'Content-Type: application/json' \
       -d "$(jq -nc --arg model "$model" '{model: $model, prompt: "", stream: false}')" \
@@ -468,6 +573,7 @@ step "Write durable worker evidence"
   echo "server_url=$CLIENT_URL"
   echo "reuse_existing=$REUSE_EXISTING"
   echo "copy_to_workspace=$COPY_TO_WORKSPACE"
+  echo "copy_from_shared_store=$SOURCE_SHARED_DIR"
   echo "keep_root_models=$KEEP_ROOT_MODELS"
   echo "models=${MODELS[*]}"
 } > "$STATE_DIR/worker-summary.txt"

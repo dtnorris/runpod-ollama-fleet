@@ -32,7 +32,8 @@ module LocalModelEvaluation
     end
 
     def run(worker_indices:, models:, expected_digests: [], clean: false, reuse_existing: false,
-            copy_to_workspace: false, keep_root_models: false, context: nil, state_root: nil,
+            copy_to_workspace: false, copy_from_shared_store: nil, keep_root_models: false,
+            context: nil, state_root: nil,
             pull_timeout_seconds: DEFAULT_PULL_TIMEOUT_SECONDS,
             heartbeat_seconds: DEFAULT_HEARTBEAT_SECONDS, poll_seconds: DEFAULT_POLL_SECONDS)
       fleet = active_fleet!
@@ -47,6 +48,27 @@ module LocalModelEvaluation
       end
       if copy_to_workspace && reuse_existing
         raise Error, "--copy-to-workspace cannot be combined with --reuse-existing"
+      end
+      if copy_from_shared_store
+        copy_from_shared_store = copy_from_shared_store.to_s
+        unless copy_from_shared_store.start_with?("/")
+          raise Error, "--copy-from-shared-store must be an absolute remote path"
+        end
+        if reuse_existing
+          raise Error, "--copy-from-shared-store cannot be combined with --reuse-existing"
+        end
+        if copy_to_workspace
+          raise Error, "--copy-from-shared-store cannot be combined with --copy-to-workspace"
+        end
+        if keep_root_models
+          raise Error, "--copy-from-shared-store cannot be combined with --keep-root-models"
+        end
+        if clean
+          raise Error, "--copy-from-shared-store cannot be combined with --clean"
+        end
+        if models.length != 1
+          raise Error, "--copy-from-shared-store requires exactly one model"
+        end
       end
       if copy_to_workspace && keep_root_models
         raise Error, "--copy-to-workspace cannot be combined with --keep-root-models"
@@ -65,7 +87,7 @@ module LocalModelEvaluation
         raise Error, "--state-root must be an absolute remote path"
       end
       if fleet.dig("provisioning", "network_volume_id")
-        raise Error, "network-volume bootstrap requires --reuse-existing" unless reuse_existing
+        raise Error, "network-volume bootstrap requires --reuse-existing or --copy-from-shared-store" unless reuse_existing || copy_from_shared_store
         remote_state = File.expand_path(state_root || "/workspace/lme-worker-state")
         if remote_state == "/workspace" || remote_state.start_with?("/workspace/")
           raise Error, "network-volume bootstrap requires --state-root outside /workspace (e.g. /root/lme-worker-state)"
@@ -89,6 +111,7 @@ module LocalModelEvaluation
           clean:,
           reuse_existing:,
           copy_to_workspace:,
+          copy_from_shared_store:,
           keep_root_models:,
           state_root:,
           context:,
@@ -105,8 +128,8 @@ module LocalModelEvaluation
     private
 
     def execute_run(fleet:, workers:, models:, digests:, expected_gpus:, clean:, reuse_existing:,
-                    copy_to_workspace:, keep_root_models:, state_root:, context:, pull_timeout_seconds:,
-                    heartbeat_seconds:, poll_seconds:, bootstrap_root:)
+                    copy_to_workspace:, copy_from_shared_store:, keep_root_models:, state_root:, context:,
+                    pull_timeout_seconds:, heartbeat_seconds:, poll_seconds:, bootstrap_root:)
       started_wall = utc_now
       started_mono = @monotonic_clock.call
       run_id = build_run_id(started_wall)
@@ -121,6 +144,7 @@ module LocalModelEvaluation
         clean:,
         reuse_existing:,
         copy_to_workspace:,
+        copy_from_shared_store:,
         keep_root_models:,
         state_root:,
         context:,
@@ -143,6 +167,7 @@ module LocalModelEvaluation
             clean:,
             reuse_existing:,
             copy_to_workspace:,
+            copy_from_shared_store:,
             keep_root_models:,
             state_root:,
             context:,
@@ -338,7 +363,7 @@ module LocalModelEvaluation
     end
 
     def spawn_worker(worker:, models:, digests:, expected_gpu:, clean:, reuse_existing:, copy_to_workspace:,
-                     keep_root_models:, context:, pull_timeout_seconds:, state_root:, run_dir:)
+                     copy_from_shared_store:, keep_root_models:, context:, pull_timeout_seconds:, state_root:, run_dir:)
       index = worker.fetch("index")
       command = [@remote_setup_path, "--worker", index.to_s]
       command.concat(["--expect-gpu", expected_gpu])
@@ -346,6 +371,7 @@ module LocalModelEvaluation
       command << "--clean" if clean
       command << "--reuse-existing" if reuse_existing
       command << "--copy-to-workspace" if copy_to_workspace
+      command.concat(["--copy-from-shared-store", copy_from_shared_store]) if copy_from_shared_store
       command << "--keep-root-models" if keep_root_models
       command.concat(["--state-root", state_root]) if state_root
       models.each do |model|
@@ -374,6 +400,7 @@ module LocalModelEvaluation
         [/\[6\/8\] Warm each model/, "WARMING"],
         [/Warming /, "WARMING"],
         [/Copying completed Ollama store/, "COPYING"],
+        [/Copy requested model from shared store/, "COPYING"],
         [/\b\d+(?:\.\d+)?[KMGT]\s+\d+%\s+\d+(?:\.\d+)?[KMGT]?B\/s/i, "COPYING"],
         [/Pulling /, "PULLING"],
         [/pulling [0-9a-f]{8,}:/i, "PULLING"],
@@ -565,8 +592,8 @@ module LocalModelEvaluation
     end
 
     def initial_record(fleet:, workers:, models:, digests:, expected_gpus:, clean:, reuse_existing:,
-                       copy_to_workspace:, keep_root_models:, state_root:, context:, pull_timeout_seconds:,
-                       heartbeat_seconds:, started_wall:, run_id:)
+                       copy_to_workspace:, copy_from_shared_store:, keep_root_models:, state_root:, context:,
+                       pull_timeout_seconds:, heartbeat_seconds:, started_wall:, run_id:)
       gpu_ids = expected_gpus.values.uniq
       {
         "schema_version" => 2,
@@ -582,7 +609,8 @@ module LocalModelEvaluation
         "clean" => clean,
         "reuse_existing" => reuse_existing,
         "copy_to_workspace" => copy_to_workspace,
-        "model_store_mode" => reuse_existing ? "workspace_reuse" : (copy_to_workspace ? "workspace" : "root"),
+        "copy_from_shared_store" => copy_from_shared_store,
+        "model_store_mode" => (copy_from_shared_store ? "shared_copy_to_root" : (reuse_existing ? "workspace_reuse" : (copy_to_workspace ? "workspace" : "root"))),
         "keep_root_models" => keep_root_models,
         "state_root" => state_root || "/workspace/lme-worker-state",
         "context" => context,
