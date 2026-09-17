@@ -451,14 +451,42 @@ module LocalModelEvaluation
       raise Error, "provisioning metadata must be a hash" unless value.is_a?(Hash)
       data = value.transform_keys(&:to_s)
       disk = positive_integer(data.fetch("container_disk_gb"), "provisioning container_disk_gb")
+
+      global_volume = nil
+      if data["global_volume_id"]
+        id = data.fetch("global_volume_id").to_s
+        raise Error, "invalid provisioning global_volume_id" unless id.match?(/\A[A-Za-z0-9_-]+\z/)
+        unless data["global_volume_type"] == "OBJECT_STORE_VOLUME"
+          raise Error, "global volume must use OBJECT_STORE_VOLUME"
+        end
+        unless data["global_volume_mount_path"] == "/workspace-global"
+          raise Error, "global volume must mount at /workspace-global"
+        end
+        raise Error, "global volume conflicts with provisioning volume_gb" unless data["volume_gb"].nil?
+
+        global_volume = {
+          "global_volume_id" => id,
+          "global_volume_type" => "OBJECT_STORE_VOLUME",
+          "global_volume_mount_path" => "/workspace-global"
+        }
+      end
+
       if data["network_volume_id"]
         id = data.fetch("network_volume_id").to_s
         raise Error, "invalid provisioning network_volume_id" unless id.match?(/\A[A-Za-z0-9_-]+\z/)
         raise Error, "network volume conflicts with provisioning volume_gb" unless data["volume_gb"].nil?
         raise Error, "network volume must mount at /workspace" unless data["volume_mount_path"] == "/workspace"
 
-        { "container_disk_gb" => disk, "volume_gb" => nil,
-          "network_volume_id" => id, "volume_mount_path" => "/workspace" }
+        normalized = {
+          "container_disk_gb" => disk,
+          "volume_gb" => nil,
+          "network_volume_id" => id,
+          "volume_mount_path" => "/workspace"
+        }
+        normalized.merge!(global_volume) if global_volume
+        normalized
+      elsif global_volume
+        { "container_disk_gb" => disk, "volume_gb" => nil }.merge(global_volume)
       else
         { "container_disk_gb" => disk,
           "volume_gb" => positive_integer(data.fetch("volume_gb"), "provisioning volume_gb") }

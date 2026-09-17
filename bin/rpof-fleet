@@ -73,7 +73,7 @@ def create_options(argv)
     workers: nil, cloud: LocalModelEvaluation::RunpodFleet::DEFAULT_CLOUD,
     gpu_id: LocalModelEvaluation::RunpodFleet::GPU_ID,
     container_disk_gb: LocalModelEvaluation::RunpodFleet::DEFAULT_CONTAINER_DISK_GB,
-    volume_gb: nil, network_volume_id: nil,
+    volume_gb: nil, network_volume_id: nil, global_volume_id: nil,
     max_runtime_seconds: nil, max_spend_usd: nil, min_ready_workers: nil, dry_run: false, yes: false,
     max_hourly_usd: ENV.fetch("RUNPOD_MAX_FLEET_HOURLY_USD", LocalModelEvaluation::RunpodFleet::DEFAULT_MAX_FLEET_HOURLY_USD),
     max_total_hourly_usd: ENV.fetch("RUNPOD_MAX_TOTAL_HOURLY_USD", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_MAX_TOTAL_HOURLY_USD),
@@ -88,6 +88,7 @@ def create_options(argv)
     o.on("--gpu GPU_ID") { |v| opts[:gpu_id] = v }
     o.on("--container-disk-gb N", Integer) { |v| opts[:container_disk_gb] = v }
     o.on("--network-volume-id ID", "Attach an existing network volume at /workspace on every worker") { |v| opts[:network_volume_id] = v }
+    o.on("--global-volume-id ID", "Attach an existing Global Volume at /workspace-global on every worker") { |v| opts[:global_volume_id] = v }
     o.on("--volume-gb N", Integer) { |v| opts[:volume_gb] = v }
     o.on("--max-runtime-minutes MINUTES", Float) { |v| opts[:max_runtime_seconds] = v * 60.0 }
     o.on("--max-spend-usd USD", Float) { |v| opts[:max_spend_usd] = v }
@@ -100,6 +101,7 @@ def create_options(argv)
     o.on("--poll-seconds N", Float) { |v| opts[:poll_seconds] = v }
   end.parse!(argv)
   abort "--network-volume-id cannot be combined with --volume-gb" if opts[:network_volume_id] && opts[:volume_gb]
+  abort "--global-volume-id cannot be combined with --volume-gb" if opts[:global_volume_id] && opts[:volume_gb]
   abort "Usage: bin/rpof create --workers N [--dry-run|--yes]" unless opts[:workers]
   if opts[:min_ready_workers] && !opts[:min_ready_workers].between?(1, opts[:workers])
     abort "--min-ready-workers must be between 1 and --workers"
@@ -162,7 +164,7 @@ when "create"
     preflight = fleet.preflight(
       worker_count: opts[:workers], cloud: opts[:cloud], max_fleet_hourly_usd: opts[:max_hourly_usd],
       container_disk_gb: opts[:container_disk_gb], volume_gb: opts[:volume_gb],
-      network_volume_id: opts[:network_volume_id],
+      network_volume_id: opts[:network_volume_id], global_volume_id: opts[:global_volume_id],
       max_runtime_seconds: opts[:max_runtime_seconds], max_spend_usd: opts[:max_spend_usd]
     )
     ssh_public_key = fleet.read_ssh_public_key(opts[:ssh_public_key])
@@ -200,8 +202,15 @@ when "create"
       puts "  No fresh per-pod workspace volume will be created."
       puts "  Bootstrap shared models with --reuse-existing --state-root /root/lme-worker-state."
       puts "  GPU catalog availability is not specific to the network volume's data center."
-    else
+    elsif preflight.volume_gb
       puts "  Workspace volume: #{preflight.volume_gb} GB at #{LocalModelEvaluation::RunpodFleet::VOLUME_MOUNT_PATH}"
+    end
+    if preflight.global_volume_id
+      puts "  Existing Global Volume: #{preflight.global_volume_id} at #{LocalModelEvaluation::RunpodFleet::GLOBAL_VOLUME_MOUNT_PATH} on every worker"
+      unless preflight.network_volume_id
+        puts "  No fresh per-pod workspace volume will be created."
+      end
+      puts "  Global Volume attachment uses RunPod GraphQL because REST v2 does not expose this beta mount."
     end
     puts format("  Catalog rate: $%.4f/hr per worker", preflight.hourly_rate)
     puts format("  Projected fleet rate: $%.4f/hr", preflight.fleet_hourly_rate)
@@ -231,7 +240,8 @@ when "create"
     workers = fleet.create(
       worker_count: opts[:workers], cloud: opts[:cloud], ssh_public_key:, preflight:,
       max_fleet_hourly_usd: opts[:max_hourly_usd], container_disk_gb: opts[:container_disk_gb],
-      volume_gb: opts[:volume_gb], network_volume_id: opts[:network_volume_id], max_runtime_seconds: opts[:max_runtime_seconds],
+      volume_gb: opts[:volume_gb], network_volume_id: opts[:network_volume_id],
+      global_volume_id: opts[:global_volume_id], max_runtime_seconds: opts[:max_runtime_seconds],
       max_spend_usd: opts[:max_spend_usd], min_ready_workers: minimum_ready_workers,
       wait_seconds: opts[:wait_seconds], poll_seconds: opts[:poll_seconds]
     )

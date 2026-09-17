@@ -7,6 +7,7 @@ require "uri"
 module LocalModelEvaluation
   class RunpodClient
     DEFAULT_BASE_URL = "https://api.runpod.io/v2"
+    DEFAULT_GRAPHQL_URL = "https://api.runpod.io/graphql"
 
     class Error < StandardError
       attr_reader :status
@@ -19,11 +20,13 @@ module LocalModelEvaluation
 
     Response = Struct.new(:status, :body, keyword_init: true)
 
-    def initialize(api_key:, base_url: DEFAULT_BASE_URL, open_timeout: 5, read_timeout: 30, transport: nil)
+    def initialize(api_key:, base_url: DEFAULT_BASE_URL, graphql_url: DEFAULT_GRAPHQL_URL,
+                   open_timeout: 5, read_timeout: 30, transport: nil)
       @api_key = api_key.to_s
       raise ArgumentError, "RUNPOD_API_KEY is empty" if @api_key.empty?
 
       @base_url = base_url.to_s.sub(%r{/+\z}, "")
+      @graphql_url = graphql_url.to_s
       @open_timeout = open_timeout
       @read_timeout = read_timeout
       @transport = transport
@@ -53,7 +56,11 @@ module LocalModelEvaluation
     end
 
     def create_pod(body)
-      request("POST", "/pods", body:)
+      if Array(body["volumeMounts"]).empty?
+        request("POST", "/pods", body:)
+      else
+        create_pod_graphql(body)
+      end
     end
 
     def delete_pod(pod_id)
@@ -61,6 +68,69 @@ module LocalModelEvaluation
     end
 
     private
+
+    def create_pod_graphql(body)
+      mounts = body.fetch("mounts", {})
+      persistent = mounts["persistent"]
+      network = Array(mounts["network"]).first
+      input = {
+        "cloudType" => body.fetch("cloud"),
+        "containerDiskInGb" => Integer(body.fetch("disk")),
+        "env" => (body["env"] || {}).map { |key, value| { "key" => key.to_s, "value" => value.to_s } },
+        "gpuCount" => Integer(body.dig("gpu", "count")),
+        "gpuTypeId" => body.dig("gpu", "id").to_s,
+        "imageName" => body.fetch("image"),
+        "name" => body.fetch("name"),
+        "ports" => Array(body["ports"]).join(","),
+        "startSsh" => true,
+        "volumeInGb" => persistent ? Integer(persistent.fetch("size")) : 0,
+        "volumeMountPath" => persistent && persistent.fetch("path"),
+        "networkVolumeId" => network && network.fetch("volumeId"),
+        "volumeMounts" => Array(body.fetch("volumeMounts"))
+      }.compact
+
+      document = graphql_request(
+        query: <<~GRAPHQL,
+          mutation createPodWithGlobalVolume($input: PodFindAndDeployOnDemandInput!) {
+            podFindAndDeployOnDemand(input: $input) {
+              id
+            }
+          }
+        GRAPHQL
+        variables: { "input" => input }
+      )
+
+      errors = Array(document["errors"])
+      unless errors.empty?
+        detail = errors.filter_map { |error| error["message"].to_s.strip }.reject(&:empty?).join("; ")
+        raise Error.new(502, detail.empty? ? "GraphQL pod creation failed" : detail)
+      end
+
+      pod = document.dig("data", "podFindAndDeployOnDemand")
+      raise Error.new(502, "GraphQL pod creation returned no pod") unless pod.is_a?(Hash)
+
+      pod
+    end
+
+    def graphql_request(query:, variables:)
+      uri = URI.parse(@graphql_url)
+      headers = {
+        "Authorization" => "Bearer #{@api_key}",
+        "Accept" => "application/json",
+        "Content-Type" => "application/json"
+      }
+      encoded_body = JSON.generate("query" => query, "variables" => variables)
+      response = if @transport
+                   @transport.call(method: "POST", uri:, headers:, body: encoded_body)
+                 else
+                   perform_http(method: "POST", uri:, headers:, body: encoded_body)
+                 end
+      status = response.respond_to?(:code) ? response.code.to_i : Integer(response.status)
+      raw_body = response.body.to_s
+      return parse_success(raw_body) if status.between?(200, 299)
+
+      raise Error.new(status, error_detail(raw_body))
+    end
 
     def safe_id(value)
       id = value.to_s
