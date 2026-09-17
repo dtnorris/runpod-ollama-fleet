@@ -17,6 +17,14 @@ PULL_TIMEOUT_SECONDS=360
 STAGING_DIR=/root/.ollama/models
 SHARED_DIR=/workspace/ollama-models
 SOURCE_SHARED_DIR=""
+PINNED_OLLAMA_RUNTIME_VERSION="v0.34.1"
+PINNED_OLLAMA_RUNTIME_SHA256="f361dc3992ec07e4ad429f4bb2d10d4663ba2c295f9a9a688c7d52f4ba650034"
+PINNED_OLLAMA_RUNTIME_ARCHIVE="/workspace-global/runtime-cache/ollama/${PINNED_OLLAMA_RUNTIME_VERSION}/ollama-linux-amd64.tar.zst"
+PINNED_OLLAMA_RUNTIME_LOCAL_ROOT="/root/lme-ollama-runtime/${PINNED_OLLAMA_RUNTIME_VERSION}"
+OLLAMA_RUNTIME_MODE="public_or_existing"
+OLLAMA_RUNTIME_VERSION=""
+OLLAMA_RUNTIME_SHA256=""
+OLLAMA_RUNTIME_ARCHIVE=""
 STATE_ROOT=/workspace/lme-worker-state
 SERVER_HOST=127.0.0.1:11434
 CLIENT_URL=http://127.0.0.1:11434
@@ -264,6 +272,13 @@ command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is required"
 if [[ $REUSE_EXISTING -eq 0 && -z "$SOURCE_SHARED_DIR" ]]; then
   command -v timeout >/dev/null 2>&1 || die "timeout is required for bounded model pulls"
 fi
+if [[ -n "$SOURCE_SHARED_DIR" ]]; then
+  command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required for pinned Ollama runtime verification"
+  command -v tar >/dev/null 2>&1 || die "tar is required for pinned Ollama runtime extraction"
+  command -v zstd >/dev/null 2>&1 || die "zstd is required for pinned Ollama runtime extraction"
+  [[ -f "$PINNED_OLLAMA_RUNTIME_ARCHIVE" ]] || die "pinned Ollama runtime archive is missing: $PINNED_OLLAMA_RUNTIME_ARCHIVE"
+  [[ -r "$PINNED_OLLAMA_RUNTIME_ARCHIVE" ]] || die "pinned Ollama runtime archive is not readable: $PINNED_OLLAMA_RUNTIME_ARCHIVE"
+fi
 
 GPU_LINE="$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits | head -n 1)"
 GPU_NAME="${GPU_LINE%,*}"
@@ -327,7 +342,44 @@ if ((${#missing_packages[@]})); then
   apt-get install -y "${missing_packages[@]}"
 fi
 
-if ! command -v ollama >/dev/null 2>&1; then
+if [[ -n "$SOURCE_SHARED_DIR" ]]; then
+  info "Installing pinned Ollama runtime from shared cache: $PINNED_OLLAMA_RUNTIME_ARCHIVE"
+  runtime_tmp_dir="/tmp/lme-ollama-runtime"
+  runtime_tmp_archive="$runtime_tmp_dir/ollama-linux-amd64.tar.zst"
+  rm -rf "$runtime_tmp_dir"
+  mkdir -p "$runtime_tmp_dir"
+
+  cp "$PINNED_OLLAMA_RUNTIME_ARCHIVE" "${runtime_tmp_archive}.partial"
+  mv "${runtime_tmp_archive}.partial" "$runtime_tmp_archive"
+
+  actual_runtime_sha256="$(sha256sum "$runtime_tmp_archive" | awk '{print $1}')"
+  [[ "$actual_runtime_sha256" == "$PINNED_OLLAMA_RUNTIME_SHA256" ]] || \
+    die "pinned Ollama runtime checksum mismatch: expected $PINNED_OLLAMA_RUNTIME_SHA256, got $actual_runtime_sha256"
+
+  rm -rf "$PINNED_OLLAMA_RUNTIME_LOCAL_ROOT"
+  mkdir -p "$PINNED_OLLAMA_RUNTIME_LOCAL_ROOT"
+  tar --zstd -xf "$runtime_tmp_archive" -C "$PINNED_OLLAMA_RUNTIME_LOCAL_ROOT"
+  [[ -x "$PINNED_OLLAMA_RUNTIME_LOCAL_ROOT/bin/ollama" ]] || \
+    die "pinned Ollama runtime did not contain executable bin/ollama"
+
+  export PATH="$PINNED_OLLAMA_RUNTIME_LOCAL_ROOT/bin:$PATH"
+  runtime_version_output="$(ollama --version 2>&1 || true)"
+  actual_runtime_version="$(
+    sed -nE 's/.*(client )?version (is )?([0-9]+\.[0-9]+\.[0-9]+).*/\3/p' <<<"$runtime_version_output" |
+      tail -n 1
+  )"
+  expected_runtime_version="${PINNED_OLLAMA_RUNTIME_VERSION#v}"
+  [[ "$actual_runtime_version" == "$expected_runtime_version" ]] || \
+    die "pinned Ollama runtime version mismatch: expected $expected_runtime_version, got ${actual_runtime_version:-<unknown>}"
+
+  OLLAMA_RUNTIME_MODE="pinned_shared_archive"
+  OLLAMA_RUNTIME_VERSION="$PINNED_OLLAMA_RUNTIME_VERSION"
+  OLLAMA_RUNTIME_SHA256="$actual_runtime_sha256"
+  OLLAMA_RUNTIME_ARCHIVE="$PINNED_OLLAMA_RUNTIME_ARCHIVE"
+  printf '%s\n' "$runtime_version_output" > "$STATE_DIR/ollama-runtime-version.txt"
+  rm -f "$runtime_tmp_archive"
+  info "Pinned Ollama runtime PASS: $OLLAMA_RUNTIME_VERSION sha256=$OLLAMA_RUNTIME_SHA256"
+elif ! command -v ollama >/dev/null 2>&1; then
   info "Installing Ollama ..."
   curl -fsSL https://ollama.com/install.sh | sh
 else
@@ -574,10 +626,18 @@ step "Write durable worker evidence"
   echo "reuse_existing=$REUSE_EXISTING"
   echo "copy_to_workspace=$COPY_TO_WORKSPACE"
   echo "copy_from_shared_store=$SOURCE_SHARED_DIR"
+  echo "ollama_runtime_mode=$OLLAMA_RUNTIME_MODE"
+  echo "ollama_runtime_version=$OLLAMA_RUNTIME_VERSION"
+  echo "ollama_runtime_sha256=$OLLAMA_RUNTIME_SHA256"
+  echo "ollama_runtime_archive=$OLLAMA_RUNTIME_ARCHIVE"
   echo "keep_root_models=$KEEP_ROOT_MODELS"
   echo "models=${MODELS[*]}"
 } > "$STATE_DIR/worker-summary.txt"
 
+if [[ "$OLLAMA_RUNTIME_MODE" == "pinned_shared_archive" ]]; then
+  printf '[%s] LME_PROVENANCE_OLLAMA_RUNTIME\t%s\t%s\t%s\n' \
+    "$(ts)" "$OLLAMA_RUNTIME_VERSION" "$OLLAMA_RUNTIME_SHA256" "$OLLAMA_RUNTIME_ARCHIVE"
+fi
 info "Emitting machine-readable model/GPU provenance."
 printf '[%s] LME_PROVENANCE_GPU\t%s\t%s\n' "$(ts)" "$GPU_PROVENANCE_NAME" "$GPU_VRAM_MIB"
 for model in "${MODELS[@]}"; do
