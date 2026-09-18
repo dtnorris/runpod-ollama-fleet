@@ -108,16 +108,7 @@ module RunpodOllamaFleet
         invoke_tunnels(handle, worker_indices)
         alias_evidence = invoke_runtime_alias(handle, worker_indices, requirements, profile)
         capability = invoke_capability(handle, worker_indices, requirements)
-        unless capability.fetch("ready")
-          failures = Array(capability["diagnostics"]).select { |row| row["status"] == "FAIL" }
-          detail = failures.map { |row| "#{row['code']}: #{row['detail']}" }.join("; ")
-          raise Error, "execution capability check failed: #{detail.empty? ? 'not ready' : detail}"
-        end
-        selected = Array(capability.fetch("selected_worker_indices")).map { |value| Integer(value) }.sort
-        unless selected == worker_indices
-          raise Error,
-                "capability check returned workers #{selected.inspect}, expected #{worker_indices.inspect}"
-        end
+        assert_capability_ready!(capability, worker_indices)
 
         preparation_result(
           request:,
@@ -161,15 +152,14 @@ module RunpodOllamaFleet
       profile = @hardware.profile_for(requirements.fetch("ollama_model"))
       handle = execution_handle(request)
 
-      capacity_result = invoke_capacity(
-        handle:,
-        profile:,
-        capacity:,
-        dry_run:,
-        assume_yes:
-      )
-
       if dry_run
+        capacity_result = invoke_capacity(
+          handle:,
+          profile:,
+          capacity:,
+          dry_run: true,
+          assume_yes: false
+        )
         return result_document(
           request:,
           handle:,
@@ -184,19 +174,84 @@ module RunpodOllamaFleet
         )
       end
 
-      initial_workers = Integer(capacity_result.fetch("initial_workers"))
-      final_workers = Integer(capacity_result.fetch("final_workers"))
+      # Read existing capacity without creating anything. The rolling path then
+      # treats that count as a READY prefix only after a capability proof.
+      snapshot = invoke_capacity(
+        handle:,
+        profile:,
+        capacity:,
+        dry_run: true,
+        assume_yes: false
+      )
+      initial_workers = Integer(snapshot.fetch("initial_workers"))
+      current_workers = initial_workers
+      desired_workers = Integer(capacity.fetch("desired_workers"))
       minimum_workers = Integer(capacity.fetch("minimum_workers"))
+      runtime_alias_evidence = []
 
-      if final_workers < minimum_workers
-        cleanup_error = cleanup_new_capacity(handle, initial_workers, final_workers)
-        detail = capacity_result.fetch("stopped_reason").to_s
+      if current_workers.positive?
+        existing_indices = (1..current_workers).to_a
+        begin
+          invoke_keep(handle)
+          invoke_tunnels(handle, existing_indices)
+          existing_capability = invoke_capability(handle, existing_indices, requirements)
+          assert_capability_ready!(existing_capability, existing_indices)
+        rescue StandardError => e
+          detail = "existing execution workers are not ready: #{e.message}"
+          capacity_result = rolling_capacity_result(
+            status: "failed",
+            initial_workers:,
+            final_workers: current_workers,
+            detail:
+          )
+          return result_document(
+            request:,
+            handle:,
+            ready: false,
+            status: "failed",
+            capacity_result:,
+            worker_indices: [],
+            profile:,
+            detail:,
+            runtime_alias_evidence: [],
+            capability: nil
+          )
+        end
+      end
+
+      stop_result = nil
+      while current_workers < desired_workers
+        preparation = prepare_next_worker(
+          request,
+          current_workers: current_workers,
+          assume_yes:
+        )
+        unless preparation.fetch("ready")
+          stop_result = preparation
+          break
+        end
+
+        current_workers = Integer(preparation.dig("capacity", "final_workers"))
+        runtime_alias_evidence.concat(Array(preparation["runtime_alias_evidence"]))
+      end
+
+      if current_workers < minimum_workers
+        cleanup_error = cleanup_new_capacity(handle, initial_workers, current_workers)
+        stop_status = stop_result && stop_result.fetch("status")
+        status = stop_status == "failed" ? "failed" : "unfulfilled"
+        detail = stop_result ? stop_result.fetch("detail").to_s : "minimum execution capacity was not reached"
         detail = "#{detail}; cleanup failed: #{cleanup_error}" if cleanup_error
+        capacity_result = rolling_capacity_result(
+          status: (status == "failed" ? "failed" : "unfulfilled"),
+          initial_workers:,
+          final_workers: current_workers,
+          detail:
+        )
         return result_document(
           request:,
           handle:,
           ready: false,
-          status: "unfulfilled",
+          status:,
           capacity_result:,
           worker_indices: [],
           profile:,
@@ -206,42 +261,19 @@ module RunpodOllamaFleet
         )
       end
 
-      worker_indices = (1..final_workers).to_a
+      worker_indices = (1..current_workers).to_a
       begin
-        invoke_keep(handle)
-        invoke_bootstrap(handle, worker_indices, requirements, profile)
-        invoke_tunnels(handle, worker_indices)
-        alias_evidence = invoke_runtime_alias(handle, worker_indices, requirements, profile)
         capability = invoke_capability(handle, worker_indices, requirements)
-        unless capability.fetch("ready")
-          failures = Array(capability["diagnostics"]).select { |row| row["status"] == "FAIL" }
-          detail = failures.map { |row| "#{row['code']}: #{row['detail']}" }.join("; ")
-          raise Error, "execution capability check failed: #{detail.empty? ? 'not ready' : detail}"
-        end
-        selected = Array(capability.fetch("selected_worker_indices")).map { |value| Integer(value) }.sort
-        unless selected == worker_indices
-          raise Error,
-                "capability check returned workers #{selected.inspect}, expected #{worker_indices.inspect}"
-        end
-
-        status = final_workers >= Integer(capacity.fetch("desired_workers")) ? "ready" : "partial_ready"
-        result_document(
-          request:,
-          handle:,
-          ready: true,
-          status:,
-          capacity_result:,
-          worker_indices:,
-          profile:,
-          detail: status == "ready" ? "desired execution capacity is ready" : "minimum execution capacity is ready",
-          runtime_alias_evidence: alias_evidence,
-          capability:
-        )
+        assert_capability_ready!(capability, worker_indices)
       rescue StandardError => e
-        cleanup_error = cleanup_new_capacity(handle, initial_workers, final_workers)
-        detail = e.message.to_s
-        detail = "#{detail}; cleanup failed: #{cleanup_error}" if cleanup_error
-        result_document(
+        detail = "final rolling capability check failed: #{e.message}"
+        capacity_result = rolling_capacity_result(
+          status: (current_workers >= desired_workers ? "fulfilled" : "minimum_met"),
+          initial_workers:,
+          final_workers: current_workers,
+          detail:
+        )
+        return result_document(
           request:,
           handle:,
           ready: false,
@@ -250,10 +282,38 @@ module RunpodOllamaFleet
           worker_indices: [],
           profile:,
           detail:,
-          runtime_alias_evidence: [],
+          runtime_alias_evidence:,
           capability: nil
         )
       end
+
+      status = current_workers >= desired_workers ? "ready" : "partial_ready"
+      capacity_status = status == "ready" ? "fulfilled" : "minimum_met"
+      detail = if status == "ready"
+                 "desired execution capacity is ready"
+               else
+                 reason = stop_result ? stop_result.fetch("detail").to_s : "target capacity was not reached"
+                 "minimum execution capacity is ready; rolling preparation stopped before desired capacity: #{reason}"
+               end
+      capacity_result = rolling_capacity_result(
+        status: capacity_status,
+        initial_workers:,
+        final_workers: current_workers,
+        detail:
+      )
+
+      result_document(
+        request:,
+        handle:,
+        ready: true,
+        status:,
+        capacity_result:,
+        worker_indices:,
+        profile:,
+        detail:,
+        runtime_alias_evidence:,
+        capability:
+      )
     rescue ContractV01::Error, ExecutionPoolHardware::Error => e
       raise Error, e.message
     rescue KeyError, ArgumentError, TypeError => e
@@ -390,6 +450,29 @@ module RunpodOllamaFleet
           return document
         end
       end
+    end
+
+    def assert_capability_ready!(capability, worker_indices)
+      unless capability.fetch("ready")
+        failures = Array(capability["diagnostics"]).select { |row| row["status"] == "FAIL" }
+        detail = failures.map { |row| "#{row['code']}: #{row['detail']}" }.join("; ")
+        raise Error, "execution capability check failed: #{detail.empty? ? 'not ready' : detail}"
+      end
+
+      selected = Array(capability.fetch("selected_worker_indices")).map { |value| Integer(value) }.sort
+      return true if selected == worker_indices
+
+      raise Error,
+            "capability check returned workers #{selected.inspect}, expected #{worker_indices.inspect}"
+    end
+
+    def rolling_capacity_result(status:, initial_workers:, final_workers:, detail:)
+      {
+        "status" => status,
+        "initial_workers" => initial_workers,
+        "final_workers" => final_workers,
+        "stopped_reason" => detail
+      }
     end
 
     def cleanup_new_capacity(handle, initial_workers, final_workers)

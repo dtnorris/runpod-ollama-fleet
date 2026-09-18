@@ -27,15 +27,26 @@ class ExecutionPoolFulfillTest < Minitest::Test
 
   class FakeRunner
     attr_reader :capability_request
+    attr_reader :capability_requests
     attr_reader :calls
     attr_accessor :capacity_status, :capacity_initial, :capacity_final, :capability_ready
+    attr_accessor :capability_ready_sequence
 
     def initialize
       @calls = []
+      @capability_requests = []
       @capacity_status = "minimum_met"
       @capacity_initial = 0
       @capacity_final = 2
       @capability_ready = true
+      @capability_ready_sequence = []
+      @rolling_current = nil
+      @rolling_limit = nil
+    end
+
+    def enable_rolling_capacity(current_workers: 0, limit: nil)
+      @rolling_current = Integer(current_workers)
+      @rolling_limit = limit && Integer(limit)
     end
 
     def run(argv, env: {})
@@ -44,19 +55,28 @@ class ExecutionPoolFulfillTest < Minitest::Test
       case command
       when "fulfill"
         output = value_after(argv, "--output")
+        target = Integer(value_after(argv, "--target-workers"))
+        minimum = Integer(value_after(argv, "--minimum-workers"))
+        status, initial, final, reason = capacity_response(argv, target)
         File.write(output, JSON.pretty_generate(
           "contract_version" => "rpof-capacity-fulfillment-result/v0.1",
           "fleet_key" => value_after(argv, "--fleet"),
           "fleet_id" => "fixture-fleet",
-          "status" => @capacity_status,
-          "target_workers" => Integer(value_after(argv, "--target-workers")),
-          "minimum_workers" => Integer(value_after(argv, "--minimum-workers")),
-          "initial_workers" => @capacity_initial,
-          "final_workers" => @capacity_final,
-          "stopped_reason" => @capacity_status == "planned" ? "would acquire" : "fixture capacity",
+          "status" => status,
+          "target_workers" => target,
+          "minimum_workers" => minimum,
+          "initial_workers" => initial,
+          "final_workers" => final,
+          "stopped_reason" => reason,
           "attempts" => []
         ))
-        %w[fulfilled minimum_met planned].include?(@capacity_status) ? 0 : 1
+        %w[fulfilled minimum_met planned].include?(status) ? 0 : 1
+      when "scale"
+        @rolling_current = Integer(value_after(argv, "--workers")) unless @rolling_current.nil?
+        0
+      when "destroy"
+        @rolling_current = 0 unless @rolling_current.nil?
+        0
       when "runtime-alias"
         output = value_after(argv, "--output")
         workers = value_after(argv, "--workers").split(",").map do |index|
@@ -78,24 +98,46 @@ class ExecutionPoolFulfillTest < Minitest::Test
       when "capability-check"
         request = JSON.parse(File.read(value_after(argv, "--request")))
         @capability_request = request
+        @capability_requests << request
         output = value_after(argv, "--output")
         selected = request.dig("worker_selector", "indices")
+        ready = @capability_ready_sequence.empty? ? @capability_ready : @capability_ready_sequence.shift
         File.write(output, JSON.pretty_generate(
           "contract_version" => "afio-rpof-capability-check-result/v0.1",
-          "ready" => @capability_ready,
+          "ready" => ready,
           "fleet_key" => request.fetch("fleet_key"),
           "fleet_id" => "fixture-fleet",
           "selected_worker_indices" => selected,
-          "capabilities" => @capability_ready ? [{ "gpu_id" => "mixed", "models" => [] }] : nil,
-          "diagnostics" => @capability_ready ? [] : [{ "code" => "bootstrap.provenance", "status" => "FAIL", "detail" => "fixture failure" }]
+          "capabilities" => ready ? [{ "gpu_id" => "mixed", "models" => [] }] : nil,
+          "diagnostics" => ready ? [] : [{ "code" => "bootstrap.provenance", "status" => "FAIL", "detail" => "fixture failure" }]
         ))
-        @capability_ready ? 0 : 1
+        ready ? 0 : 1
       else
         0
       end
     end
 
     private
+
+    def capacity_response(argv, target)
+      unless @rolling_current.nil?
+        initial = @rolling_current
+        if argv.include?("--dry-run")
+          status = @rolling_limit && initial >= @rolling_limit ? "unavailable" : "planned"
+          return [status, initial, initial, status == "planned" ? "would acquire" : "fixture capacity unavailable"]
+        end
+
+        if @rolling_limit && target > @rolling_limit
+          return ["unfulfilled", initial, initial, "fixture capacity limit reached"]
+        end
+
+        @rolling_current = target
+        return ["fulfilled", initial, target, "target worker count reached"]
+      end
+
+      reason = @capacity_status == "planned" ? "would acquire" : "fixture capacity"
+      [@capacity_status, @capacity_initial, @capacity_final, reason]
+    end
 
     def value_after(argv, flag)
       argv.fetch(argv.index(flag) + 1)
@@ -214,85 +256,125 @@ class ExecutionPoolFulfillTest < Minitest::Test
     assert_empty runner.calls
   end
 
-  def test_turns_minimum_capacity_into_ready_runtime_pool
+  def test_run_prepares_workers_serially_to_desired_capacity
     runner = FakeRunner.new
+    runner.enable_rolling_capacity
+
     result = build(runner).run(request, assume_yes: true)
 
     assert_equal true, result.fetch("ready")
-    assert_equal "partial_ready", result.fetch("status")
-    assert_equal "ep-qwen35-#{PLAN[0, 10]}", result.fetch("execution_handle")
-    assert_equal [1, 2], result.fetch("worker_indices")
+    assert_equal "ready", result.fetch("status")
+    assert_equal [1, 2, 3, 4], result.fetch("worker_indices")
+    assert_equal 0, result.dig("capacity", "initial_workers")
+    assert_equal 4, result.dig("capacity", "final_workers")
 
-    fulfill = runner.calls.find { |row| row.fetch(:argv)[1] == "fulfill" }.fetch(:argv)
-    assert_equal ["NVIDIA A40", "NVIDIA RTX A6000"], fulfill.each_index.filter_map { |i| fulfill[i + 1] if fulfill[i] == "--gpu" }
-    assert_equal "3.0", fulfill.fetch(fulfill.index("--max-hourly-usd") + 1)
-    assert_equal "6.0", fulfill.fetch(fulfill.index("--max-total-hourly-usd") + 1)
-    assert_equal GLOBAL_VOLUME_ID, fulfill.fetch(fulfill.index("--global-volume-id") + 1)
+    fulfill_calls = runner.calls.select { |row| row.fetch(:argv)[1] == "fulfill" }.map { |row| row.fetch(:argv) }
+    assert_includes fulfill_calls.first, "--dry-run"
+    paid = fulfill_calls.drop(1)
+    assert_equal %w[1 2 3 4], paid.map { |argv| argv.fetch(argv.index("--target-workers") + 1) }
+    assert_equal %w[0 1 2 3], paid.map { |argv| argv.fetch(argv.index("--expect-initial-workers") + 1) }
+    assert paid.all? { |argv| argv.fetch(argv.index("--global-volume-id") + 1) == GLOBAL_VOLUME_ID }
+    assert paid.all? { |argv| argv.fetch(argv.index("--max-hourly-usd") + 1) == "3.0" }
+    assert paid.all? { |argv| argv.fetch(argv.index("--max-total-hourly-usd") + 1) == "6.0" }
 
-    bootstrap = runner.calls.find { |row| row.fetch(:argv)[1] == "bootstrap" }.fetch(:argv)
-    assert_equal SHARED_MODEL, bootstrap.fetch(bootstrap.index("--model") + 1)
-    assert_includes bootstrap, "#{SHARED_MODEL}=#{DIGEST}"
-    assert_equal OLLAMA_STORE_PATH, bootstrap.fetch(bootstrap.index("--copy-from-shared-store") + 1)
-    refute_includes bootstrap, request.dig("requirements", "pull_model")
+    bootstraps = runner.calls.select { |row| row.fetch(:argv)[1] == "bootstrap" }.map { |row| row.fetch(:argv) }
+    assert_equal %w[1 2 3 4], bootstraps.map { |argv| argv.fetch(argv.index("--workers") + 1) }
+    refute bootstraps.any? { |argv| argv.fetch(argv.index("--workers") + 1).include?(",") }
+    bootstraps.each do |argv|
+      assert_equal SHARED_MODEL, argv.fetch(argv.index("--model") + 1)
+      assert_includes argv, "#{SHARED_MODEL}=#{DIGEST}"
+      assert_equal OLLAMA_STORE_PATH, argv.fetch(argv.index("--copy-from-shared-store") + 1)
+      refute_includes argv, request.dig("requirements", "pull_model")
+    end
 
-    tunnels = runner.calls.find { |row| row.fetch(:argv)[1] == "tunnels" }
-    assert_equal result.fetch("execution_handle"), tunnels.dig(:env, "LME_RUNPOD_FLEET")
+    alias_calls = runner.calls.select { |row| row.fetch(:argv)[1] == "runtime-alias" }.map { |row| row.fetch(:argv) }
+    assert_equal 4, alias_calls.length
+    assert alias_calls.all? { |argv| argv.fetch(argv.index("--source-model") + 1) == SHARED_MODEL }
+    assert alias_calls.all? { |argv| argv.fetch(argv.index("--runtime-model") + 1) == "qwen3.6:35b-a3b" }
 
-    alias_call = runner.calls.find { |row| row.fetch(:argv)[1] == "runtime-alias" }.fetch(:argv)
-    assert_equal SHARED_MODEL, alias_call.fetch(alias_call.index("--source-model") + 1)
-    assert_equal "qwen3.6:35b-a3b", alias_call.fetch(alias_call.index("--runtime-model") + 1)
-    assert_equal "afio-rpof-capability-check-request/v0.2", runner.capability_request.fetch("contract_version")
-    capability_model = runner.capability_request.dig("requirements", "models", 0)
-    assert_equal "qwen3.6:35b-a3b", capability_model.fetch("name")
+    assert_equal [1, 2, 3, 4], runner.capability_requests.last.dig("worker_selector", "indices")
+    capability_model = runner.capability_requests.last.dig("requirements", "models", 0)
     assert_equal DIGEST, capability_model.fetch("expected_digest")
     assert_equal GLOBAL_VOLUME_ID, result.dig("hardware_policy", "global_volume_id")
     assert_equal SHARED_MODEL, result.dig("hardware_policy", "shared_model")
     assert_equal OLLAMA_STORE_PATH, result.dig("hardware_policy", "ollama_store_path")
   end
 
-  def test_failed_readiness_tears_down_only_new_capacity
+  def test_run_reuses_only_existing_workers_that_pass_capability_and_rolls_from_next_slot
     runner = FakeRunner.new
+    runner.enable_rolling_capacity(current_workers: 2)
+
+    result = build(runner).run(request, assume_yes: true)
+
+    assert_equal true, result.fetch("ready")
+    assert_equal [1, 2, 3, 4], result.fetch("worker_indices")
+    assert_equal [1, 2], runner.capability_requests.first.dig("worker_selector", "indices")
+    bootstraps = runner.calls.select { |row| row.fetch(:argv)[1] == "bootstrap" }.map { |row| row.fetch(:argv) }
+    assert_equal %w[3 4], bootstraps.map { |argv| argv.fetch(argv.index("--workers") + 1) }
+  end
+
+  def test_run_fails_closed_when_existing_workers_are_not_ready
+    runner = FakeRunner.new
+    runner.enable_rolling_capacity(current_workers: 2)
     runner.capability_ready = false
 
     result = build(runner).run(request, assume_yes: true)
 
     assert_equal false, result.fetch("ready")
     assert_equal "failed", result.fetch("status")
-    destroy = runner.calls.find { |row| row.fetch(:argv)[1] == "destroy" }
-    refute_nil destroy
-    assert_includes result.fetch("detail"), "bootstrap.provenance"
+    assert_includes result.fetch("detail"), "existing execution workers are not ready"
+    fulfill_calls = runner.calls.select { |row| row.fetch(:argv)[1] == "fulfill" }
+    assert_equal 1, fulfill_calls.length
+    assert_includes fulfill_calls.first.fetch(:argv), "--dry-run"
+    refute runner.calls.any? { |row| row.fetch(:argv)[1] == "bootstrap" }
   end
 
-  def test_below_minimum_capacity_is_not_bootstrapped_and_is_torn_down
+  def test_run_retains_minimum_ready_prefix_when_target_capacity_is_unavailable
     runner = FakeRunner.new
-    runner.capacity_status = "unfulfilled"
-    runner.capacity_final = 1
+    runner.enable_rolling_capacity(limit: 2)
+
+    result = build(runner).run(request, assume_yes: true)
+
+    assert_equal true, result.fetch("ready")
+    assert_equal "partial_ready", result.fetch("status")
+    assert_equal [1, 2], result.fetch("worker_indices")
+    assert_equal 2, result.dig("capacity", "final_workers")
+    assert_includes result.fetch("detail"), "fixture capacity limit reached"
+    refute runner.calls.any? { |row| %w[scale destroy].include?(row.fetch(:argv)[1]) }
+  end
+
+  def test_run_cleans_back_to_initial_capacity_when_minimum_is_not_reached
+    runner = FakeRunner.new
+    runner.enable_rolling_capacity(limit: 1)
 
     result = build(runner).run(request, assume_yes: true)
 
     assert_equal false, result.fetch("ready")
     assert_equal "unfulfilled", result.fetch("status")
-    refute runner.calls.any? { |row| row.fetch(:argv)[1] == "bootstrap" }
+    assert_equal [], result.fetch("worker_indices")
+    bootstraps = runner.calls.select { |row| row.fetch(:argv)[1] == "bootstrap" }.map { |row| row.fetch(:argv) }
+    assert_equal ["1"], bootstraps.map { |argv| argv.fetch(argv.index("--workers") + 1) }
     assert runner.calls.any? { |row| row.fetch(:argv)[1] == "destroy" }
   end
 
-  def test_failure_preserves_preexisting_workers_and_scales_back_only_new_tail
+  def test_run_retains_minimum_ready_prefix_when_next_bootstrap_fails
     runner = FakeRunner.new
-    runner.capacity_initial = 1
-    runner.capacity_final = 2
-    runner.capability_ready = false
+    runner.enable_rolling_capacity
+    runner.capability_ready_sequence = [true, true, false, true]
 
-    build(runner).run(request, assume_yes: true)
+    result = build(runner).run(request, assume_yes: true)
 
+    assert_equal true, result.fetch("ready")
+    assert_equal "partial_ready", result.fetch("status")
+    assert_equal [1, 2], result.fetch("worker_indices")
     scale = runner.calls.find { |row| row.fetch(:argv)[1] == "scale" }.fetch(:argv)
-    assert_equal "1", scale.fetch(scale.index("--workers") + 1)
-    refute runner.calls.any? { |row| row.fetch(:argv)[1] == "destroy" }
+    assert_equal "2", scale.fetch(scale.index("--workers") + 1)
+    assert_includes result.fetch("detail"), "bootstrap.provenance"
   end
 
   def test_dry_run_stops_before_paid_or_bootstrap_steps
     runner = FakeRunner.new
-    runner.capacity_status = "planned"
-    runner.capacity_final = 0
+    runner.enable_rolling_capacity
 
     result = build(runner).run(request, dry_run: true)
 
