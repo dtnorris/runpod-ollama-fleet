@@ -7,13 +7,13 @@ require "optparse"
 ROOT = File.expand_path("..", __dir__)
 $LOAD_PATH.unshift File.join(ROOT, "lib")
 require "local_model_evaluation/runpod_budget"
+require "local_model_evaluation/runpod_budget_guardian_supervisor"
 
 command = ARGV.shift
 opts = {
   budget_id: nil,
   plan_sha256: nil,
   request: nil,
-  guardian_heartbeat_at_utc: nil,
   source: nil,
   reason: nil
 }
@@ -23,7 +23,6 @@ parser = OptionParser.new do |o|
   o.on("--budget-id ID", "Parent production-burst budget id") { |v| opts[:budget_id] = v }
   o.on("--plan-sha256 SHA", "Frozen AFIO production plan SHA-256") { |v| opts[:plan_sha256] = v }
   o.on("--request FILE", "JSON document containing a budget object or {budget: ...}") { |v| opts[:request] = v }
-  o.on("--guardian-heartbeat-at UTC", "Guardian heartbeat proving guardian readiness for arm") { |v| opts[:guardian_heartbeat_at_utc] = v }
   o.on("--source SOURCE", "Heartbeat source: guardian or orchestrator") { |v| opts[:source] = v }
   o.on("--reason TEXT", "Durable teardown reason") { |v| opts[:reason] = v }
 end
@@ -57,14 +56,20 @@ def build_budget(root, budget_id, plan_sha256)
   )
 end
 
+def build_supervisor(root)
+  LocalModelEvaluation::RunpodBudgetGuardianSupervisor.new(
+    root:,
+    repo_root: ROOT
+  )
+end
+
 begin
   result = case command
            when "arm"
              raise OptionParser::MissingArgument, "--request" unless opts[:request]
-             raise OptionParser::MissingArgument, "--guardian-heartbeat-at" unless opts[:guardian_heartbeat_at_utc]
              request = read_budget_request(opts[:request])
              budget = build_budget(root, request.fetch("budget_id"), request.fetch("plan_sha256"))
-             budget.arm!(budget: request, guardian_heartbeat_at_utc: opts[:guardian_heartbeat_at_utc])
+             build_supervisor(root).arm!(budget:, request:)
            when "heartbeat"
              raise OptionParser::MissingArgument, "--source" unless opts[:source]
              budget = build_budget(root, opts[:budget_id], opts[:plan_sha256])
@@ -72,6 +77,9 @@ begin
            when "status"
              budget = build_budget(root, opts[:budget_id], opts[:plan_sha256])
              budget.status
+           when "guardian-status"
+             budget = build_budget(root, opts[:budget_id], opts[:plan_sha256])
+             build_supervisor(root).status(budget:)
            when "evaluate"
              budget = build_budget(root, opts[:budget_id], opts[:plan_sha256])
              budget.evaluate!
@@ -81,15 +89,18 @@ begin
              budget.begin_teardown!(reason: opts[:reason])
            when "close"
              budget = build_budget(root, opts[:budget_id], opts[:plan_sha256])
-             budget.close!
+             value = budget.close!
+             build_supervisor(root).disable!(budget:)
+             value
            else
              warn <<~USAGE
                Usage: bin/rpof budget COMMAND [options]
 
                Commands:
-                 arm --request FILE --guardian-heartbeat-at UTC
+                 arm --request FILE
                  heartbeat --budget-id ID --plan-sha256 SHA --source guardian|orchestrator
                  status --budget-id ID --plan-sha256 SHA
+                 guardian-status --budget-id ID --plan-sha256 SHA
                  evaluate --budget-id ID --plan-sha256 SHA
                  begin-teardown --budget-id ID --plan-sha256 SHA --reason TEXT
                  close --budget-id ID --plan-sha256 SHA
@@ -99,7 +110,8 @@ begin
 
   puts JSON.pretty_generate(result)
 rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError,
-       OptionParser::ParseError, LocalModelEvaluation::RunpodBudget::Error => e
+       OptionParser::ParseError, LocalModelEvaluation::RunpodBudget::Error,
+       LocalModelEvaluation::RunpodBudgetGuardianSupervisor::Error => e
   warn "ERROR: #{e.message}"
   exit 1
 end

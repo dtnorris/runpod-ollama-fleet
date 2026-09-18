@@ -1,0 +1,62 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "local_model_evaluation"
+
+opts = {
+  state_root: nil,
+  repo_root: ROOT,
+  fleet_state_root: nil,
+  fleet_state_repo_root: nil,
+  budget_id: nil,
+  plan_sha256: nil,
+  enabled: nil,
+  runtime: nil
+}
+
+OptionParser.new do |o|
+  o.on("--state-root PATH") { |v| opts[:state_root] = v }
+  o.on("--repo-root PATH") { |v| opts[:repo_root] = v }
+  o.on("--fleet-state-root PATH") { |v| opts[:fleet_state_root] = v }
+  o.on("--fleet-state-repo-root PATH") { |v| opts[:fleet_state_repo_root] = v }
+  o.on("--budget-id ID") { |v| opts[:budget_id] = v }
+  o.on("--plan-sha256 SHA") { |v| opts[:plan_sha256] = v }
+  o.on("--enabled PATH") { |v| opts[:enabled] = v }
+  o.on("--runtime PATH") { |v| opts[:runtime] = v }
+end.parse!(ARGV)
+
+%i[state_root repo_root fleet_state_root fleet_state_repo_root budget_id plan_sha256 enabled runtime].each do |key|
+  abort "ERROR: missing --#{key.to_s.tr('_', '-')}" if opts[key].to_s.empty?
+end
+abort "ERROR: unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+
+# Pin the fleet-state migration seam explicitly; launchd must not depend on the
+# environment of the AFIO process that originally armed the budget.
+ENV["RPOF_STATE_ROOT"] = File.expand_path(opts.fetch(:fleet_state_root))
+ENV["RPOF_STATE_REPO_ROOT"] = File.expand_path(opts.fetch(:fleet_state_repo_root))
+
+begin
+  guardian = LocalModelEvaluation::RunpodBudgetGuardian.new(
+    root: opts.fetch(:state_root),
+    repo_root: opts.fetch(:repo_root),
+    fleet_state_root: opts.fetch(:fleet_state_root),
+    fleet_state_repo_root: opts.fetch(:fleet_state_repo_root),
+    budget_id: opts.fetch(:budget_id),
+    plan_sha256: opts.fetch(:plan_sha256)
+  )
+  guardian.run(
+    enabled_path: opts.fetch(:enabled),
+    runtime_path: opts.fetch(:runtime)
+  )
+rescue LocalModelEvaluation::RunpodBudgetGuardian::Error,
+       LocalModelEvaluation::RunpodBudget::Error,
+       LocalModelEvaluation::RunpodClient::Error,
+       LocalModelEvaluation::RunpodFleet::Error,
+       LocalModelEvaluation::RunpodFleetNamespace::Error => e
+  warn "ERROR: budget guardian failed: #{e.message}"
+  exit 1
+end
