@@ -256,6 +256,41 @@ class RunpodBootstrapTest < Minitest::Test
     @clock = FakeClock.new
   end
 
+  def test_copy_progress_does_not_use_unrelated_filesystem_percentages
+    progress = parse_progress(<<~TEXT)
+      [3/8] Copy requested model from shared store to fast local/root store
+      Filesystem      Size  Used Avail Use% Mounted on
+      overlay          40G  2.2G   38G   6% /
+      Copying 22.29 GiB: sha256-deadbeef
+    TEXT
+
+    assert_equal "COPYING", progress.fetch(:stage)
+    assert_nil progress[:detail]
+  end
+
+  def test_latest_valid_copy_progress_marker_wins
+    progress = parse_progress(<<~TEXT)
+      [3/8] Copy requested model from shared store to fast local/root store
+      overlay 40G 2.2G 38G 6% /
+      LME_COPY_PROGRESS\tgemma4:26b\t100\t1000\t10.00
+      LME_COPY_PROGRESS\tgemma4:26b\t374\t1000\t37.40
+      LME_COPY_PROGRESS\tgemma4:26b\tbogus\t1000\t99.00
+    TEXT
+
+    assert_equal "COPYING", progress.fetch(:stage)
+    assert_equal "37%", progress.fetch(:detail)
+  end
+
+  def test_final_copy_progress_marker_reports_one_hundred_percent
+    progress = parse_progress(<<~TEXT)
+      [3/8] Copy requested model from shared store to fast local/root store
+      LME_COPY_PROGRESS\tgemma4:26b\t1000\t1000\t100.00
+    TEXT
+
+    assert_equal "COPYING", progress.fetch(:stage)
+    assert_equal "100%", progress.fetch(:detail)
+  end
+
   def test_parallel_bootstrap_emits_heartbeats_and_writes_only_current_fleet_run
     script = fake_remote_script(<<~'RUBY')
       worker = ARGV[ARGV.index("--worker") + 1]
@@ -697,6 +732,12 @@ class RunpodBootstrapTest < Minitest::Test
 
 
   private
+
+  def parse_progress(text)
+    path = File.join(@state_root, "copy-progress-fixture.log")
+    @store.seed_log(path, text)
+    build_runner("/virtual/fake-remote.sh").send(:progress_for, path)
+  end
 
   def build_runner(script, sleeper: nil)
     LocalModelEvaluation::RunpodBootstrap.new(

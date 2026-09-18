@@ -203,7 +203,10 @@ module LocalModelEvaluation
       when "interrupted" then "INTERRUPTED"
       else
         stage = record["stage"].to_s
-        stage.empty? ? record["status"].to_s.upcase : stage
+        return record["status"].to_s.upcase if stage.empty?
+
+        progress = record["progress"].to_s
+        stage == "COPYING" && !progress.empty? ? "#{stage} #{progress}" : stage
       end
     end
   end

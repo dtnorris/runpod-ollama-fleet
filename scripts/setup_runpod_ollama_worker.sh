@@ -470,17 +470,56 @@ for digest in digests:
     blob_paths.append((blob_name, source_blob))
     total_bytes += os.path.getsize(source_blob)
 
+CHUNK_SIZE = 16 * 1024 * 1024
+PROGRESS_INTERVAL_SECONDS = 1.0
+PROGRESS_PERCENT_STEP = 5.0
+
 started = time.monotonic()
+copied_bytes = 0
+progress_state = {"at": None, "percent": None}
+
+def emit_progress(force=False):
+    now = time.monotonic()
+    percent = (copied_bytes / total_bytes) * 100.0
+    last_at = progress_state["at"]
+    last_percent = progress_state["percent"]
+    if force and last_percent is not None and percent == last_percent:
+        return
+    should_emit = (
+        force
+        or last_at is None
+        or now - last_at >= PROGRESS_INTERVAL_SECONDS
+        or last_percent is None
+        or percent - last_percent >= PROGRESS_PERCENT_STEP
+    )
+    if not should_emit:
+        return
+    print(
+        f"LME_COPY_PROGRESS\t{model}\t{copied_bytes}\t{total_bytes}\t{percent:.2f}",
+        flush=True,
+    )
+    progress_state["at"] = now
+    progress_state["percent"] = percent
+
 os.makedirs(os.path.dirname(destination_manifest), exist_ok=True)
 os.makedirs(os.path.join(destination, "blobs"), exist_ok=True)
+emit_progress(force=True)
 for blob_name, source_blob in blob_paths:
     size = os.path.getsize(source_blob)
     print(f"Copying {size / 1024**3:.2f} GiB: {blob_name}", flush=True)
     destination_blob = os.path.join(destination, "blobs", blob_name)
     temporary_blob = destination_blob + ".partial"
-    shutil.copyfile(source_blob, temporary_blob)
+    with open(source_blob, "rb") as source_handle, open(temporary_blob, "wb") as destination_handle:
+        while True:
+            chunk = source_handle.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            destination_handle.write(chunk)
+            copied_bytes += len(chunk)
+            emit_progress()
     os.replace(temporary_blob, destination_blob)
 
+emit_progress(force=True)
 shutil.copyfile(source_manifest, destination_manifest)
 elapsed = max(time.monotonic() - started, 0.001)
 mib_per_second = (total_bytes / 1024**2) / elapsed

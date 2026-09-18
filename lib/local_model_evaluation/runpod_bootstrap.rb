@@ -399,6 +399,7 @@ module LocalModelEvaluation
         [/verification PASS: context=/, "VERIFIED"],
         [/\[6\/8\] Warm each model/, "WARMING"],
         [/Warming /, "WARMING"],
+        [/LME_COPY_PROGRESS\t/, "COPYING"],
         [/Copying completed Ollama store/, "COPYING"],
         [/Copy requested model from shared store/, "COPYING"],
         [/\b\d+(?:\.\d+)?[KMGT]\s+\d+%\s+\d+(?:\.\d+)?[KMGT]?B\/s/i, "COPYING"],
@@ -422,8 +423,13 @@ module LocalModelEvaluation
 
       stage = winner ? winner[1] : "STARTING"
       segment = winner ? text[winner[0]..] : text
-      percentages = segment.scan(/(?<!\d)(100|[1-9]?\d)%/).flatten
-      detail = %w[PULLING COPYING].include?(stage) && !percentages.empty? ? "#{percentages.last}%" : nil
+      detail = case stage
+               when "COPYING"
+                 copy_progress_detail(text)
+               when "PULLING"
+                 percentages = segment.scan(/(?<!\d)(100|[1-9]?\d)%/).flatten
+                 "#{percentages.last}%" unless percentages.empty?
+               end
       passed = text.include?("remote setup PASS")
       stage = "READY" if passed
 
@@ -433,6 +439,31 @@ module LocalModelEvaluation
         latest_line: latest_meaningful_line(text),
         passed:
       }
+    end
+
+    def copy_progress_detail(text)
+      latest = nil
+      text.each_line do |line|
+        payload = line.split("LME_COPY_PROGRESS\t", 2)[1]
+        next unless payload
+
+        model, copied_text, total_text, percent_text = payload.strip.split("\t", 4)
+        next if model.to_s.empty? || copied_text.nil? || total_text.nil? || percent_text.nil?
+
+        copied = Integer(copied_text, 10)
+        total = Integer(total_text, 10)
+        percent = Float(percent_text)
+        next unless total.positive? && copied.between?(0, total)
+        next unless percent.finite? && percent.between?(0.0, 100.0)
+
+        expected_percent = (copied * 100.0) / total
+        next if (percent - expected_percent).abs > 0.05
+
+        latest = "#{percent.round}%"
+      rescue ArgumentError, TypeError
+        next
+      end
+      latest
     end
 
     def provenance_for(path)

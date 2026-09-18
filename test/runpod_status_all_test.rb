@@ -141,6 +141,49 @@ class RunpodStatusAllTest < Minitest::Test
     refute_includes output, "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb"
   end
 
+  def test_bootstrap_copy_progress_renders_in_existing_column
+    bootstrap = bootstrap_worker(1, "pod_a")
+    bootstrap["status"] = "running"
+    bootstrap["stage"] = "COPYING"
+    bootstrap["progress"] = "37%"
+    fleet = entry(
+      "copying",
+      rate: 0.49,
+      accrued: 0.10,
+      workers: [worker(1, "pod_a", "NVIDIA A40", 0.49)],
+      bootstrap_workers: [bootstrap]
+    )
+
+    output = @overview.render(@overview.snapshot([fleet]))
+
+    assert_match(/^A\s+1\s+.*COPYING 37%$/, output)
+  end
+
+  def test_copying_without_progress_and_terminal_labels_remain_unchanged
+    copying = bootstrap_worker(1, "pod_a")
+    copying["status"] = "running"
+    copying["stage"] = "COPYING"
+    failed = bootstrap_worker(2, "pod_b")
+    failed["status"] = "failed"
+    failed["stage"] = "COPYING"
+    failed["progress"] = "91%"
+    fleet = entry(
+      "labels",
+      rate: 0.98,
+      accrued: 0.10,
+      workers: [
+        worker(1, "pod_a", "NVIDIA A40", 0.49),
+        worker(2, "pod_b", "NVIDIA A40", 0.49)
+      ],
+      bootstrap_workers: [copying, failed]
+    )
+
+    output = @overview.render(@overview.snapshot([fleet]))
+
+    assert_match(/^A\s+1\s+.*COPYING$/, output)
+    assert_match(/^A\s+2\s+.*FAILED$/, output)
+  end
+
   private
 
   def entry(key, rate:, accrued:, workers:, bootstrap_workers:, lme_status: "active")
