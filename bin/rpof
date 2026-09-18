@@ -16,6 +16,10 @@ when "capability-check"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-capability-check"), *ARGV
 when "dispatch"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-dispatch"), *ARGV
+when "dispatch-admit"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-dispatch-admit"), *ARGV
+when "dispatch-close"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-dispatch-close"), *ARGV
 when "capacity"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-capacity"), *ARGV
 when "fulfill"
@@ -56,6 +60,8 @@ else
       version
       capability-check
       dispatch
+      dispatch-admit
+      dispatch-close
       capacity
       fulfill
       execution-pool-fulfill

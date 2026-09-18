@@ -24,7 +24,7 @@ class RpofDispatchV01Test < Minitest::Test
       self.class.last_init = kwargs
       @output_dir = kwargs.fetch(:output_dir)
     end
-    def run(jobs:, worker_indices:, group_by_affinity:)
+    def run(jobs:, worker_indices:, group_by_affinity:, dynamic_worker_admission: false)
       FileUtils.mkdir_p(@output_dir)
       File.write(File.join(@output_dir, "manifest.json"), JSON.generate({
         "fleet_id" => "20260914T120000Z-fixture", "worker_indices" => worker_indices,
@@ -36,6 +36,7 @@ class RpofDispatchV01Test < Minitest::Test
         "started_at_utc" => "2026-09-14T12:00:00Z",
         "finished_at_utc" => "2026-09-14T12:00:01Z",
         "status" => "completed", "worker_count" => 1, "job_count" => 1,
+        "worker_indices" => worker_indices,
         "completed_count" => 1, "failed_count" => 0, "not_started_count" => 0,
         "not_started_job_ids" => [], "infrastructure_failures" => [],
         "jobs" => [{
@@ -65,8 +66,9 @@ class RpofDispatchV01Test < Minitest::Test
       summary = RunpodOllamaFleet::DispatchV01.new(
         fleet_state: FakeState.new, fleet_key: "default", workdir: workdir,
         output_dir: output, provider_repo_root: root, dispatcher_class: FakeDispatcher
-      ).run(request)
+      ).run(request, dynamic_worker_admission: true)
       assert_equal "afio-rpof-dispatch-summary/v0.1", summary.fetch("contract_version")
+      assert_equal [1], summary.fetch("worker_indices")
       refute summary.fetch("jobs").first.key?("worker_url")
       assert_equal File.expand_path(workdir), FakeDispatcher.last_init.fetch(:workdir)
       persisted = JSON.parse(File.read(File.join(output, "summary.json")))

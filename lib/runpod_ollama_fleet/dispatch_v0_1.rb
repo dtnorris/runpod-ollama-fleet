@@ -24,7 +24,7 @@ module RunpodOllamaFleet
 
     attr_reader :output_dir
 
-    def run(request)
+    def run(request, dynamic_worker_admission: false)
       ContractV01.validate_dispatch_request!(request)
       started = utc_now
       target = request.fetch("target")
@@ -49,13 +49,16 @@ module RunpodOllamaFleet
         repo_root: @provider_repo_root,
         workdir: @workdir,
         out: @out,
-        drain_checker: drain_checker
+        drain_checker: drain_checker,
+        fleet_key: @fleet_key
       )
-      private_summary = dispatcher.run(
+      run_args = {
         jobs: request.fetch("jobs"),
         worker_indices: target.fetch("worker_indices"),
         group_by_affinity: request.fetch("group_by_affinity")
-      )
+      }
+      run_args[:dynamic_worker_admission] = true if dynamic_worker_admission
+      private_summary = dispatcher.run(**run_args)
       public_summary = public_summary(private_summary)
       write_summary(public_summary)
       public_summary
@@ -163,6 +166,7 @@ module RunpodOllamaFleet
         "finished_at_utc" => private_summary.fetch("finished_at_utc"),
         "status" => private_summary.fetch("status"),
         "worker_count" => Integer(private_summary.fetch("worker_count")),
+        "worker_indices" => Array(private_summary["worker_indices"]).map { |value| Integer(value) }.uniq.sort,
         "job_count" => Integer(private_summary.fetch("job_count")),
         "completed_count" => Integer(private_summary.fetch("completed_count")),
         "failed_count" => Integer(private_summary.fetch("failed_count")),

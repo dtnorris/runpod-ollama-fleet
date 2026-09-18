@@ -4,6 +4,7 @@ require "fileutils"
 require "json"
 require "time"
 require "uri"
+require_relative "runpod_dispatch_admission"
 require_relative "runpod_fleet_state"
 require_relative "runpod_tunnels"
 require_relative "runpod_workers"
@@ -99,25 +100,30 @@ module LocalModelEvaluation
 
     def initialize(fleet_state:, output_dir:, repo_root:, out: $stdout,
                    endpoint_checker: nil, command_runner: nil,
-                   wall_clock: nil, monotonic_clock: nil, workdir: nil, drain_checker: nil)
+                   wall_clock: nil, monotonic_clock: nil, workdir: nil, drain_checker: nil,
+                   fleet_key: "default", admission_poll_seconds: 0.25)
       @fleet_state = fleet_state
       @output_dir = File.expand_path(output_dir)
       @repo_root = File.expand_path(repo_root)
       @workdir = File.expand_path(workdir || repo_root)
+      @fleet_key = fleet_key.to_s
       @out = out
       @endpoint_checker = endpoint_checker || RunpodTunnels::HttpHealthChecker.new
       @command_runner = command_runner || SystemCommandRunner.new
       @wall_clock = wall_clock || -> { Time.now.utc }
       @monotonic_clock = monotonic_clock || -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
       @drain_checker = drain_checker
+      @admission_poll_seconds = Float(admission_poll_seconds)
+      raise ArgumentError, "admission poll seconds must be positive" unless @admission_poll_seconds.positive?
       @state_mutex = Mutex.new
       @results = []
       @infrastructure_failures = []
+      @participating_workers = []
     end
 
     attr_reader :output_dir
 
-    def run(jobs:, worker_indices:, group_by_affinity: false)
+    def run(jobs:, worker_indices:, group_by_affinity: false, dynamic_worker_admission: false)
       reset_run_state!
       jobs = normalize_jobs(jobs)
       raise Error, "at least one job is required" if jobs.empty?
@@ -125,55 +131,83 @@ module LocalModelEvaluation
       fleet = active_fleet!
       workers = selected_workers(fleet, worker_indices)
       started_at = utc_now
-      pending_jobs = prepare_output!(fleet:, workers:, jobs:, started_at:, group_by_affinity:)
+      pending_jobs = prepare_output!(
+        fleet:, workers:, jobs:, started_at:, group_by_affinity:, dynamic_worker_admission:
+      )
 
       queue = Queue.new
       ordered_jobs(pending_jobs, group_by_affinity:).each { |job| queue << job }
       threads = []
+      threads_mutex = Mutex.new
+      admission = nil
+      admission_thread = nil
       begin
-        workers.each do |worker|
-          threads << Thread.new do
-            begin
-              worker_loop(queue, fleet.fetch("fleet_id"), worker)
-            rescue StandardError => e
-              record_infrastructure_failure(
-                worker,
-                InfrastructureError.new("dispatcher worker loop crashed: #{e.class}: #{e.message}")
-              )
-            end
-          end
+        workers.each { |worker| register_participating_worker(worker) }
+        if dynamic_worker_admission
+          admission = RunpodDispatchAdmission.new(
+            output_dir:,
+            fleet_state: @fleet_state,
+            fleet_key: @fleet_key,
+            wall_clock: @wall_clock
+          )
+          admission.open!(
+            fleet_id: fleet.fetch("fleet_id"),
+            initial_worker_indices: workers.map { |worker| Integer(worker.fetch("index")) }
+          )
         end
-        threads.each(&:join)
+
+        workers.each do |worker|
+          spawn_worker_thread(
+            threads:, threads_mutex:, queue:, fleet_id: fleet.fetch("fleet_id"), worker:
+          )
+        end
+        if admission
+          admission_thread = Thread.new do
+            admission_loop(
+              admission:, queue:, fleet_id: fleet.fetch("fleet_id"),
+              threads:, threads_mutex:
+            )
+          end
+          admission_thread.value
+        end
+        join_worker_threads(threads, threads_mutex)
       rescue Interrupt
         request_stop!
+        admission&.close!
         @command_runner.cancel_all if @command_runner.respond_to?(:cancel_all)
-        threads.each do |thread|
-          thread.join
-        rescue StandardError
-          nil
-        end
+        admission_thread&.join rescue nil
+        join_worker_threads(threads, threads_mutex)
 
         summary = build_summary(
           fleet_id: fleet.fetch("fleet_id"),
           jobs:,
-          workers:,
+          workers: participating_workers,
           started_at:
         )
         summary["status"] = "interrupted"
         summary["interrupted"] = true
         write_json(File.join(output_dir, "summary.json"), summary)
         raise
+      rescue StandardError
+        request_stop!
+        admission&.close!
+        @command_runner.cancel_all if @command_runner.respond_to?(:cancel_all)
+        admission_thread&.join rescue nil
+        join_worker_threads(threads, threads_mutex)
+        raise
+      ensure
+        admission&.close! rescue nil
       end
 
       summary = build_summary(
         fleet_id: fleet.fetch("fleet_id"),
         jobs:,
-        workers:,
+        workers: participating_workers,
         started_at:
       )
       write_json(File.join(output_dir, "summary.json"), summary)
       summary
-    rescue RunpodFleetState::Error, RunpodWorkers::Error => e
+    rescue RunpodFleetState::Error, RunpodWorkers::Error, RunpodDispatchAdmission::Error => e
       raise InfrastructureError, e.message
     end
 
@@ -183,6 +217,7 @@ module LocalModelEvaluation
       @state_mutex.synchronize do
         @results.clear
         @infrastructure_failures.clear
+        @participating_workers.clear
         @stop_requested = false
         @drained = false
       end
@@ -299,6 +334,104 @@ module LocalModelEvaluation
       selected
     rescue KeyError, ArgumentError, TypeError => e
       raise InfrastructureError, "invalid fleet worker state: #{e.message}"
+    end
+
+    def spawn_worker_thread(threads:, threads_mutex:, queue:, fleet_id:, worker:)
+      thread = Thread.new do
+        begin
+          worker_loop(queue, fleet_id, worker)
+        rescue StandardError => e
+          record_infrastructure_failure(
+            worker,
+            InfrastructureError.new("dispatcher worker loop crashed: #{e.class}: #{e.message}")
+          )
+        end
+      end
+      threads_mutex.synchronize { threads << thread }
+      thread
+    end
+
+    def join_worker_threads(threads, mutex)
+      mutex.synchronize { threads.dup }.each do |thread|
+        thread.join
+      rescue StandardError
+        nil
+      end
+    end
+
+    def admission_loop(admission:, queue:, fleet_id:, threads:, threads_mutex:)
+      seen = participating_workers.to_h do |worker|
+        [Integer(worker.fetch("index")), true]
+      end
+
+      loop do
+        break if stop_requested?
+        if drain_requested?
+          mark_drained!
+          break
+        end
+
+        admission.events.each do |event|
+          index = Integer(event.fetch("worker_index"))
+          next if seen[index]
+
+          worker = admitted_worker!(fleet_id, event)
+          seen[index] = true
+          register_participating_worker(worker)
+          @out.puts "Admitting burst_#{index} to running dispatch."
+          spawn_worker_thread(
+            threads:, threads_mutex:, queue:, fleet_id:, worker:
+          )
+        end
+
+        break if queue.empty?
+        break unless admission.open?
+
+        sleep @admission_poll_seconds
+      end
+      admission.close! if queue.empty? || stop_requested? || drained?
+    rescue RunpodDispatchAdmission::Error, KeyError, ArgumentError, TypeError => e
+      raise InfrastructureError, "dynamic worker admission failed: #{e.message}"
+    end
+
+    def admitted_worker!(fleet_id, event)
+      fleet = active_fleet!
+      unless fleet.fetch("fleet_id") == fleet_id
+        raise InfrastructureError, "active fleet changed during dynamic worker admission"
+      end
+
+      index = RunpodWorkers.validate_index(event.fetch("worker_index"))
+      worker = Array(fleet.fetch("workers")).find do |candidate|
+        Integer(candidate.fetch("index")) == index
+      rescue KeyError, ArgumentError, TypeError
+        false
+      end
+      raise InfrastructureError, "admitted worker burst_#{index} disappeared from fleet state" unless worker
+      raise InfrastructureError, "admitted worker burst_#{index} is not active" unless worker["status"] == "active"
+      unless worker.fetch("pod_id").to_s == event.fetch("pod_id").to_s &&
+             worker.fetch("local_ollama_url").to_s == event.fetch("local_ollama_url").to_s
+        raise InfrastructureError, "admitted worker burst_#{index} routing changed before dispatch admission"
+      end
+      validate_endpoint!(worker.fetch("local_ollama_url"))
+      worker
+    rescue RunpodWorkers::Error, KeyError, ArgumentError, TypeError => e
+      raise InfrastructureError, e.message
+    end
+
+    def register_participating_worker(worker)
+      @state_mutex.synchronize do
+        index = Integer(worker.fetch("index"))
+        unless @participating_workers.any? { |candidate| Integer(candidate.fetch("index")) == index }
+          @participating_workers << Marshal.load(Marshal.dump(worker))
+        end
+      end
+    end
+
+    def participating_workers
+      @state_mutex.synchronize do
+        @participating_workers.sort_by { |worker| Integer(worker.fetch("index")) }
+                              .map { |worker| Marshal.load(Marshal.dump(worker)) }
+      end
     end
 
     def worker_loop(queue, fleet_id, planned_worker)
@@ -440,18 +573,22 @@ module LocalModelEvaluation
                 "#{record.fetch('error')}"
     end
 
-    def prepare_output!(fleet:, workers:, jobs:, started_at:, group_by_affinity:)
-      return prepare_resume!(jobs, group_by_affinity:) if File.exist?(output_dir)
+    def prepare_output!(fleet:, workers:, jobs:, started_at:, group_by_affinity:, dynamic_worker_admission:)
+      if File.exist?(output_dir)
+        return prepare_resume!(jobs, group_by_affinity:, dynamic_worker_admission:)
+      end
 
       FileUtils.mkdir_p(File.join(output_dir, "jobs"))
       write_json(
         File.join(output_dir, "manifest.json"),
-        manifest(fleet:, workers:, jobs:, started_at:, group_by_affinity:)
+        manifest(
+          fleet:, workers:, jobs:, started_at:, group_by_affinity:, dynamic_worker_admission:
+        )
       )
       jobs
     end
 
-    def prepare_resume!(jobs, group_by_affinity:)
+    def prepare_resume!(jobs, group_by_affinity:, dynamic_worker_admission:)
       unless File.directory?(output_dir)
         raise Error, "output path exists but is not a directory: #{output_dir}"
       end
@@ -462,7 +599,7 @@ module LocalModelEvaluation
       end
 
       existing_manifest = read_json!(manifest_path, label: "existing manifest")
-      validate_resume_manifest!(existing_manifest, jobs, group_by_affinity:)
+      validate_resume_manifest!(existing_manifest, jobs, group_by_affinity:, dynamic_worker_admission:)
 
       prior_results = []
       pending_jobs = []
@@ -494,7 +631,7 @@ module LocalModelEvaluation
       pending_jobs
     end
 
-    def validate_resume_manifest!(existing_manifest, jobs, group_by_affinity:)
+    def validate_resume_manifest!(existing_manifest, jobs, group_by_affinity:, dynamic_worker_admission:)
       unless existing_manifest.is_a?(Hash) && existing_manifest["schema_version"] == SCHEMA_VERSION
         raise Error, "existing manifest has unsupported schema_version"
       end
@@ -504,6 +641,13 @@ module LocalModelEvaluation
         raise Error,
               "existing output manifest affinity grouping does not match requested dispatch; " \
               "use the original grouping mode or a new --output path"
+      end
+
+      existing_dynamic = existing_manifest["dynamic_worker_admission"] == true
+      unless existing_dynamic == dynamic_worker_admission
+        raise Error,
+              "existing output manifest dynamic worker admission mode does not match requested dispatch; " \
+              "use the original mode or a new --output path"
       end
 
       expected_jobs = manifest_jobs(jobs)
@@ -576,7 +720,7 @@ module LocalModelEvaluation
       raise Error, "could not read #{label}: #{e.message}"
     end
 
-    def manifest(fleet:, workers:, jobs:, started_at:, group_by_affinity:)
+    def manifest(fleet:, workers:, jobs:, started_at:, group_by_affinity:, dynamic_worker_admission:)
       document = {
         "schema_version" => SCHEMA_VERSION,
         "fleet_id" => fleet.fetch("fleet_id"),
@@ -586,6 +730,7 @@ module LocalModelEvaluation
         "jobs" => manifest_jobs(jobs)
       }
       document["affinity_grouping"] = true if group_by_affinity
+      document["dynamic_worker_admission"] = true if dynamic_worker_admission
       document
     end
 
@@ -646,6 +791,7 @@ module LocalModelEvaluation
                       "completed"
                     end,
         "worker_count" => workers.length,
+        "worker_indices" => workers.map { |worker| Integer(worker.fetch("index")) }.uniq.sort,
         "job_count" => jobs.length,
         "completed_count" => countable_results.count { |result| result["status"] == "completed" },
         "failed_count" => countable_results.count { |result| result["status"] == "failed" },

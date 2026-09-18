@@ -10,12 +10,13 @@ require "runpod_ollama_fleet"
 require "local_model_evaluation/runpod_fleet_namespace"
 require "local_model_evaluation/runpod_fleet_state"
 
-opts = { request: nil, workdir: nil, output: nil }
+opts = { request: nil, workdir: nil, output: nil, dynamic_worker_admission: false }
 parser = OptionParser.new do |o|
   o.banner = "Usage: bin/rpof dispatch --request FILE --workdir DIR --output DIR"
   o.on("--request FILE") { |v| opts[:request] = v }
   o.on("--workdir DIR") { |v| opts[:workdir] = v }
   o.on("--output DIR") { |v| opts[:output] = v }
+  o.on("--dynamic-worker-admission", "Allow already-prepared workers to join while jobs remain unclaimed") { opts[:dynamic_worker_admission] = true }
 end
 
 begin
@@ -47,7 +48,7 @@ begin
     workdir: opts.fetch(:workdir),
     output_dir: opts.fetch(:output),
     provider_repo_root: namespace.repo_root
-  ).run(request)
+  ).run(request, dynamic_worker_admission: opts.fetch(:dynamic_worker_admission))
   puts "Dispatch #{summary.fetch('status')}: #{summary.fetch('completed_count')} completed, #{summary.fetch('failed_count')} failed, #{summary.fetch('not_started_count')} not started."
   exit(summary.fetch("status") == "completed" ? 0 : 1)
 rescue LocalModelEvaluation::RunpodFleetNamespace::Error => e

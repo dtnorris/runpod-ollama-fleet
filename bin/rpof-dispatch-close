@@ -1,0 +1,54 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "local_model_evaluation/runpod_dispatch_admission"
+require "local_model_evaluation/runpod_fleet_namespace"
+require "local_model_evaluation/runpod_fleet_state"
+
+opts = {
+  fleet: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY),
+  output: nil
+}
+parser = OptionParser.new do |o|
+  o.banner = "Usage: bin/rpof dispatch-close --fleet KEY --output DIR"
+  o.on("--fleet KEY") { |v| opts[:fleet] = v }
+  o.on("--output DIR") { |v| opts[:output] = v }
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::MissingArgument, "--output" unless opts[:output]
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+rescue OptionParser::ParseError => e
+  warn "ERROR: #{e.message}"
+  warn parser
+  exit 2
+end
+
+begin
+  namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
+    root: File.join(ROOT, "output", "runpod-fleets"),
+    repo_root: ROOT,
+    fleet_key: opts.fetch(:fleet)
+  )
+  state = LocalModelEvaluation::RunpodFleetState.new(
+    root: namespace.state_root,
+    local_port_base: namespace.local_port_base
+  )
+  result = LocalModelEvaluation::RunpodDispatchAdmission.new(
+    output_dir: opts.fetch(:output),
+    fleet_state: state,
+    fleet_key: namespace.fleet_key
+  ).close!
+  raise LocalModelEvaluation::RunpodDispatchAdmission::Error, "dispatch admission control is not initialized" unless result
+  puts "Dispatch admission closed for fleet #{result.fetch('fleet_id')}."
+rescue LocalModelEvaluation::RunpodFleetNamespace::Error,
+       LocalModelEvaluation::RunpodDispatchAdmission::Error,
+       KeyError => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end
