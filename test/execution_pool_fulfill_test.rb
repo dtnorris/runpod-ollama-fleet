@@ -7,6 +7,9 @@ require_relative "../lib/runpod_ollama_fleet/execution_pool_fulfill"
 class ExecutionPoolFulfillTest < Minitest::Test
   DIGEST = "a" * 64
   PLAN = "b" * 64
+  SHARED_MODEL = "shared/qwen35"
+  GLOBAL_VOLUME_ID = "global-123"
+  OLLAMA_STORE_PATH = "/workspace-global/ollama-models"
 
   class FakeHardware
     def profile_for(model)
@@ -14,7 +17,10 @@ class ExecutionPoolFulfillTest < Minitest::Test
       RunpodOllamaFleet::ExecutionPoolHardware::Profile.new(
         model:,
         cloud: "SECURE",
-        gpu_ids: ["NVIDIA A40", "NVIDIA RTX A6000"]
+        gpu_ids: ["NVIDIA A40", "NVIDIA RTX A6000"],
+        shared_model: SHARED_MODEL,
+        global_volume_id: GLOBAL_VOLUME_ID,
+        ollama_store_path: OLLAMA_STORE_PATH
       )
     end
   end
@@ -139,20 +145,27 @@ class ExecutionPoolFulfillTest < Minitest::Test
     assert_equal ["NVIDIA A40", "NVIDIA RTX A6000"], fulfill.each_index.filter_map { |i| fulfill[i + 1] if fulfill[i] == "--gpu" }
     assert_equal "3.0", fulfill.fetch(fulfill.index("--max-hourly-usd") + 1)
     assert_equal "6.0", fulfill.fetch(fulfill.index("--max-total-hourly-usd") + 1)
+    assert_equal GLOBAL_VOLUME_ID, fulfill.fetch(fulfill.index("--global-volume-id") + 1)
 
     bootstrap = runner.calls.find { |row| row.fetch(:argv)[1] == "bootstrap" }.fetch(:argv)
-    assert_includes bootstrap, "qwen3.6:35b-a3b-q4_K_M"
-    assert_includes bootstrap, "qwen3.6:35b-a3b-q4_K_M=#{DIGEST}"
+    assert_equal SHARED_MODEL, bootstrap.fetch(bootstrap.index("--model") + 1)
+    assert_includes bootstrap, "#{SHARED_MODEL}=#{DIGEST}"
+    assert_equal OLLAMA_STORE_PATH, bootstrap.fetch(bootstrap.index("--copy-from-shared-store") + 1)
+    refute_includes bootstrap, request.dig("requirements", "pull_model")
 
     tunnels = runner.calls.find { |row| row.fetch(:argv)[1] == "tunnels" }
     assert_equal result.fetch("execution_handle"), tunnels.dig(:env, "LME_RUNPOD_FLEET")
 
     alias_call = runner.calls.find { |row| row.fetch(:argv)[1] == "runtime-alias" }.fetch(:argv)
+    assert_equal SHARED_MODEL, alias_call.fetch(alias_call.index("--source-model") + 1)
     assert_equal "qwen3.6:35b-a3b", alias_call.fetch(alias_call.index("--runtime-model") + 1)
     assert_equal "afio-rpof-capability-check-request/v0.2", runner.capability_request.fetch("contract_version")
     capability_model = runner.capability_request.dig("requirements", "models", 0)
     assert_equal "qwen3.6:35b-a3b", capability_model.fetch("name")
     assert_equal DIGEST, capability_model.fetch("expected_digest")
+    assert_equal GLOBAL_VOLUME_ID, result.dig("hardware_policy", "global_volume_id")
+    assert_equal SHARED_MODEL, result.dig("hardware_policy", "shared_model")
+    assert_equal OLLAMA_STORE_PATH, result.dig("hardware_policy", "ollama_store_path")
   end
 
   def test_failed_readiness_tears_down_only_new_capacity

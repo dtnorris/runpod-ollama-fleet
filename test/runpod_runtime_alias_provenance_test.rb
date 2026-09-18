@@ -5,6 +5,7 @@ require "tmpdir"
 require "fileutils"
 require "json"
 require_relative "../lib/local_model_evaluation/runpod_runtime_alias"
+require_relative "../lib/local_model_evaluation/runpod_fleet_state"
 
 class RunpodRuntimeAliasProvenanceTest < Minitest::Test
   DIGEST = "d" * 64
@@ -30,6 +31,14 @@ class RunpodRuntimeAliasProvenanceTest < Minitest::Test
 
     def artifact_dir(fleet_id, kind)
       File.join(@root, fleet_id, kind)
+    end
+  end
+
+  def test_real_fleet_state_accepts_runtime_alias_artifact_directory
+    Dir.mktmpdir("runtime-alias-artifact-dir-") do |root|
+      state = LocalModelEvaluation::RunpodFleetState.new(root:)
+      path = state.artifact_dir("20260918T000000Z-pod1", "runtime-alias")
+      assert_equal File.join(root, "20260918T000000Z-pod1", "runtime-alias"), path
     end
   end
 

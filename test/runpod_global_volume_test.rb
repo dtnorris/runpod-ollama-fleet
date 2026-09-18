@@ -6,6 +6,7 @@ require "stringio"
 require "tmpdir"
 require_relative "../lib/local_model_evaluation/runpod_client"
 require_relative "../lib/local_model_evaluation/runpod_fleet"
+require_relative "../lib/local_model_evaluation/runpod_fleet_lifecycle"
 
 class RunpodGlobalVolumeTest < Minitest::Test
   GLOBAL_VOLUME_ID = "cmu4n7zhq000007lb6u7f43m9"
@@ -148,6 +149,51 @@ class RunpodGlobalVolumeTest < Minitest::Test
         body.fetch("mounts")
       )
       assert_equal "/workspace-global", body.fetch("volumeMounts").fetch(0).fetch("mountPath")
+    end
+  end
+
+  def test_lifecycle_preserves_global_volume_for_scaled_workers
+    Dir.mktmpdir("rpof-global-volume-lifecycle-") do |dir|
+      lifecycle = LocalModelEvaluation::RunpodFleetLifecycle.new(
+        client: Object.new,
+        fleet_state: Object.new,
+        env_path: File.join(dir, ".env"),
+        fleet_key: "fixture",
+        local_port_base: 11_441,
+        out: StringIO.new
+      )
+      fleet = {
+        "provisioning" => {
+          "container_disk_gb" => 30,
+          "volume_gb" => nil,
+          "global_volume_id" => GLOBAL_VOLUME_ID,
+          "global_volume_type" => "OBJECT_STORE_VOLUME",
+          "global_volume_mount_path" => "/workspace-global"
+        }
+      }
+
+      profile = lifecycle.send(:provisioning_profile!, fleet)
+      assert_nil profile.fetch("volume_gb")
+      assert_nil profile.fetch("network_volume_id")
+      assert_equal GLOBAL_VOLUME_ID, profile.fetch("global_volume_id")
+
+      body = lifecycle.send(
+        :create_body,
+        2,
+        PUBLIC_KEY,
+        "SECURE",
+        profile:,
+        gpu_id: "NVIDIA A40"
+      )
+      assert_equal({}, body.fetch("mounts"))
+      assert_equal(
+        [{
+          "volumeId" => GLOBAL_VOLUME_ID,
+          "volumeType" => "OBJECT_STORE_VOLUME",
+          "mountPath" => "/workspace-global"
+        }],
+        body.fetch("volumeMounts")
+      )
     end
   end
 

@@ -12,8 +12,12 @@ class ExecutionPoolHardwareTest < Minitest::Test
         ---
         contract_version: rpof-execution-pool-hardware/v0.1
         default_cloud: SECURE
+        global_volume:
+          id: global-123
+          ollama_store_path: /workspace-global/ollama-models
         models:
           qwen3.6:35b-a3b:
+            shared_model: qwen3.6:35b-a3b-q4_K_M
             qualified_gpus:
               - NVIDIA A40
               - NVIDIA RTX A6000
@@ -21,6 +25,9 @@ class ExecutionPoolHardwareTest < Minitest::Test
       profile = RunpodOllamaFleet::ExecutionPoolHardware.new(path:).profile_for("qwen3.6:35b-a3b")
       assert_equal "SECURE", profile.cloud
       assert_equal ["NVIDIA A40", "NVIDIA RTX A6000"], profile.gpu_ids
+      assert_equal "qwen3.6:35b-a3b-q4_K_M", profile.shared_model
+      assert_equal "global-123", profile.global_volume_id
+      assert_equal "/workspace-global/ollama-models", profile.ollama_store_path
 
       assert_raises(RunpodOllamaFleet::ExecutionPoolHardware::Error) do
         RunpodOllamaFleet::ExecutionPoolHardware.new(path:).profile_for("unknown-model")

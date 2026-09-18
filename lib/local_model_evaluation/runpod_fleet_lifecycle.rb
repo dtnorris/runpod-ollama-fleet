@@ -430,14 +430,30 @@ module LocalModelEvaluation
       result = {
         "container_disk_gb" => positive_integer(profile["container_disk_gb"], "recorded container disk size")
       }
+
+      if profile["global_volume_id"]
+        id = profile.fetch("global_volume_id").to_s.strip
+        raise Error, "recorded global volume id is empty" if id.empty?
+        unless profile["global_volume_type"] == RunpodFleet::GLOBAL_VOLUME_TYPE &&
+               profile["global_volume_mount_path"] == RunpodFleet::GLOBAL_VOLUME_MOUNT_PATH
+          raise Error, "recorded global volume contract is invalid"
+        end
+        result["global_volume_id"] = id
+      end
+
       if profile["network_volume_id"]
         id = profile.fetch("network_volume_id").to_s.strip
         raise Error, "recorded network volume id is empty" if id.empty?
         result["volume_gb"] = nil
         result["network_volume_id"] = id
-      else
+      elsif profile["volume_gb"]
         result["volume_gb"] = positive_integer(profile["volume_gb"], "recorded workspace volume size")
         result["network_volume_id"] = nil
+      elsif result["global_volume_id"]
+        result["volume_gb"] = nil
+        result["network_volume_id"] = nil
+      else
+        raise Error, "recorded provisioning metadata has no workspace or Global Volume storage"
       end
       result
     end
@@ -521,10 +537,12 @@ module LocalModelEvaluation
     def create_body(index, ssh_public_key, cloud, profile:, gpu_id:)
       mounts = if profile["network_volume_id"]
                  { "network" => [{ "volumeId" => profile.fetch("network_volume_id"), "path" => RunpodFleet::VOLUME_MOUNT_PATH }] }
-               else
+               elsif profile["volume_gb"]
                  { "persistent" => { "size" => profile.fetch("volume_gb"), "path" => RunpodFleet::VOLUME_MOUNT_PATH } }
+               else
+                 {}
                end
-      {
+      body = {
         "name" => worker_name(index),
         "image" => RunpodFleet::IMAGE,
         "disk" => profile.fetch("container_disk_gb"),
@@ -534,6 +552,14 @@ module LocalModelEvaluation
         "cloud" => cloud,
         "gpu" => { "id" => normalize_gpu_id(gpu_id), "count" => 1 }
       }
+      if profile["global_volume_id"]
+        body["volumeMounts"] = [{
+          "volumeId" => profile.fetch("global_volume_id"),
+          "volumeType" => RunpodFleet::GLOBAL_VOLUME_TYPE,
+          "mountPath" => RunpodFleet::GLOBAL_VOLUME_MOUNT_PATH
+        }]
+      end
+      body
     end
 
     def wait_until_ready(created, cloud:, gpu_id:, wait_seconds:, poll_seconds:)

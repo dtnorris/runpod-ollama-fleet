@@ -10,7 +10,7 @@ module LocalModelEvaluation
     SCHEMA_VERSION = 1
     STATE_FILE = "fleet.json"
     CURRENT_FILE = "current"
-    ARTIFACT_DIRS = %w[bootstrap tunnels lease].freeze
+    ARTIFACT_DIRS = %w[bootstrap tunnels lease runtime-alias].freeze
     DEFAULT_LOCAL_PORT_BASE = 11_441
 
     class Error < StandardError; end
@@ -94,7 +94,8 @@ module LocalModelEvaluation
         "artifact_dirs" => {
           "bootstrap" => "bootstrap",
           "tunnels" => "tunnels",
-          "lease" => "lease"
+          "lease" => "lease",
+          "runtime-alias" => "runtime-alias"
         }
       }
       record["lease"] = lease if lease

@@ -92,9 +92,9 @@ module RunpodOllamaFleet
       worker_indices = (1..final_workers).to_a
       begin
         invoke_keep(handle)
-        invoke_bootstrap(handle, worker_indices, requirements)
+        invoke_bootstrap(handle, worker_indices, requirements, profile)
         invoke_tunnels(handle, worker_indices)
-        alias_evidence = invoke_runtime_alias(handle, worker_indices, requirements)
+        alias_evidence = invoke_runtime_alias(handle, worker_indices, requirements, profile)
         capability = invoke_capability(handle, worker_indices, requirements)
         unless capability.fetch("ready")
           failures = Array(capability["diagnostics"]).select { |row| row["status"] == "FAIL" }
@@ -160,6 +160,7 @@ module RunpodOllamaFleet
           "--target-workers", capacity.fetch("desired_workers").to_s,
           "--minimum-workers", capacity.fetch("minimum_workers").to_s,
           "--cloud", profile.cloud,
+          "--global-volume-id", profile.global_volume_id,
           "--max-hourly-per-worker", capacity.fetch("max_pool_hourly_usd").to_s,
           "--max-hourly-usd", capacity.fetch("max_pool_hourly_usd").to_s,
           "--max-total-hourly-usd", capacity.fetch("max_total_hourly_usd").to_s,
@@ -189,15 +190,16 @@ module RunpodOllamaFleet
       raise Error, "could not reopen execution handle #{handle} for new work" unless exit_status.zero?
     end
 
-    def invoke_bootstrap(handle, worker_indices, requirements)
-      pull_model = requirements.fetch("pull_model")
+    def invoke_bootstrap(handle, worker_indices, requirements, profile)
+      shared_model = profile.shared_model
       digest = requirements.fetch("expected_digest")
       argv = [
         @executable, "bootstrap",
         "--fleet", handle,
         "--workers", worker_indices.join(","),
-        "--model", pull_model,
-        "--expect-digest", "#{pull_model}=#{digest}",
+        "--model", shared_model,
+        "--expect-digest", "#{shared_model}=#{digest}",
+        "--copy-from-shared-store", profile.ollama_store_path,
         "--context", requirements.fetch("required_context_length").to_s
       ]
       exit_status = @runner.run(argv)
@@ -212,13 +214,13 @@ module RunpodOllamaFleet
       raise Error, "tunnel startup failed with exit #{exit_status}" unless exit_status.zero?
     end
 
-    def invoke_runtime_alias(handle, worker_indices, requirements)
+    def invoke_runtime_alias(handle, worker_indices, requirements, profile)
       with_tempfile("runtime-alias-result") do |path|
         argv = [
           @executable, "runtime-alias",
           "--fleet", handle,
           "--workers", worker_indices.join(","),
-          "--source-model", requirements.fetch("pull_model"),
+          "--source-model", profile.shared_model,
           "--runtime-model", requirements.fetch("ollama_model"),
           "--expect-digest", requirements.fetch("expected_digest"),
           "--context", requirements.fetch("required_context_length").to_s,
@@ -305,7 +307,10 @@ module RunpodOllamaFleet
         },
         "hardware_policy" => {
           "cloud" => profile.cloud,
-          "qualified_gpu_ids" => profile.gpu_ids
+          "qualified_gpu_ids" => profile.gpu_ids,
+          "global_volume_id" => profile.global_volume_id,
+          "shared_model" => profile.shared_model,
+          "ollama_store_path" => profile.ollama_store_path
         },
         "runtime_alias_evidence" => runtime_alias_evidence,
         "capabilities" => capability && capability["capabilities"],

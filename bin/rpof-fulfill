@@ -25,6 +25,7 @@ opts = {
   container_disk_gb: LocalModelEvaluation::RunpodFleet::DEFAULT_CONTAINER_DISK_GB,
   volume_gb: nil,
   network_volume_id: nil,
+  global_volume_id: nil,
   ssh_public_key: ENV.fetch("RUNPOD_SSH_PUBLIC_KEY_PATH", "~/.ssh/id_ed25519.pub"),
   wait_seconds: LocalModelEvaluation::RunpodFleet::DEFAULT_WAIT_SECONDS,
   poll_seconds: LocalModelEvaluation::RunpodFleet::DEFAULT_POLL_SECONDS,
@@ -47,6 +48,7 @@ parser = OptionParser.new do |o|
   o.on("--max-spend-usd USD", Float, "Initial fleet spend lease") { |v| opts[:max_spend_usd] = v }
   o.on("--container-disk-gb N", Integer, "Initial worker container disk") { |v| opts[:container_disk_gb] = v }
   o.on("--network-volume-id ID", "Attach an existing network volume at /workspace") { |v| opts[:network_volume_id] = v }
+  o.on("--global-volume-id ID", "Attach an existing Global Volume at /workspace-global") { |v| opts[:global_volume_id] = v }
   o.on("--volume-gb N", Integer, "Initial persistent /workspace volume") { |v| opts[:volume_gb] = v }
   o.on("--ssh-public-key PATH", "OpenSSH public key file to authorize") { |v| opts[:ssh_public_key] = v }
   o.on("--wait-seconds N", Integer, "Maximum wait for each one-worker acquisition") { |v| opts[:wait_seconds] = v }
@@ -65,6 +67,9 @@ begin
   raise OptionParser::MissingArgument, "--max-hourly-per-worker" unless opts[:max_hourly_per_worker_usd]
   if opts[:network_volume_id] && opts[:volume_gb]
     raise OptionParser::InvalidArgument, "--network-volume-id cannot be combined with --volume-gb"
+  end
+  if opts[:global_volume_id] && opts[:volume_gb]
+    raise OptionParser::InvalidArgument, "--global-volume-id cannot be combined with --volume-gb"
   end
 rescue OptionParser::ParseError => e
   warn "ERROR: #{e.message}"
@@ -173,7 +178,8 @@ ensure
   File.delete(tmp) if defined?(tmp) && tmp && File.exist?(tmp)
 end
 
-def existing_policy_check!(record, gpu_ids:, cloud:, max_per_worker:, max_fleet:, max_runtime_seconds:, max_spend_usd:)
+def existing_policy_check!(record, gpu_ids:, cloud:, max_per_worker:, max_fleet:, max_runtime_seconds:, max_spend_usd:,
+                           global_volume_id:)
   return 0 unless record && record["status"] == "active"
   unless record.fetch("cloud").to_s == cloud
     raise LocalModelEvaluation::RunpodFulfillment::Error,
@@ -199,6 +205,14 @@ def existing_policy_check!(record, gpu_ids:, cloud:, max_per_worker:, max_fleet:
             format("existing burst_%d rate $%.4f/hr exceeds per-worker cap $%.4f/hr", worker.fetch("index"), rate, max_per_worker)
     end
   end
+  if global_volume_id
+    recorded_global_volume_id = record.dig("provisioning", "global_volume_id").to_s
+    unless recorded_global_volume_id == global_volume_id
+      raise LocalModelEvaluation::RunpodFulfillment::Error,
+            "existing fleet Global Volume #{recorded_global_volume_id.inspect} does not match requested #{global_volume_id.inspect}"
+    end
+  end
+
   current_rate = Float(record.fetch("fleet_hourly_rate_usd"))
   if current_rate > max_fleet
     raise LocalModelEvaluation::RunpodFulfillment::Error,
@@ -256,7 +270,8 @@ begin
     max_per_worker:,
     max_fleet:,
     max_runtime_seconds: opts[:max_runtime_seconds],
-    max_spend_usd: opts[:max_spend_usd]
+    max_spend_usd: opts[:max_spend_usd],
+    global_volume_id: opts[:global_volume_id]
   )
   current_total = provisional_namespace.total_active_hourly_usd
   if current_total > max_total
@@ -272,6 +287,7 @@ begin
   puts "  Cloud: #{cloud}"
   puts "  Workers: #{current_workers} -> target #{opts[:target_workers]} (minimum #{opts[:minimum_workers]})"
   puts "  Qualified GPUs: #{gpu_ids.join(', ')}"
+  puts "  Global Volume: #{opts[:global_volume_id]} at #{LocalModelEvaluation::RunpodFleet::GLOBAL_VOLUME_MOUNT_PATH}" if opts[:global_volume_id]
   puts format("  Per-worker cap: $%.4f/hr", max_per_worker)
   puts format("  Per-fleet cap: $%.4f/hr", max_fleet)
   puts format("  Aggregate managed cap: $%.4f/hr", max_total)
@@ -335,6 +351,7 @@ begin
           container_disk_gb: opts[:container_disk_gb],
           volume_gb: opts[:volume_gb],
           network_volume_id: opts[:network_volume_id],
+          global_volume_id: opts[:global_volume_id],
           max_runtime_seconds: opts[:max_runtime_seconds],
           max_spend_usd: opts[:max_spend_usd]
         )
@@ -356,6 +373,7 @@ begin
           container_disk_gb: opts[:container_disk_gb],
           volume_gb: opts[:volume_gb],
           network_volume_id: opts[:network_volume_id],
+          global_volume_id: opts[:global_volume_id],
           max_runtime_seconds: opts[:max_runtime_seconds],
           max_spend_usd: opts[:max_spend_usd],
           min_ready_workers: 1,

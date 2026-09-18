@@ -3,17 +3,24 @@
 # Add or broaden entries only after empirical qualification evidence exists.
 contract_version: rpof-execution-pool-hardware/v0.1
 default_cloud: SECURE
+global_volume:
+  id: cmu4n7zhq000007lb6u7f43m9
+  ollama_store_path: /workspace-global/ollama-models
 models:
   qwen3.6:35b-a3b:
+    shared_model: qwen3.6:35b-a3b-q4_K_M
     qualified_gpus:
       - NVIDIA A40
   qwen3.6:27b:
+    shared_model: qwen3.6:27b-q4_K_M
     qualified_gpus:
       - NVIDIA A40
       - NVIDIA RTX A6000
   gemma4:26b:
+    shared_model: gemma4:26b-a4b-it-mtp-q4_K_M
     qualified_gpus:
       - NVIDIA L40S
   gpt-oss:20b:
+    shared_model: gpt-oss:20b
     qualified_gpus:
       - NVIDIA A40

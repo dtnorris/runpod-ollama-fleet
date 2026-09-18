@@ -6,10 +6,14 @@ module RunpodOllamaFleet
   class ExecutionPoolHardware
     CONTRACT_VERSION = "rpof-execution-pool-hardware/v0.1"
     SUPPORTED_CLOUDS = %w[SECURE COMMUNITY].freeze
+    GLOBAL_VOLUME_MOUNT_PATH = "/workspace-global"
 
     class Error < StandardError; end
 
-    Profile = Struct.new(:model, :cloud, :gpu_ids, keyword_init: true)
+    Profile = Struct.new(
+      :model, :cloud, :gpu_ids, :shared_model, :global_volume_id, :ollama_store_path,
+      keyword_init: true
+    )
 
     def initialize(path:)
       @path = File.expand_path(path)
@@ -31,7 +35,18 @@ module RunpodOllamaFleet
       gpu_ids = Array(entry["qualified_gpus"]).map { |value| value.to_s.strip }.reject(&:empty?).uniq
       raise Error, "hardware profile for #{model_name.inspect} has no qualified_gpus" if gpu_ids.empty?
 
-      Profile.new(model: model_name, cloud:, gpu_ids:)
+      shared_model = entry["shared_model"].to_s.strip
+      raise Error, "hardware profile for #{model_name.inspect} has no shared_model" if shared_model.empty?
+
+      global_volume = document.fetch("global_volume")
+      Profile.new(
+        model: model_name,
+        cloud:,
+        gpu_ids:,
+        shared_model:,
+        global_volume_id: global_volume.fetch("id"),
+        ollama_store_path: global_volume.fetch("ollama_store_path")
+      )
     rescue KeyError => e
       raise Error, "hardware qualification config is missing required key: #{e.message}"
     end
@@ -49,13 +64,33 @@ module RunpodOllamaFleet
       unless SUPPORTED_CLOUDS.include?(default_cloud)
         raise Error, "default_cloud must be one of: #{SUPPORTED_CLOUDS.join(', ')}"
       end
+
+      global_volume = data["global_volume"]
+      raise Error, "global_volume must be a mapping" unless global_volume.is_a?(Hash)
+      global_volume = global_volume.transform_keys(&:to_s)
+      global_volume_id = global_volume["id"].to_s.strip
+      unless global_volume_id.match?(/\A[A-Za-z0-9_-]+\z/)
+        raise Error, "global_volume id has invalid format"
+      end
+      ollama_store_path = global_volume["ollama_store_path"].to_s.strip
+      unless ollama_store_path.start_with?("#{GLOBAL_VOLUME_MOUNT_PATH}/")
+        raise Error, "global_volume ollama_store_path must be below #{GLOBAL_VOLUME_MOUNT_PATH}"
+      end
+
       models = data["models"]
       raise Error, "hardware qualification models must be a non-empty mapping" unless models.is_a?(Hash) && !models.empty?
 
       normalized = models.to_h do |key, value|
         [key.to_s, value.is_a?(Hash) ? value.transform_keys(&:to_s) : value]
       end
-      data.merge("models" => normalized, "default_cloud" => default_cloud)
+      data.merge(
+        "models" => normalized,
+        "default_cloud" => default_cloud,
+        "global_volume" => {
+          "id" => global_volume_id,
+          "ollama_store_path" => ollama_store_path
+        }
+      )
     rescue Psych::Exception => e
       raise Error, "invalid hardware qualification YAML: #{e.message}"
     rescue SystemCallError => e
