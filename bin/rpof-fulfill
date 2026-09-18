@@ -23,6 +23,13 @@ opts = {
   max_total_hourly_usd: ENV.fetch("RUNPOD_MAX_TOTAL_HOURLY_USD", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_MAX_TOTAL_HOURLY_USD),
   max_runtime_seconds: nil,
   max_spend_usd: nil,
+  budget_id: nil,
+  budget_plan_sha256: nil,
+  budget_max_cumulative_compute_usd: nil,
+  budget_max_runtime_seconds: nil,
+  budget_guardian_poll_seconds: nil,
+  budget_orchestrator_heartbeat_timeout_seconds: nil,
+  budget_teardown_reserve_seconds: nil,
   container_disk_gb: LocalModelEvaluation::RunpodFleet::DEFAULT_CONTAINER_DISK_GB,
   volume_gb: nil,
   network_volume_id: nil,
@@ -48,6 +55,13 @@ parser = OptionParser.new do |o|
   o.on("--max-total-hourly-usd USD", Float, "Fail closed above aggregate managed hourly rate") { |v| opts[:max_total_hourly_usd] = v }
   o.on("--max-runtime-minutes MINUTES", Float, "Initial fleet runtime lease") { |v| opts[:max_runtime_seconds] = v * 60.0 }
   o.on("--max-spend-usd USD", Float, "Initial fleet spend lease") { |v| opts[:max_spend_usd] = v }
+  o.on("--budget-id ID", "Parent production-burst budget id") { |v| opts[:budget_id] = v }
+  o.on("--budget-plan-sha256 SHA", "Frozen AFIO production plan SHA-256") { |v| opts[:budget_plan_sha256] = v }
+  o.on("--budget-max-cumulative-compute-usd USD", Float) { |v| opts[:budget_max_cumulative_compute_usd] = v }
+  o.on("--budget-max-runtime-seconds SECONDS", Float) { |v| opts[:budget_max_runtime_seconds] = v }
+  o.on("--budget-guardian-poll-seconds SECONDS", Float) { |v| opts[:budget_guardian_poll_seconds] = v }
+  o.on("--budget-orchestrator-heartbeat-timeout-seconds SECONDS", Float) { |v| opts[:budget_orchestrator_heartbeat_timeout_seconds] = v }
+  o.on("--budget-teardown-reserve-seconds SECONDS", Float) { |v| opts[:budget_teardown_reserve_seconds] = v }
   o.on("--container-disk-gb N", Integer, "Initial worker container disk") { |v| opts[:container_disk_gb] = v }
   o.on("--network-volume-id ID", "Attach an existing network volume at /workspace") { |v| opts[:network_volume_id] = v }
   o.on("--global-volume-id ID", "Attach an existing Global Volume at /workspace-global") { |v| opts[:global_volume_id] = v }
@@ -76,6 +90,18 @@ begin
   if opts[:global_volume_id] && opts[:volume_gb]
     raise OptionParser::InvalidArgument, "--global-volume-id cannot be combined with --volume-gb"
   end
+  budget_keys = %i[
+    budget_id budget_plan_sha256 budget_max_cumulative_compute_usd budget_max_runtime_seconds
+    budget_guardian_poll_seconds budget_orchestrator_heartbeat_timeout_seconds budget_teardown_reserve_seconds
+  ]
+  supplied_budget_keys = budget_keys.select { |key| !opts[key].nil? }
+  if supplied_budget_keys.any? && supplied_budget_keys.length != budget_keys.length
+    raise OptionParser::InvalidArgument, "parent burst budget options must be supplied together"
+  end
+  if opts[:yes] && !opts[:dry_run] && supplied_budget_keys.empty?
+    raise OptionParser::MissingArgument,
+          "parent burst budget options are required for non-interactive paid fulfillment"
+  end
 rescue OptionParser::ParseError => e
   warn "ERROR: #{e.message}"
   warn parser
@@ -88,6 +114,20 @@ def positive_float(value, label)
   number
 rescue ArgumentError, TypeError
   raise LocalModelEvaluation::RunpodFulfillment::Error, "#{label} must be a positive number"
+end
+
+def budget_context(opts)
+  return nil unless opts[:budget_id]
+  {
+    "contract_version" => LocalModelEvaluation::RunpodBudget::CONTRACT_VERSION,
+    "budget_id" => opts.fetch(:budget_id),
+    "plan_sha256" => opts.fetch(:budget_plan_sha256),
+    "max_cumulative_compute_usd" => opts.fetch(:budget_max_cumulative_compute_usd),
+    "max_runtime_seconds" => opts.fetch(:budget_max_runtime_seconds),
+    "guardian_poll_seconds" => opts.fetch(:budget_guardian_poll_seconds),
+    "orchestrator_heartbeat_timeout_seconds" => opts.fetch(:budget_orchestrator_heartbeat_timeout_seconds),
+    "teardown_reserve_seconds" => opts.fetch(:budget_teardown_reserve_seconds)
+  }
 end
 
 def confirm_or_abort(prompt, assume_yes:)
@@ -259,6 +299,17 @@ begin
     repo_root: ROOT
   )
   max_total = cost_control.provisioning_cap(requested_max_total)
+  parent_budget = budget_context(opts)
+  budget = if parent_budget && !opts[:dry_run]
+             value = LocalModelEvaluation::RunpodBudget.new(
+               root: File.join(ROOT, "output", "runpod-fleets"),
+               budget_id: parent_budget.fetch("budget_id"),
+               plan_sha256: parent_budget.fetch("plan_sha256")
+             )
+             value.verify_limits!(parent_budget)
+             value.assert_positive_mutation_ready!
+             value
+           end
 
   provisional_namespace = namespace_for(fleet_key, provisional: true)
   client = client_for(api_key)
@@ -296,6 +347,7 @@ begin
   puts format("  Per-worker cap: $%.4f/hr", max_per_worker)
   puts format("  Per-fleet cap: $%.4f/hr", max_fleet)
   puts format("  Aggregate managed cap: $%.4f/hr", max_total)
+  puts "  Parent burst budget: #{parent_budget.fetch('budget_id')} / #{parent_budget.fetch('plan_sha256')}" if parent_budget
   puts "  Acquisition: live catalog refresh; cheapest qualified first; one durable worker per attempt"
   puts "  Capacity miss: retain prior successes and try the next qualified GPU"
 
@@ -323,6 +375,8 @@ begin
       fleet = fleet_for(namespace, client)
       fleet.gpu_id = candidate.gpu_id
       ssh_public_key = fleet.read_ssh_public_key(opts[:ssh_public_key])
+      reservation = nil
+      new_worker = nil
 
       if current && current["status"] == "active"
         lifecycle = lifecycle_for(namespace, client, state)
@@ -341,7 +395,13 @@ begin
           raise LocalModelEvaluation::RunpodFulfillment::Error,
                 format("projected managed total $%.4f/hr exceeds aggregate cap $%.4f/hr", total, max_total)
         end
-        lifecycle.scale(
+        reservation = budget&.reserve_mutation!(
+          operation_type: "scale_up",
+          fleet_key: fleet_key,
+          logical_resource_id: "burst_#{target}",
+          max_hourly_rate_delta_usd: max_per_worker
+        )
+        workers = lifecycle.scale(
           target_worker_count: target,
           ssh_public_key:,
           preflight:,
@@ -349,6 +409,7 @@ begin
           wait_seconds: opts[:wait_seconds],
           poll_seconds: opts[:poll_seconds]
         )
+        new_worker = workers.find { |worker| Integer(worker.index) == target } || workers.fetch(0)
       else
         preflight = fleet.preflight(
           worker_count: 1,
@@ -370,6 +431,12 @@ begin
           raise LocalModelEvaluation::RunpodFulfillment::Error,
                 format("projected managed total $%.4f/hr exceeds aggregate cap $%.4f/hr", total, max_total)
         end
+        reservation = budget&.reserve_mutation!(
+          operation_type: "create",
+          fleet_key: fleet_key,
+          logical_resource_id: "burst_1",
+          max_hourly_rate_delta_usd: max_per_worker
+        )
         workers = fleet.create(
           worker_count: 1,
           cloud:,
@@ -387,6 +454,16 @@ begin
           poll_seconds: opts[:poll_seconds]
         )
         start_lease_watchdog!(namespace:, fleet:, workers:)
+        new_worker = workers.fetch(0)
+      end
+
+      if budget && reservation
+        budget.commit_mutation!(
+          reservation_id: reservation.fetch("reservation_id"),
+          provider_resource_id: new_worker.pod_id,
+          actual_hourly_rate_usd: new_worker.hourly_rate,
+          started_at_utc: reservation.fetch("created_at_utc")
+        )
       end
 
       updated = state.current
@@ -452,6 +529,7 @@ rescue LocalModelEvaluation::RunpodClient::Error,
        LocalModelEvaluation::RunpodFleetState::Error,
        LocalModelEvaluation::RunpodFleetNamespace::Error,
        LocalModelEvaluation::RunpodFleetLifecycle::Error,
+       LocalModelEvaluation::RunpodBudget::Error,
        LocalModelEvaluation::RunpodFulfillment::Error => e
   warn "ERROR: #{e.message}"
   exit 1

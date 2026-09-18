@@ -149,6 +149,16 @@ class ExecutionPoolFulfillTest < Minitest::Test
       "contract_version" => "afio-rpof-execution-pool-fulfill-request/v0.1",
       "plan_sha256" => PLAN,
       "pool_id" => "qwen35",
+      "budget" => {
+        "contract_version" => "afio-production-burst-budget/v0.1",
+        "budget_id" => "batch034",
+        "plan_sha256" => PLAN,
+        "max_cumulative_compute_usd" => 5.0,
+        "max_runtime_seconds" => 2700,
+        "guardian_poll_seconds" => 5,
+        "orchestrator_heartbeat_timeout_seconds" => 30,
+        "teardown_reserve_seconds" => 60
+      },
       "requirements" => {
         "ollama_model" => "qwen3.6:35b-a3b",
         "pull_model" => "qwen3.6:35b-a3b-q4_K_M",
@@ -190,6 +200,8 @@ class ExecutionPoolFulfillTest < Minitest::Test
     assert_equal "1", fulfill.fetch(fulfill.index("--target-workers") + 1)
     assert_equal "1", fulfill.fetch(fulfill.index("--minimum-workers") + 1)
     assert_equal "0", fulfill.fetch(fulfill.index("--expect-initial-workers") + 1)
+    assert_equal "batch034", fulfill.fetch(fulfill.index("--budget-id") + 1)
+    assert_equal PLAN, fulfill.fetch(fulfill.index("--budget-plan-sha256") + 1)
 
     %w[bootstrap runtime-alias].each do |command|
       argv = runner.calls.find { |row| row.fetch(:argv)[1] == command }.fetch(:argv)

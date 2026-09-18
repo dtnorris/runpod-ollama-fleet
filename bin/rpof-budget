@@ -1,0 +1,105 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "local_model_evaluation/runpod_budget"
+
+command = ARGV.shift
+opts = {
+  budget_id: nil,
+  plan_sha256: nil,
+  request: nil,
+  guardian_heartbeat_at_utc: nil,
+  source: nil,
+  reason: nil
+}
+
+parser = OptionParser.new do |o|
+  o.banner = "Usage: bin/rpof budget COMMAND [options]"
+  o.on("--budget-id ID", "Parent production-burst budget id") { |v| opts[:budget_id] = v }
+  o.on("--plan-sha256 SHA", "Frozen AFIO production plan SHA-256") { |v| opts[:plan_sha256] = v }
+  o.on("--request FILE", "JSON document containing a budget object or {budget: ...}") { |v| opts[:request] = v }
+  o.on("--guardian-heartbeat-at UTC", "Guardian heartbeat proving guardian readiness for arm") { |v| opts[:guardian_heartbeat_at_utc] = v }
+  o.on("--source SOURCE", "Heartbeat source: guardian or orchestrator") { |v| opts[:source] = v }
+  o.on("--reason TEXT", "Durable teardown reason") { |v| opts[:reason] = v }
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+rescue OptionParser::ParseError => e
+  warn "ERROR: #{e.message}"
+  warn parser
+  exit 2
+end
+
+root = File.join(ROOT, "output", "runpod-fleets")
+
+def read_budget_request(path)
+  document = JSON.parse(File.read(File.expand_path(path)))
+  budget = document.key?("budget") ? document.fetch("budget") : document
+  raise ArgumentError, "budget request must be an object" unless budget.is_a?(Hash)
+  budget
+end
+
+def build_budget(root, budget_id, plan_sha256)
+  raise OptionParser::MissingArgument, "--budget-id" if budget_id.to_s.empty?
+  raise OptionParser::MissingArgument, "--plan-sha256" if plan_sha256.to_s.empty?
+
+  LocalModelEvaluation::RunpodBudget.new(
+    root:,
+    budget_id:,
+    plan_sha256:
+  )
+end
+
+begin
+  result = case command
+           when "arm"
+             raise OptionParser::MissingArgument, "--request" unless opts[:request]
+             raise OptionParser::MissingArgument, "--guardian-heartbeat-at" unless opts[:guardian_heartbeat_at_utc]
+             request = read_budget_request(opts[:request])
+             budget = build_budget(root, request.fetch("budget_id"), request.fetch("plan_sha256"))
+             budget.arm!(budget: request, guardian_heartbeat_at_utc: opts[:guardian_heartbeat_at_utc])
+           when "heartbeat"
+             raise OptionParser::MissingArgument, "--source" unless opts[:source]
+             budget = build_budget(root, opts[:budget_id], opts[:plan_sha256])
+             budget.heartbeat!(source: opts[:source])
+           when "status"
+             budget = build_budget(root, opts[:budget_id], opts[:plan_sha256])
+             budget.status
+           when "evaluate"
+             budget = build_budget(root, opts[:budget_id], opts[:plan_sha256])
+             budget.evaluate!
+           when "begin-teardown"
+             raise OptionParser::MissingArgument, "--reason" unless opts[:reason]
+             budget = build_budget(root, opts[:budget_id], opts[:plan_sha256])
+             budget.begin_teardown!(reason: opts[:reason])
+           when "close"
+             budget = build_budget(root, opts[:budget_id], opts[:plan_sha256])
+             budget.close!
+           else
+             warn <<~USAGE
+               Usage: bin/rpof budget COMMAND [options]
+
+               Commands:
+                 arm --request FILE --guardian-heartbeat-at UTC
+                 heartbeat --budget-id ID --plan-sha256 SHA --source guardian|orchestrator
+                 status --budget-id ID --plan-sha256 SHA
+                 evaluate --budget-id ID --plan-sha256 SHA
+                 begin-teardown --budget-id ID --plan-sha256 SHA --reason TEXT
+                 close --budget-id ID --plan-sha256 SHA
+             USAGE
+             exit(command ? 2 : 0)
+           end
+
+  puts JSON.pretty_generate(result)
+rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError,
+       OptionParser::ParseError, LocalModelEvaluation::RunpodBudget::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end

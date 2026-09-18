@@ -9,6 +9,7 @@ module RunpodOllamaFleet
     DISPATCH_SUMMARY_VERSION = "afio-rpof-dispatch-summary/v0.1"
     EXECUTION_POOL_REQUEST_VERSION = "afio-rpof-execution-pool-fulfill-request/v0.1"
     EXECUTION_POOL_RESULT_VERSION = "afio-rpof-execution-pool-fulfill-result/v0.1"
+    PRODUCTION_BURST_BUDGET_VERSION = "afio-production-burst-budget/v0.1"
 
     FLEET_KEY = /\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z/
     JOB_ID = /\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z/
@@ -69,10 +70,13 @@ module RunpodOllamaFleet
     end
 
     def validate_execution_pool_request!(document)
-      object!(document, %w[contract_version plan_sha256 pool_id requirements capacity], [])
+      object!(document, %w[contract_version plan_sha256 pool_id requirements capacity], %w[budget])
       const!(document, "contract_version", EXECUTION_POOL_REQUEST_VERSION)
       string!(document, "plan_sha256", pattern: DIGEST, max: 64)
       string!(document, "pool_id", pattern: FLEET_KEY, max: 64)
+      if document.key?("budget")
+        validate_production_burst_budget!(document.fetch("budget"), expected_plan_sha256: document.fetch("plan_sha256"))
+      end
 
       requirements = document.fetch("requirements")
       object!(
@@ -102,6 +106,37 @@ module RunpodOllamaFleet
       positive_number!(capacity.fetch("max_pool_hourly_usd"), "capacity.max_pool_hourly_usd")
       positive_number!(capacity.fetch("max_total_hourly_usd"), "capacity.max_total_hourly_usd")
       document
+    end
+
+    def validate_production_burst_budget!(budget, expected_plan_sha256:)
+      object!(
+        budget,
+        %w[
+          contract_version budget_id plan_sha256 max_cumulative_compute_usd
+          max_runtime_seconds guardian_poll_seconds
+          orchestrator_heartbeat_timeout_seconds teardown_reserve_seconds
+        ],
+        []
+      )
+      const!(budget, "contract_version", PRODUCTION_BURST_BUDGET_VERSION)
+      string!(budget, "budget_id", max: 256)
+      string!(budget, "plan_sha256", pattern: DIGEST, max: 64)
+      unless budget.fetch("plan_sha256").downcase == expected_plan_sha256.to_s.downcase
+        raise Error, "budget.plan_sha256 must match request plan_sha256"
+      end
+
+      positive_number!(budget.fetch("max_cumulative_compute_usd"), "budget.max_cumulative_compute_usd")
+      positive_number!(budget.fetch("max_runtime_seconds"), "budget.max_runtime_seconds")
+      guardian_poll = positive_number!(budget.fetch("guardian_poll_seconds"), "budget.guardian_poll_seconds")
+      heartbeat_timeout = positive_number!(
+        budget.fetch("orchestrator_heartbeat_timeout_seconds"),
+        "budget.orchestrator_heartbeat_timeout_seconds"
+      )
+      positive_number!(budget.fetch("teardown_reserve_seconds"), "budget.teardown_reserve_seconds")
+      if heartbeat_timeout < 2 * guardian_poll
+        raise Error, "budget.orchestrator_heartbeat_timeout_seconds must be at least twice budget.guardian_poll_seconds"
+      end
+      budget
     end
 
     def validate_dispatch_request!(document)

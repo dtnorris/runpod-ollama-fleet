@@ -39,6 +39,7 @@ module RunpodOllamaFleet
 
     def prepare_next_worker(request, current_workers:, assume_yes: false)
       ContractV01.validate_execution_pool_request!(request)
+      budget = request.fetch("budget")
       current = nonnegative_integer(current_workers, "current workers")
       requirements = request.fetch("requirements")
       capacity = request.fetch("capacity")
@@ -58,7 +59,8 @@ module RunpodOllamaFleet
         assume_yes:,
         target_workers: target,
         minimum_workers: target,
-        expected_initial_workers: current
+        expected_initial_workers: current,
+        budget:
       )
 
       initial_workers = Integer(capacity_result.fetch("initial_workers"))
@@ -173,6 +175,7 @@ module RunpodOllamaFleet
           capability: nil
         )
       end
+      request.fetch("budget")
 
       # Read existing capacity without creating anything. The rolling path then
       # treats that count as a READY prefix only after a capability proof.
@@ -330,7 +333,7 @@ module RunpodOllamaFleet
     end
 
     def invoke_capacity(handle:, profile:, capacity:, dry_run:, assume_yes:,
-                        target_workers: nil, minimum_workers: nil, expected_initial_workers: nil)
+                        target_workers: nil, minimum_workers: nil, expected_initial_workers: nil, budget: nil)
       target_workers ||= capacity.fetch("desired_workers")
       minimum_workers ||= capacity.fetch("minimum_workers")
       with_tempfile("capacity-result") do |path|
@@ -347,6 +350,7 @@ module RunpodOllamaFleet
           "--output", path
         ]
         profile.gpu_ids.each { |gpu_id| argv.concat(["--gpu", gpu_id]) }
+        argv.concat(budget_cli_args(budget)) if budget
         unless expected_initial_workers.nil?
           argv.concat(["--expect-initial-workers", expected_initial_workers.to_s])
         end
@@ -366,6 +370,21 @@ module RunpodOllamaFleet
         end
         document
       end
+    end
+
+    def budget_cli_args(budget)
+      [
+        "--budget-id", budget.fetch("budget_id").to_s,
+        "--budget-plan-sha256", budget.fetch("plan_sha256").to_s,
+        "--budget-max-cumulative-compute-usd", budget.fetch("max_cumulative_compute_usd").to_s,
+        "--budget-max-runtime-seconds", budget.fetch("max_runtime_seconds").to_s,
+        "--budget-guardian-poll-seconds", budget.fetch("guardian_poll_seconds").to_s,
+        "--budget-orchestrator-heartbeat-timeout-seconds",
+        budget.fetch("orchestrator_heartbeat_timeout_seconds").to_s,
+        "--budget-teardown-reserve-seconds", budget.fetch("teardown_reserve_seconds").to_s
+      ]
+    rescue KeyError => e
+      raise Error, "production burst budget is incomplete: #{e.message}"
     end
 
     def invoke_keep(handle)

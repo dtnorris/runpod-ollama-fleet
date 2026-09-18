@@ -11,6 +11,16 @@ class ExecutionPoolContractTest < Minitest::Test
       "contract_version" => RunpodOllamaFleet::ContractV01::EXECUTION_POOL_REQUEST_VERSION,
       "plan_sha256" => "b" * 64,
       "pool_id" => "qwen35",
+      "budget" => {
+        "contract_version" => "afio-production-burst-budget/v0.1",
+        "budget_id" => "batch034",
+        "plan_sha256" => "b" * 64,
+        "max_cumulative_compute_usd" => 5.0,
+        "max_runtime_seconds" => 2700,
+        "guardian_poll_seconds" => 5,
+        "orchestrator_heartbeat_timeout_seconds" => 30,
+        "teardown_reserve_seconds" => 60
+      },
       "requirements" => {
         "ollama_model" => "qwen3.6:35b-a3b",
         "pull_model" => "qwen3.6:35b-a3b-q4_K_M",
@@ -50,5 +60,15 @@ class ExecutionPoolContractTest < Minitest::Test
       RunpodOllamaFleet::ContractV01.validate_execution_pool_request!(document)
     end
     assert_includes error.message, "cannot exceed"
+  end
+
+  def test_rejects_budget_identity_that_does_not_match_plan
+    document = request
+    document.fetch("budget")["plan_sha256"] = "c" * 64
+
+    error = assert_raises(RunpodOllamaFleet::ContractV01::Error) do
+      RunpodOllamaFleet::ContractV01.validate_execution_pool_request!(document)
+    end
+    assert_includes error.message, "must match request plan_sha256"
   end
 end
