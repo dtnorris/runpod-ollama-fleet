@@ -31,10 +31,14 @@ module LocalModelEvaluation
     end
 
     def run(target_workers:, minimum_workers:, gpu_ids:, cloud:, current_workers:,
-            max_hourly_per_worker_usd: nil, dry_run: false, &provision_one)
+            expected_current_workers: nil, max_hourly_per_worker_usd: nil, dry_run: false, &provision_one)
       target = positive_integer(target_workers, "target workers")
       minimum = positive_integer(minimum_workers, "minimum workers")
       current = nonnegative_integer(current_workers, "current workers")
+      expected = expected_current_workers.nil? ? nil : nonnegative_integer(expected_current_workers, "expected current workers")
+      if !expected.nil? && current != expected
+        raise Error, "current workers #{current} do not match expected #{expected}; refusing capacity mutation"
+      end
       raise Error, "minimum workers cannot exceed target workers" if minimum > target
       raise Error, "current workers cannot exceed target workers" if current > target
       raise Error, "provision callback is required" unless dry_run || provision_one

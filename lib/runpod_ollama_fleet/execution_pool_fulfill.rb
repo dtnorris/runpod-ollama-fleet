@@ -37,6 +37,123 @@ module RunpodOllamaFleet
       @runner = command_runner || SystemCommandRunner.new(repo_root: @repo_root, out:)
     end
 
+    def prepare_next_worker(request, current_workers:, assume_yes: false)
+      ContractV01.validate_execution_pool_request!(request)
+      current = nonnegative_integer(current_workers, "current workers")
+      requirements = request.fetch("requirements")
+      capacity = request.fetch("capacity")
+      desired = Integer(capacity.fetch("desired_workers"))
+      if current >= desired
+        raise Error, "current workers #{current} already meet desired capacity #{desired}"
+      end
+
+      profile = @hardware.profile_for(requirements.fetch("ollama_model"))
+      handle = execution_handle(request)
+      target = current + 1
+      capacity_result = invoke_capacity(
+        handle:,
+        profile:,
+        capacity:,
+        dry_run: false,
+        assume_yes:,
+        target_workers: target,
+        minimum_workers: target,
+        expected_initial_workers: current
+      )
+
+      initial_workers = Integer(capacity_result.fetch("initial_workers"))
+      final_workers = Integer(capacity_result.fetch("final_workers"))
+      unless initial_workers == current
+        raise Error,
+              "capacity fulfillment initial worker count #{initial_workers} did not match expected #{current}"
+      end
+
+      if final_workers < target
+        return preparation_result(
+          request:,
+          handle:,
+          ready: false,
+          status: "capacity_unavailable",
+          worker_index: target,
+          capacity_result:,
+          profile:,
+          detail: capacity_result.fetch("stopped_reason").to_s,
+          runtime_alias_evidence: [],
+          capability: nil
+        )
+      end
+
+      unless final_workers == target
+        cleanup_error = cleanup_new_capacity(handle, current, final_workers)
+        detail = "capacity fulfillment returned #{final_workers} workers; expected exactly #{target}"
+        detail = "#{detail}; cleanup failed: #{cleanup_error}" if cleanup_error
+        return preparation_result(
+          request:,
+          handle:,
+          ready: false,
+          status: "failed",
+          worker_index: target,
+          capacity_result:,
+          profile:,
+          detail:,
+          runtime_alias_evidence: [],
+          capability: nil
+        )
+      end
+
+      worker_indices = [target]
+      begin
+        invoke_keep(handle)
+        invoke_bootstrap(handle, worker_indices, requirements, profile)
+        invoke_tunnels(handle, worker_indices)
+        alias_evidence = invoke_runtime_alias(handle, worker_indices, requirements, profile)
+        capability = invoke_capability(handle, worker_indices, requirements)
+        unless capability.fetch("ready")
+          failures = Array(capability["diagnostics"]).select { |row| row["status"] == "FAIL" }
+          detail = failures.map { |row| "#{row['code']}: #{row['detail']}" }.join("; ")
+          raise Error, "execution capability check failed: #{detail.empty? ? 'not ready' : detail}"
+        end
+        selected = Array(capability.fetch("selected_worker_indices")).map { |value| Integer(value) }.sort
+        unless selected == worker_indices
+          raise Error,
+                "capability check returned workers #{selected.inspect}, expected #{worker_indices.inspect}"
+        end
+
+        preparation_result(
+          request:,
+          handle:,
+          ready: true,
+          status: "ready",
+          worker_index: target,
+          capacity_result:,
+          profile:,
+          detail: "burst_#{target} execution worker is ready",
+          runtime_alias_evidence: alias_evidence,
+          capability:
+        )
+      rescue StandardError => e
+        cleanup_error = cleanup_new_capacity(handle, current, final_workers)
+        detail = e.message.to_s
+        detail = "#{detail}; cleanup failed: #{cleanup_error}" if cleanup_error
+        preparation_result(
+          request:,
+          handle:,
+          ready: false,
+          status: "failed",
+          worker_index: target,
+          capacity_result:,
+          profile:,
+          detail:,
+          runtime_alias_evidence: [],
+          capability: nil
+        )
+      end
+    rescue ContractV01::Error, ExecutionPoolHardware::Error => e
+      raise Error, e.message
+    rescue KeyError, ArgumentError, TypeError => e
+      raise Error, "invalid incremental execution-worker preparation request: #{e.message}"
+    end
+
     def run(request, dry_run: false, assume_yes: false)
       ContractV01.validate_execution_pool_request!(request)
       requirements = request.fetch("requirements")
@@ -152,13 +269,16 @@ module RunpodOllamaFleet
       "ep-#{slug[0, 16]}-#{request.fetch('plan_sha256')[0, 10].downcase}"
     end
 
-    def invoke_capacity(handle:, profile:, capacity:, dry_run:, assume_yes:)
+    def invoke_capacity(handle:, profile:, capacity:, dry_run:, assume_yes:,
+                        target_workers: nil, minimum_workers: nil, expected_initial_workers: nil)
+      target_workers ||= capacity.fetch("desired_workers")
+      minimum_workers ||= capacity.fetch("minimum_workers")
       with_tempfile("capacity-result") do |path|
         argv = [
           @executable, "fulfill",
           "--fleet", handle,
-          "--target-workers", capacity.fetch("desired_workers").to_s,
-          "--minimum-workers", capacity.fetch("minimum_workers").to_s,
+          "--target-workers", target_workers.to_s,
+          "--minimum-workers", minimum_workers.to_s,
           "--cloud", profile.cloud,
           "--global-volume-id", profile.global_volume_id,
           "--max-hourly-per-worker", capacity.fetch("max_pool_hourly_usd").to_s,
@@ -167,6 +287,9 @@ module RunpodOllamaFleet
           "--output", path
         ]
         profile.gpu_ids.each { |gpu_id| argv.concat(["--gpu", gpu_id]) }
+        unless expected_initial_workers.nil?
+          argv.concat(["--expect-initial-workers", expected_initial_workers.to_s])
+        end
         argv << "--dry-run" if dry_run
         argv << "--yes" if !dry_run && assume_yes
         if !dry_run && !assume_yes
@@ -285,6 +408,35 @@ module RunpodOllamaFleet
       e.message
     end
 
+    def preparation_result(request:, handle:, ready:, status:, worker_index:, capacity_result:, profile:, detail:,
+                           runtime_alias_evidence:, capability:)
+      {
+        "ready" => ready,
+        "status" => status,
+        "plan_sha256" => request.fetch("plan_sha256").downcase,
+        "pool_id" => request.fetch("pool_id"),
+        "execution_handle" => handle,
+        "worker_index" => worker_index,
+        "capacity" => {
+          "status" => capacity_result.fetch("status"),
+          "target_workers" => capacity_result.fetch("target_workers"),
+          "minimum_workers" => capacity_result.fetch("minimum_workers"),
+          "initial_workers" => capacity_result.fetch("initial_workers"),
+          "final_workers" => capacity_result.fetch("final_workers")
+        },
+        "hardware_policy" => {
+          "cloud" => profile.cloud,
+          "qualified_gpu_ids" => profile.gpu_ids,
+          "global_volume_id" => profile.global_volume_id,
+          "shared_model" => profile.shared_model,
+          "ollama_store_path" => profile.ollama_store_path
+        },
+        "runtime_alias_evidence" => runtime_alias_evidence,
+        "capabilities" => capability && capability["capabilities"],
+        "detail" => detail
+      }
+    end
+
     def result_document(request:, handle:, ready:, status:, capacity_result:, worker_indices:, profile:, detail:,
                         runtime_alias_evidence:, capability:)
       {
@@ -332,6 +484,15 @@ module RunpodOllamaFleet
         file.flush
         yield file.path
       end
+    end
+
+    def nonnegative_integer(value, label)
+      number = Integer(value)
+      raise ArgumentError if number.negative?
+
+      number
+    rescue ArgumentError, TypeError
+      raise Error, "#{label} must be a nonnegative integer"
     end
 
     def read_json_result(path, label)

@@ -49,8 +49,8 @@ class ExecutionPoolFulfillTest < Minitest::Test
           "fleet_key" => value_after(argv, "--fleet"),
           "fleet_id" => "fixture-fleet",
           "status" => @capacity_status,
-          "target_workers" => 4,
-          "minimum_workers" => 2,
+          "target_workers" => Integer(value_after(argv, "--target-workers")),
+          "minimum_workers" => Integer(value_after(argv, "--minimum-workers")),
           "initial_workers" => @capacity_initial,
           "final_workers" => @capacity_final,
           "stopped_reason" => @capacity_status == "planned" ? "would acquire" : "fixture capacity",
@@ -130,6 +130,88 @@ class ExecutionPoolFulfillTest < Minitest::Test
       hardware: FakeHardware.new,
       command_runner: runner
     )
+  end
+
+  def test_prepare_next_worker_from_empty_pool_prepares_only_worker_one
+    runner = FakeRunner.new
+    runner.capacity_status = "fulfilled"
+    runner.capacity_initial = 0
+    runner.capacity_final = 1
+
+    result = build(runner).prepare_next_worker(request, current_workers: 0, assume_yes: true)
+
+    assert_equal true, result.fetch("ready")
+    assert_equal "ready", result.fetch("status")
+    assert_equal 1, result.fetch("worker_index")
+
+    fulfill = runner.calls.find { |row| row.fetch(:argv)[1] == "fulfill" }.fetch(:argv)
+    assert_equal "1", fulfill.fetch(fulfill.index("--target-workers") + 1)
+    assert_equal "1", fulfill.fetch(fulfill.index("--minimum-workers") + 1)
+    assert_equal "0", fulfill.fetch(fulfill.index("--expect-initial-workers") + 1)
+
+    %w[bootstrap runtime-alias].each do |command|
+      argv = runner.calls.find { |row| row.fetch(:argv)[1] == command }.fetch(:argv)
+      assert_equal "1", argv.fetch(argv.index("--workers") + 1)
+    end
+    tunnels = runner.calls.find { |row| row.fetch(:argv)[1] == "tunnels" }.fetch(:argv)
+    assert_equal "1", tunnels.fetch(tunnels.index("--workers") + 1)
+    assert_equal [1], runner.capability_request.dig("worker_selector", "indices")
+  end
+
+  def test_prepare_next_worker_after_existing_worker_targets_only_next_slot
+    runner = FakeRunner.new
+    runner.capacity_status = "fulfilled"
+    runner.capacity_initial = 1
+    runner.capacity_final = 2
+
+    result = build(runner).prepare_next_worker(request, current_workers: 1, assume_yes: true)
+
+    assert_equal true, result.fetch("ready")
+    assert_equal 2, result.fetch("worker_index")
+    bootstrap = runner.calls.find { |row| row.fetch(:argv)[1] == "bootstrap" }.fetch(:argv)
+    assert_equal "2", bootstrap.fetch(bootstrap.index("--workers") + 1)
+    assert_equal [2], runner.capability_request.dig("worker_selector", "indices")
+  end
+
+  def test_prepare_next_worker_failure_preserves_existing_workers
+    runner = FakeRunner.new
+    runner.capacity_status = "fulfilled"
+    runner.capacity_initial = 1
+    runner.capacity_final = 2
+    runner.capability_ready = false
+
+    result = build(runner).prepare_next_worker(request, current_workers: 1, assume_yes: true)
+
+    assert_equal false, result.fetch("ready")
+    assert_equal "failed", result.fetch("status")
+    scale = runner.calls.find { |row| row.fetch(:argv)[1] == "scale" }.fetch(:argv)
+    assert_equal "1", scale.fetch(scale.index("--workers") + 1)
+    refute runner.calls.any? { |row| row.fetch(:argv)[1] == "destroy" }
+  end
+
+  def test_prepare_next_worker_capacity_miss_does_not_touch_existing_workers
+    runner = FakeRunner.new
+    runner.capacity_status = "unfulfilled"
+    runner.capacity_initial = 1
+    runner.capacity_final = 1
+
+    result = build(runner).prepare_next_worker(request, current_workers: 1, assume_yes: true)
+
+    assert_equal false, result.fetch("ready")
+    assert_equal "capacity_unavailable", result.fetch("status")
+    assert_equal 2, result.fetch("worker_index")
+    assert_equal ["fulfill"], runner.calls.map { |row| row.fetch(:argv)[1] }
+  end
+
+  def test_prepare_next_worker_refuses_when_desired_capacity_is_already_met
+    runner = FakeRunner.new
+
+    error = assert_raises(RunpodOllamaFleet::ExecutionPoolFulfill::Error) do
+      build(runner).prepare_next_worker(request, current_workers: 4, assume_yes: true)
+    end
+
+    assert_includes error.message, "already meet desired capacity"
+    assert_empty runner.calls
   end
 
   def test_turns_minimum_capacity_into_ready_runtime_pool

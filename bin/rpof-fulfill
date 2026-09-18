@@ -15,6 +15,7 @@ opts = {
   fleet: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY),
   target_workers: nil,
   minimum_workers: nil,
+  expect_initial_workers: nil,
   gpu_ids: [],
   cloud: LocalModelEvaluation::RunpodFleet::DEFAULT_CLOUD,
   max_hourly_per_worker_usd: nil,
@@ -39,6 +40,7 @@ parser = OptionParser.new do |o|
   o.on("--fleet KEY", "Managed RPOF fleet key") { |v| opts[:fleet] = v }
   o.on("--target-workers N", Integer, "Desired provisioned worker count") { |v| opts[:target_workers] = v }
   o.on("--minimum-workers N", Integer, "Minimum useful provisioned worker count") { |v| opts[:minimum_workers] = v }
+  o.on("--expect-initial-workers N", Integer, "Fail before provisioning unless current worker count is exactly N") { |v| opts[:expect_initial_workers] = v }
   o.on("--gpu GPU_ID", "Qualified GPU id; repeatable") { |v| opts[:gpu_ids] << v }
   o.on("--cloud TIER", "RunPod cloud tier (default: SECURE)") { |v| opts[:cloud] = v }
   o.on("--max-hourly-per-worker USD", Float, "Never acquire a new worker above this rate") { |v| opts[:max_hourly_per_worker_usd] = v }
@@ -65,6 +67,9 @@ begin
   raise OptionParser::MissingArgument, "--minimum-workers" unless opts[:minimum_workers]
   raise OptionParser::MissingArgument, "--gpu" if opts[:gpu_ids].empty?
   raise OptionParser::MissingArgument, "--max-hourly-per-worker" unless opts[:max_hourly_per_worker_usd]
+  if opts[:expect_initial_workers] && opts[:expect_initial_workers].negative?
+    raise OptionParser::InvalidArgument, "--expect-initial-workers must be non-negative"
+  end
   if opts[:network_volume_id] && opts[:volume_gb]
     raise OptionParser::InvalidArgument, "--network-volume-id cannot be combined with --volume-gb"
   end
@@ -301,6 +306,7 @@ begin
       gpu_ids:,
       cloud:,
       current_workers:,
+      expected_current_workers: opts[:expect_initial_workers],
       max_hourly_per_worker_usd: max_per_worker,
       dry_run: true
     )
@@ -400,6 +406,7 @@ begin
       gpu_ids:,
       cloud:,
       current_workers:,
+      expected_current_workers: opts[:expect_initial_workers],
       max_hourly_per_worker_usd: max_per_worker,
       &provision_one
     )

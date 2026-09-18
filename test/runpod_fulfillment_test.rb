@@ -115,6 +115,29 @@ class RunpodFulfillmentTest < Minitest::Test
     assert_equal 0, result.final_workers
   end
 
+  def test_expected_current_worker_mismatch_fails_before_capacity_lookup_or_provision
+    policy = FakePolicy.new([])
+    fulfillment = LocalModelEvaluation::RunpodFulfillment.new(
+      capacity_policy: policy,
+      out: StringIO.new
+    )
+
+    error = assert_raises(LocalModelEvaluation::RunpodFulfillment::Error) do
+      fulfillment.run(
+        target_workers: 2,
+        minimum_workers: 1,
+        gpu_ids: ["NVIDIA A40"],
+        cloud: "SECURE",
+        current_workers: 1,
+        expected_current_workers: 0,
+        max_hourly_per_worker_usd: 0.60
+      ) { flunk "should not provision" }
+    end
+
+    assert_includes error.message, "current workers 1 do not match expected 0"
+    assert_empty policy.calls
+  end
+
   def test_dry_run_never_invokes_provision_callback
     a40 = candidate("NVIDIA A40", 0.49)
     policy = FakePolicy.new([ranking(a40)])
