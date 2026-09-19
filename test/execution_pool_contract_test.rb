@@ -42,6 +42,27 @@ class ExecutionPoolContractTest < Minitest::Test
     assert_same document, RunpodOllamaFleet::ContractV01.validate_execution_pool_request!(document)
   end
 
+  def test_rejects_legacy_v0_1_execution_pool_request
+    document = request
+    document["contract_version"] = "afio-rpof-execution-pool-fulfill-request/v0.1"
+
+    error = assert_raises(RunpodOllamaFleet::ContractV01::Error) do
+      RunpodOllamaFleet::ContractV01.validate_execution_pool_request!(document)
+    end
+    assert_includes error.message, "unsupported contract_version"
+    assert_includes error.message, "v0.2"
+  end
+
+  def test_requires_parent_production_burst_budget
+    document = request
+    document.delete("budget")
+
+    error = assert_raises(RunpodOllamaFleet::ContractV01::Error) do
+      RunpodOllamaFleet::ContractV01.validate_execution_pool_request!(document)
+    end
+    assert_includes error.message, "missing required field(s): budget"
+  end
+
   def test_rejects_hardware_fields_from_afio_request
     document = request
     document.fetch("capacity")["gpu_ids"] = ["NVIDIA A40"]

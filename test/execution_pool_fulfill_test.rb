@@ -146,7 +146,7 @@ class ExecutionPoolFulfillTest < Minitest::Test
 
   def request
     {
-      "contract_version" => "afio-rpof-execution-pool-fulfill-request/v0.1",
+      "contract_version" => RunpodOllamaFleet::ContractV01::EXECUTION_POOL_REQUEST_VERSION,
       "plan_sha256" => PLAN,
       "pool_id" => "qwen35",
       "budget" => {

@@ -7,7 +7,7 @@ module RunpodOllamaFleet
     CAPABILITY_RESULT_VERSION = "afio-rpof-capability-check-result/v0.1"
     DISPATCH_REQUEST_VERSION = "afio-rpof-dispatch-request/v0.1"
     DISPATCH_SUMMARY_VERSION = "afio-rpof-dispatch-summary/v0.1"
-    EXECUTION_POOL_REQUEST_VERSION = "afio-rpof-execution-pool-fulfill-request/v0.1"
+    EXECUTION_POOL_REQUEST_VERSION = "afio-rpof-execution-pool-fulfill-request/v0.2"
     EXECUTION_POOL_RESULT_VERSION = "afio-rpof-execution-pool-fulfill-result/v0.1"
     PRODUCTION_BURST_BUDGET_VERSION = "afio-production-burst-budget/v0.1"
 
@@ -70,13 +70,14 @@ module RunpodOllamaFleet
     end
 
     def validate_execution_pool_request!(document)
-      object!(document, %w[contract_version plan_sha256 pool_id requirements capacity], %w[budget])
+      object!(document, %w[contract_version plan_sha256 budget pool_id requirements capacity], [])
       const!(document, "contract_version", EXECUTION_POOL_REQUEST_VERSION)
       string!(document, "plan_sha256", pattern: DIGEST, max: 64)
       string!(document, "pool_id", pattern: FLEET_KEY, max: 64)
-      if document.key?("budget")
-        validate_production_burst_budget!(document.fetch("budget"), expected_plan_sha256: document.fetch("plan_sha256"))
-      end
+      validate_production_burst_budget!(
+        document.fetch("budget"),
+        expected_plan_sha256: document.fetch("plan_sha256")
+      )
 
       requirements = document.fetch("requirements")
       object!(
