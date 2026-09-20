@@ -10,6 +10,7 @@ ROOT = File.expand_path("..", __dir__)
 ENV["LME_REPO"] = ROOT
 $LOAD_PATH.unshift File.join(ROOT, "lib")
 require "local_model_evaluation"
+require "local_model_evaluation/runpod_fulfill_options"
 
 opts = {
   fleet: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY),
@@ -76,37 +77,7 @@ end
 
 begin
   parser.parse!(ARGV)
-  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
-  raise OptionParser::MissingArgument, "--target-workers" unless opts[:target_workers]
-  raise OptionParser::MissingArgument, "--minimum-workers" unless opts[:minimum_workers]
-  raise OptionParser::MissingArgument, "--gpu" if opts[:gpu_ids].empty?
-  raise OptionParser::MissingArgument, "--max-hourly-per-worker" unless opts[:max_hourly_per_worker_usd]
-  if opts[:expect_initial_workers] && opts[:expect_initial_workers].negative?
-    raise OptionParser::InvalidArgument, "--expect-initial-workers must be non-negative"
-  end
-  if opts[:network_volume_id] && opts[:volume_gb]
-    raise OptionParser::InvalidArgument, "--network-volume-id cannot be combined with --volume-gb"
-  end
-  if opts[:global_volume_id] && opts[:volume_gb]
-    raise OptionParser::InvalidArgument, "--global-volume-id cannot be combined with --volume-gb"
-  end
-  budget_keys = %i[
-    budget_id budget_plan_sha256 budget_max_cumulative_compute_usd budget_max_runtime_seconds
-    budget_guardian_poll_seconds budget_orchestrator_heartbeat_timeout_seconds budget_teardown_reserve_seconds
-  ]
-  supplied_budget_keys = budget_keys.select { |key| !opts[key].nil? }
-  if supplied_budget_keys.any? && supplied_budget_keys.length != budget_keys.length
-    raise OptionParser::InvalidArgument, "parent burst budget options must be supplied together"
-  end
-  if supplied_budget_keys.any? && (opts[:max_runtime_seconds] || opts[:max_spend_usd])
-    raise OptionParser::InvalidArgument,
-          "parent burst budget derives the child fleet runtime/spend lease; " \
-          "do not combine budget options with --max-runtime-minutes or --max-spend-usd"
-  end
-  if opts[:yes] && !opts[:dry_run] && supplied_budget_keys.empty?
-    raise OptionParser::MissingArgument,
-          "parent burst budget options are required for non-interactive paid fulfillment"
-  end
+  LocalModelEvaluation::RunpodFulfillOptions.validate!(opts, ARGV)
 rescue OptionParser::ParseError => e
   warn "ERROR: #{e.message}"
   warn parser
