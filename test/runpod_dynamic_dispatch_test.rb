@@ -36,21 +36,45 @@ class RunpodDynamicDispatchTest < Minitest::Test
     end
   end
 
-  class SlowRunner
+  class CoordinatedRunner
     attr_reader :worker_indices
 
     def initialize
       @worker_indices = []
       @mutex = Mutex.new
+      @condition = ConditionVariable.new
+      @release_worker_one = false
     end
 
     def run(argv:, env:, stdout_path:, stderr_path:, chdir:)
       index = Integer(env.fetch("LME_WORKER_INDEX"))
-      @mutex.synchronize { @worker_indices << index }
-      sleep 0.03
+      @mutex.synchronize do
+        @worker_indices << index
+        @condition.broadcast
+        @condition.wait(@mutex) while index == 1 && !@release_worker_one
+      end
       File.write(stdout_path, "#{env.fetch('LME_JOB_ID')} via burst_#{index} in #{chdir}\n")
       File.write(stderr_path, "")
       0
+    end
+
+    def wait_for_worker(index, timeout: 2.0)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      @mutex.synchronize do
+        until @worker_indices.include?(index)
+          remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          raise "timed out waiting for burst_#{index} to start" unless remaining.positive?
+
+          @condition.wait(@mutex, remaining)
+        end
+      end
+    end
+
+    def release_worker_one
+      @mutex.synchronize do
+        @release_worker_one = true
+        @condition.broadcast
+      end
     end
   end
 
@@ -64,7 +88,7 @@ class RunpodDynamicDispatchTest < Minitest::Test
 
   def test_running_dispatch_admits_prepared_worker_and_uses_it
     state = FakeFleetState.new
-    runner = SlowRunner.new
+    runner = CoordinatedRunner.new
     output = File.join(@tmp, "dispatch")
     dispatcher = LocalModelEvaluation::RunpodDispatcher.new(
       fleet_state: state,
@@ -80,26 +104,31 @@ class RunpodDynamicDispatchTest < Minitest::Test
 
     thread = Thread.new do
       dispatcher.run(
-        jobs: jobs(30),
+        jobs: jobs(2),
         worker_indices: [1],
         dynamic_worker_admission: true
       )
     end
-    wait_for_control(output)
+    runner.wait_for_worker(1)
 
     control = LocalModelEvaluation::RunpodDispatchAdmission.new(
       output_dir: output,
       fleet_state: state,
       fleet_key: "fixture"
     )
-    result = control.admit!(worker_index: 2)
-    assert_equal "admitted", result.fetch("status")
-    control.close!
+    begin
+      result = control.admit!(worker_index: 2)
+      assert_equal "admitted", result.fetch("status")
+      runner.wait_for_worker(2)
+    ensure
+      control.close! rescue nil
+      runner.release_worker_one
+    end
 
     summary = thread.value
     assert_equal "completed", summary.fetch("status")
     assert_equal [1, 2], summary.fetch("worker_indices")
-    assert_equal 30, summary.fetch("completed_count")
+    assert_equal 2, summary.fetch("completed_count")
     assert_includes runner.worker_indices, 2
     assert_operator runner.worker_indices.count(2), :>, 0
   end
@@ -133,15 +162,6 @@ class RunpodDynamicDispatchTest < Minitest::Test
         "argv" => ["fake-workload", index.to_s],
         "env" => {}
       }
-    end
-  end
-
-  def wait_for_control(output)
-    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2.0
-    path = File.join(output, LocalModelEvaluation::RunpodDispatchAdmission::STATE_FILE)
-    until File.file?(path)
-      raise "timed out waiting for dispatch admission control" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
-      sleep 0.005
     end
   end
 end
