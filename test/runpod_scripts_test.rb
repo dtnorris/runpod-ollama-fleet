@@ -7,6 +7,8 @@ require "open3"
 require_relative "../lib/local_model_evaluation/runpod_workers"
 
 class RunpodScriptsTest < Minitest::Test
+  parallelize_me!
+
   REPO_ROOT = File.expand_path("..", __dir__)
 
   def setup
