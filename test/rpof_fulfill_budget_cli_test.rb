@@ -68,4 +68,19 @@ class RpofFulfillBudgetCliTest < Minitest::Test
     assert_equal 2, status.exitstatus
     assert_includes stderr, "budget options must be supplied together"
   end
+
+  def test_parent_budget_rejects_independent_child_lease_options
+    _stdout, stderr, status = Open3.capture3(
+      { "RUNPOD_API_KEY" => "" },
+      *base_command,
+      *budget_args,
+      "--max-runtime-minutes", "10",
+      "--max-spend-usd", "1.0",
+      chdir: ROOT
+    )
+
+    assert_equal 2, status.exitstatus
+    assert_includes stderr, "parent burst budget derives the child fleet runtime/spend lease"
+    refute_includes stderr, "RUNPOD_API_KEY is missing"
+  end
 end

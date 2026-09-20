@@ -138,6 +138,40 @@ module LocalModelEvaluation
       end
     end
 
+    # Derive a fleet-local watchdog lease from the authoritative parent budget.
+    # The caller does not get a second independent policy surface: the absolute
+    # parent deadline and current remaining parent liability determine the child
+    # lease, and repeated derivation can only shrink the returned allowance.
+    def child_lease_limits!(max_fleet_hourly_usd:)
+      fleet_rate_cap = positive_float(max_fleet_hourly_usd, "maximum fleet hourly rate")
+
+      with_lock do
+        document = load_state!
+        now = utc_now
+        evaluate_document!(document, now:)
+        persist!(document, now:)
+        assert_mutation_ready!(document, now:)
+        current = snapshot(document, now:)
+
+        deadline = parse_time(current.fetch("deadline_at_utc"), "budget deadline")
+        remaining_runtime = deadline - now
+        raise Error, "budget runtime deadline has expired; child lease cannot be derived" unless remaining_runtime.positive?
+
+        remaining_parent = Float(current.fetch("remaining_uncommitted_budget_usd"))
+        runtime_bounded_spend = fleet_rate_cap * remaining_runtime / 3600.0
+        child_spend = [remaining_parent, runtime_bounded_spend].min
+        raise Error, "no parent cumulative budget remains for a child lease" unless child_spend.positive?
+
+        {
+          "deadline_at_utc" => deadline.iso8601,
+          "remaining_runtime_seconds" => remaining_runtime.round(6),
+          "max_spend_usd" => child_spend.round(6)
+        }
+      end
+    rescue KeyError, ArgumentError, TypeError => e
+      raise Error, "could not derive child lease: #{e.message}"
+    end
+
     def reserve_mutation!(operation_type:, fleet_key:, logical_resource_id:, max_hourly_rate_delta_usd:,
                           reservation_id: nil)
       operation = nonempty_string(operation_type, "operation type")

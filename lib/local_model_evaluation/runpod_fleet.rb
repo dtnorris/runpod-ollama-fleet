@@ -233,7 +233,7 @@ module LocalModelEvaluation
                max_fleet_hourly_usd: DEFAULT_MAX_FLEET_HOURLY_USD,
                container_disk_gb: DEFAULT_CONTAINER_DISK_GB, volume_gb: nil, network_volume_id: nil,
                global_volume_id: nil,
-               max_runtime_seconds: nil, max_spend_usd: nil,
+               max_runtime_seconds: nil, max_spend_usd: nil, lease_deadline_at_utc: nil,
                min_ready_workers: nil,
                wait_seconds: DEFAULT_WAIT_SECONDS, poll_seconds: DEFAULT_POLL_SECONDS)
       worker_count = validate_worker_count(worker_count)
@@ -251,6 +251,9 @@ module LocalModelEvaluation
                                      end
       max_runtime_seconds = optional_positive_float(max_runtime_seconds, "max runtime")
       max_spend_usd = optional_positive_float(max_spend_usd, "max spend")
+      lease_deadline_at = if lease_deadline_at_utc
+                            Time.parse(lease_deadline_at_utc.to_s).utc
+                          end
       preflight ||= self.preflight(
         worker_count:, cloud:, max_fleet_hourly_usd:, container_disk_gb:, volume_gb:,
         network_volume_id:, global_volume_id:, max_runtime_seconds:, max_spend_usd:
@@ -278,13 +281,17 @@ module LocalModelEvaluation
         raise Error,
               "preflight workspace volume #{preflight.volume_gb} GB does not match requested #{volume_gb} GB"
       end
-      if preflight.max_runtime_seconds != max_runtime_seconds
+      if lease_deadline_at.nil? && preflight.max_runtime_seconds != max_runtime_seconds
         raise Error,
               "preflight max runtime #{preflight.max_runtime_seconds.inspect} does not match requested #{max_runtime_seconds.inspect}"
       end
       if preflight.max_spend_usd != max_spend_usd
-        raise Error,
-              "preflight max spend #{preflight.max_spend_usd.inspect} does not match requested #{max_spend_usd.inspect}"
+        stricter_spend = preflight.max_spend_usd && max_spend_usd &&
+                         max_spend_usd <= preflight.max_spend_usd
+        unless stricter_spend
+          raise Error,
+                "preflight max spend #{preflight.max_spend_usd.inspect} does not match requested #{max_spend_usd.inspect}"
+        end
       end
 
       max_fleet_hourly_usd = positive_float(max_fleet_hourly_usd, "max fleet hourly cost")
@@ -295,7 +302,20 @@ module LocalModelEvaluation
       created = []
       workers = []
       fleet_record = nil
-      lease_started_at = lease_configured?(max_runtime_seconds, max_spend_usd) ? utc_now : nil
+      lease_started_at = if lease_configured?(max_runtime_seconds, max_spend_usd) || lease_deadline_at
+                           utc_now
+                         end
+      if lease_deadline_at
+        deadline_runtime = lease_deadline_at - lease_started_at
+        unless deadline_runtime.positive?
+          raise Error, "parent-derived fleet lease deadline has already expired"
+        end
+        max_runtime_seconds = if max_runtime_seconds
+                                [max_runtime_seconds, deadline_runtime].min
+                              else
+                                deadline_runtime
+                              end
+      end
       lease = build_lease(
         started_at: lease_started_at,
         max_runtime_seconds:,

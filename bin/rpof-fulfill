@@ -98,6 +98,11 @@ begin
   if supplied_budget_keys.any? && supplied_budget_keys.length != budget_keys.length
     raise OptionParser::InvalidArgument, "parent burst budget options must be supplied together"
   end
+  if supplied_budget_keys.any? && (opts[:max_runtime_seconds] || opts[:max_spend_usd])
+    raise OptionParser::InvalidArgument,
+          "parent burst budget derives the child fleet runtime/spend lease; " \
+          "do not combine budget options with --max-runtime-minutes or --max-spend-usd"
+  end
   if opts[:yes] && !opts[:dry_run] && supplied_budget_keys.empty?
     raise OptionParser::MissingArgument,
           "parent burst budget options are required for non-interactive paid fulfillment"
@@ -223,6 +228,37 @@ ensure
   File.delete(tmp) if defined?(tmp) && tmp && File.exist?(tmp)
 end
 
+def parent_budget_lease_check!(record, budget_snapshot)
+  return true unless record && record["status"] == "active"
+
+  lease = record["lease"]
+  unless lease.is_a?(Hash)
+    raise LocalModelEvaluation::RunpodFulfillment::Error,
+          "existing parent-budgeted fleet has no child runtime/spend lease"
+  end
+
+  started_at = Time.parse(lease.fetch("started_at_utc").to_s).utc
+  max_runtime = Float(lease.fetch("max_runtime_seconds"))
+  max_spend = Float(lease.fetch("max_spend_usd"))
+  lease_deadline = started_at + max_runtime
+  parent_deadline = Time.parse(budget_snapshot.fetch("deadline_at_utc").to_s).utc
+  parent_cap = Float(budget_snapshot.dig("limits", "max_cumulative_compute_usd"))
+
+  if lease_deadline > parent_deadline + 0.001
+    raise LocalModelEvaluation::RunpodFulfillment::Error,
+          "existing child lease deadline exceeds immutable parent budget deadline"
+  end
+  if max_spend > parent_cap + 1e-9
+    raise LocalModelEvaluation::RunpodFulfillment::Error,
+          "existing child lease spend limit exceeds immutable parent cumulative budget"
+  end
+
+  true
+rescue KeyError, ArgumentError, TypeError => e
+  raise LocalModelEvaluation::RunpodFulfillment::Error,
+        "invalid existing parent-derived child lease: #{e.message}"
+end
+
 def existing_policy_check!(record, gpu_ids:, cloud:, max_per_worker:, max_fleet:, max_runtime_seconds:, max_spend_usd:,
                            global_volume_id:)
   return 0 unless record && record["status"] == "active"
@@ -300,6 +336,7 @@ begin
   )
   max_total = cost_control.provisioning_cap(requested_max_total)
   parent_budget = budget_context(opts)
+  budget_snapshot = nil
   budget = if parent_budget && !opts[:dry_run]
              value = LocalModelEvaluation::RunpodBudget.new(
                root: File.join(ROOT, "output", "runpod-fleets"),
@@ -307,7 +344,7 @@ begin
                plan_sha256: parent_budget.fetch("plan_sha256")
              )
              value.verify_limits!(parent_budget)
-             value.assert_positive_mutation_ready!
+             budget_snapshot = value.assert_positive_mutation_ready!
              value
            end
 
@@ -329,6 +366,7 @@ begin
     max_spend_usd: opts[:max_spend_usd],
     global_volume_id: opts[:global_volume_id]
   )
+  parent_budget_lease_check!(record, budget_snapshot) if budget_snapshot
   current_total = provisional_namespace.total_active_hourly_usd
   if current_total > max_total
     raise LocalModelEvaluation::RunpodFulfillment::Error,
@@ -411,6 +449,10 @@ begin
         )
         new_worker = workers.find { |worker| Integer(worker.index) == target } || workers.fetch(0)
       else
+        initial_child_lease = budget&.child_lease_limits!(max_fleet_hourly_usd: max_fleet)
+        preflight_max_spend = initial_child_lease ?
+                                initial_child_lease.fetch("max_spend_usd") :
+                                opts[:max_spend_usd]
         preflight = fleet.preflight(
           worker_count: 1,
           cloud:,
@@ -420,7 +462,7 @@ begin
           network_volume_id: opts[:network_volume_id],
           global_volume_id: opts[:global_volume_id],
           max_runtime_seconds: opts[:max_runtime_seconds],
-          max_spend_usd: opts[:max_spend_usd]
+          max_spend_usd: preflight_max_spend
         )
         if preflight.hourly_rate > max_per_worker
           raise LocalModelEvaluation::RunpodFulfillment::Error,
@@ -437,6 +479,12 @@ begin
           logical_resource_id: "burst_1",
           max_hourly_rate_delta_usd: max_per_worker
         )
+        child_lease = budget&.child_lease_limits!(max_fleet_hourly_usd: max_fleet)
+        child_spend = if child_lease
+                        [preflight_max_spend, child_lease.fetch("max_spend_usd")].compact.min
+                      else
+                        opts[:max_spend_usd]
+                      end
         workers = fleet.create(
           worker_count: 1,
           cloud:,
@@ -448,7 +496,8 @@ begin
           network_volume_id: opts[:network_volume_id],
           global_volume_id: opts[:global_volume_id],
           max_runtime_seconds: opts[:max_runtime_seconds],
-          max_spend_usd: opts[:max_spend_usd],
+          max_spend_usd: child_spend,
+          lease_deadline_at_utc: child_lease && child_lease.fetch("deadline_at_utc"),
           min_ready_workers: 1,
           wait_seconds: opts[:wait_seconds],
           poll_seconds: opts[:poll_seconds]

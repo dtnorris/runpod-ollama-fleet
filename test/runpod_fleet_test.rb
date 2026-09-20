@@ -308,6 +308,46 @@ class RunpodFleetTest < Minitest::Test
     assert_empty @client.created_bodies
   end
 
+  def test_create_accepts_parent_absolute_deadline_and_stricter_spend_than_preflight
+    now = Time.utc(2026, 9, 20, 12, 0, 0)
+    fleet = LocalModelEvaluation::RunpodFleet.new(
+      client: @client,
+      env_path: @env_path,
+      out: @out,
+      sleeper: ->(_seconds) {},
+      clock: -> { 0.0 },
+      wall_clock: -> { now }
+    )
+    @client.create_responses = [{ "id" => "pod_parent_lease" }]
+    @client.pod_details = {
+      "pod_parent_lease" => ready_pod(
+        1, "pod_parent_lease", "198.51.100.41", 22041, 0.69, cloud: "SECURE"
+      )
+    }
+    preflight = fleet.preflight(
+      worker_count: 1,
+      max_fleet_hourly_usd: 1.0,
+      max_spend_usd: 0.70
+    )
+    deadline = now + 120
+    now += 30
+
+    fleet.create(
+      worker_count: 1,
+      ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest test@example",
+      preflight:,
+      max_fleet_hourly_usd: 1.0,
+      max_spend_usd: 0.50,
+      lease_deadline_at_utc: deadline.iso8601
+    )
+
+    lease = fleet.fleet_state.current.fetch("lease")
+    assert_in_delta 90.0, lease.fetch("max_runtime_seconds"), 0.001
+    assert_in_delta 0.50, lease.fetch("max_spend_usd"), 0.000001
+    expires = Time.parse(lease.fetch("started_at_utc")) + lease.fetch("max_runtime_seconds")
+    assert_equal deadline.iso8601, expires.utc.iso8601
+  end
+
   def test_create_rejects_preflight_for_different_storage_before_paid_mutation
     preflight = @fleet.preflight(
       worker_count: 1,

@@ -261,6 +261,36 @@ class RunpodBudgetTest < Minitest::Test
     assert_equal "runtime_expired", status.fetch("teardown_reason")
   end
 
+  def test_child_lease_uses_parent_deadline_and_only_shrinks
+    config = budget_config.merge(
+      "max_cumulative_compute_usd" => 0.70,
+      "max_runtime_seconds" => 3600.0
+    )
+    first = @budget.arm!(budget: config, guardian_heartbeat_at_utc: @now)
+    @budget.reserve_mutation!(
+      operation_type: "create",
+      fleet_key: "qwen27",
+      logical_resource_id: "burst_1",
+      max_hourly_rate_delta_usd: 0.60,
+      reservation_id: "r1"
+    )
+
+    lease = @budget.child_lease_limits!(max_fleet_hourly_usd: 0.60)
+    assert_equal first.fetch("deadline_at_utc"), lease.fetch("deadline_at_utc")
+    assert_in_delta 3600.0, lease.fetch("remaining_runtime_seconds"), 0.001
+    assert_in_delta 0.60, lease.fetch("max_spend_usd"), 0.000001
+
+    @now += 60
+    @budget.heartbeat!(source: "guardian")
+    @budget.heartbeat!(source: "orchestrator")
+    later = @budget.child_lease_limits!(max_fleet_hourly_usd: 0.60)
+
+    assert_equal lease.fetch("deadline_at_utc"), later.fetch("deadline_at_utc")
+    assert_in_delta 3540.0, later.fetch("remaining_runtime_seconds"), 0.001
+    assert_operator later.fetch("max_spend_usd"), :<, lease.fetch("max_spend_usd")
+    assert_in_delta 0.59, later.fetch("max_spend_usd"), 0.000001
+  end
+
   def test_file_lock_serializes_two_reservations_against_same_remaining_budget
     config = budget_config.merge("max_cumulative_compute_usd" => 0.05)
     @budget.arm!(budget: config, guardian_heartbeat_at_utc: @now)
