@@ -23,4 +23,7 @@ task "test:coverage:baseline" do
   sh "bundle", "exec", "simplecov", "ratchet", "--init"
 end
 
+desc "Run the complete test-suite contract"
+task "test:contract" => ["test", "test:deps", "test:lint", "test:coverage"]
+
 task default: :test
