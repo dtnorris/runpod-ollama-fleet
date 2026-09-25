@@ -1,0 +1,241 @@
+# Per-file coverage floors. A file that drops below its floor fails the run,
+# and files with no entry fall through to the global per-file minimum.
+# Regenerate with `simplecov ratchet`. Floors only ever tighten.
+lib/local_model_evaluation.rb:
+  lines:
+    percent: 100.0
+    missed: 0
+  branches:
+    percent: 100.0
+    missed: 0
+lib/local_model_evaluation/bootstrap_store.rb:
+  lines:
+    percent: 97.43
+    missed: 1
+  branches:
+    percent: 56.25
+    missed: 7
+lib/local_model_evaluation/process_supervisor.rb:
+  lines:
+    percent: 94.73
+    missed: 1
+  branches:
+    percent: 100.0
+    missed: 0
+lib/local_model_evaluation/runpod_activity.rb:
+  lines:
+    percent: 76.61
+    missed: 29
+  branches:
+    percent: 64.28
+    missed: 15
+lib/local_model_evaluation/runpod_bootstrap.rb:
+  lines:
+    percent: 90.21
+    missed: 37
+  branches:
+    percent: 73.09
+    missed: 46
+lib/local_model_evaluation/runpod_bootstrap_options.rb:
+  lines:
+    percent: 88.88
+    missed: 4
+  branches:
+    percent: 76.47
+    missed: 8
+lib/local_model_evaluation/runpod_budget.rb:
+  lines:
+    percent: 90.1
+    missed: 36
+  branches:
+    percent: 65.07
+    missed: 44
+lib/local_model_evaluation/runpod_budget_guardian.rb:
+  lines:
+    percent: 62.25
+    missed: 57
+  branches:
+    percent: 23.25
+    missed: 33
+lib/local_model_evaluation/runpod_budget_guardian_supervisor.rb:
+  lines:
+    percent: 84.8
+    missed: 19
+  branches:
+    percent: 59.52
+    missed: 17
+lib/local_model_evaluation/runpod_capacity_policy.rb:
+  lines:
+    percent: 88.57
+    missed: 8
+  branches:
+    percent: 72.72
+    missed: 6
+lib/local_model_evaluation/runpod_client.rb:
+  lines:
+    percent: 81.05
+    missed: 18
+  branches:
+    percent: 52.63
+    missed: 18
+lib/local_model_evaluation/runpod_cost_control.rb:
+  lines:
+    percent: 69.21
+    missed: 125
+  branches:
+    percent: 47.05
+    missed: 63
+lib/local_model_evaluation/runpod_dispatch_admission.rb:
+  lines:
+    percent: 82.6
+    missed: 24
+  branches:
+    percent: 47.82
+    missed: 24
+lib/local_model_evaluation/runpod_dispatcher.rb:
+  lines:
+    percent: 87.82
+    missed: 57
+  branches:
+    percent: 63.73
+    missed: 70
+lib/local_model_evaluation/runpod_fleet.rb:
+  lines:
+    percent: 90.86
+    missed: 42
+  branches:
+    percent: 73.85
+    missed: 57
+lib/local_model_evaluation/runpod_fleet_lifecycle.rb:
+  lines:
+    percent: 88.16
+    missed: 56
+  branches:
+    percent: 55.49
+    missed: 85
+lib/local_model_evaluation/runpod_fleet_namespace.rb:
+  lines:
+    percent: 96.22
+    missed: 4
+  branches:
+    percent: 62.5
+    missed: 15
+lib/local_model_evaluation/runpod_fleet_state.rb:
+  lines:
+    percent: 87.92
+    missed: 43
+  branches:
+    percent: 64.66
+    missed: 53
+lib/local_model_evaluation/runpod_fulfill_options.rb:
+  lines:
+    percent: 84.0
+    missed: 4
+  branches:
+    percent: 59.09
+    missed: 9
+lib/local_model_evaluation/runpod_fulfillment.rb:
+  lines:
+    percent: 89.47
+    missed: 8
+  branches:
+    percent: 74.28
+    missed: 9
+lib/local_model_evaluation/runpod_lease.rb:
+  lines:
+    percent: 77.53
+    missed: 31
+  branches:
+    percent: 60.29
+    missed: 27
+lib/local_model_evaluation/runpod_runtime_alias.rb:
+  lines:
+    percent: 80.39
+    missed: 30
+  branches:
+    percent: 49.15
+    missed: 30
+lib/local_model_evaluation/runpod_shutdown_control.rb:
+  lines:
+    percent: 81.86
+    missed: 66
+  branches:
+    percent: 53.96
+    missed: 58
+lib/local_model_evaluation/runpod_status.rb:
+  lines:
+    percent: 88.56
+    missed: 31
+  branches:
+    percent: 72.66
+    missed: 38
+lib/local_model_evaluation/runpod_status_all.rb:
+  lines:
+    percent: 95.19
+    missed: 5
+  branches:
+    percent: 81.08
+    missed: 7
+lib/local_model_evaluation/runpod_tunnels.rb:
+  lines:
+    percent: 75.6
+    missed: 91
+  branches:
+    percent: 58.0
+    missed: 42
+lib/local_model_evaluation/runpod_workers.rb:
+  lines:
+    percent: 90.32
+    missed: 3
+  branches:
+    percent: 75.0
+    missed: 3
+lib/runpod_ollama_fleet.rb:
+  lines:
+    percent: 0.0
+    missed: 7
+  branches:
+    percent: 100.0
+    missed: 0
+lib/runpod_ollama_fleet/capability_check.rb:
+  lines:
+    percent: 87.73
+    missed: 26
+  branches:
+    percent: 53.5
+    missed: 53
+lib/runpod_ollama_fleet/contract_v0_1.rb:
+  lines:
+    percent: 91.54
+    missed: 12
+  branches:
+    percent: 63.93
+    missed: 22
+lib/runpod_ollama_fleet/dispatch_v0_1.rb:
+  lines:
+    percent: 71.81
+    missed: 31
+  branches:
+    percent: 36.66
+    missed: 19
+lib/runpod_ollama_fleet/execution_pool_fulfill.rb:
+  lines:
+    percent: 84.64
+    missed: 35
+  branches:
+    percent: 65.51
+    missed: 30
+lib/runpod_ollama_fleet/execution_pool_hardware.rb:
+  lines:
+    percent: 84.61
+    missed: 8
+  branches:
+    percent: 53.84
+    missed: 12
+lib/runpod_ollama_fleet/version.rb:
+  lines:
+    percent: 0.0
+    missed: 2
+  branches:
+    percent: 100.0
+    missed: 0
