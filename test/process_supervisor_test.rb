@@ -5,6 +5,39 @@ require "tmpdir"
 require_relative "../lib/local_model_evaluation/process_supervisor"
 
 class ProcessSupervisorTest < Minitest::Test
+  def test_poll_returns_failed_status_when_process_was_already_reaped
+    supervisor = LocalModelEvaluation::ProcessSupervisor.new
+    pid = 12_345
+
+    result = Process.stub(:waitpid2, ->(*) { raise Errno::ECHILD }) do
+      supervisor.poll(pid)
+    end
+
+    assert_equal pid, result.fetch(0)
+    refute result.fetch(1).success?
+    assert_nil result.fetch(1).exitstatus
+  end
+
+  def test_signal_group_treats_missing_process_group_as_already_stopped
+    supervisor = LocalModelEvaluation::ProcessSupervisor.new
+
+    result = Process.stub(:kill, ->(*) { raise Errno::ESRCH }) do
+      supervisor.signal_group("TERM", 12_345)
+    end
+
+    assert_nil result
+  end
+
+  def test_wait_treats_already_reaped_process_as_complete
+    supervisor = LocalModelEvaluation::ProcessSupervisor.new
+
+    result = Process.stub(:waitpid, ->(*) { raise Errno::ECHILD }) do
+      supervisor.wait(12_345)
+    end
+
+    assert_nil result
+  end
+
   def test_real_process_preserves_argv_detaches_stdin_and_is_group_signalable
     Dir.mktmpdir("process-supervisor-") do |root|
       script = File.join(root, "worker.sh")
