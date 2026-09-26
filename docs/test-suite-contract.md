@@ -34,6 +34,13 @@ wall-clock ceilings measured with a monotonic clock.
 - warning threshold: 5.0 s
 - hard failure threshold: 5.5 s
 
+When a parallel AdventureFinder workspace test marks the process with
+`AF_TEST_CONTENDED=1`, the runtime guard automatically applies the fixed
+`TEST_RUNTIME_CONTENTION_MULTIPLIER` of 1.25. That makes the contended thresholds
+6.25 s warning / 6.875 s hard failure. Direct `rake` and serial workspace runs
+retain the calibrated 5.0 s / 5.5 s limits. The multiplier accounts for deliberate
+cross-repository resource contention; it does not redefine the isolated baseline.
+
 `rake test:coverage` runs the full functional suite once with SimpleCov
 enabled. That single run simultaneously enforces functional correctness, the
 line/branch coverage ratchet, and the runtime ceiling.
