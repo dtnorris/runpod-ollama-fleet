@@ -21,16 +21,46 @@ Runtime:
 - max: 4.246 s
 - stddev: 0.099 s
 
+This baseline was measured before coverage became the canonical functional
+safety-sweep run. Three coverage-instrumented spot checks on the same hardware
+completed the Minitest portion in 3.949 s, 4.025 s, and 4.238 s, showing no
+material runtime penalty.
+
 ## Whole-suite runtime ceilings
 
-The ordinary, non-coverage test suite is protected by absolute wall-clock
-ceilings measured with a monotonic clock on the same local development
-hardware used for the baseline.
+The canonical coverage-instrumented functional suite is protected by absolute
+wall-clock ceilings measured with a monotonic clock.
 
 - warning threshold: 5.0 s
 - hard failure threshold: 5.5 s
 
-`rake test:runtime` runs the ordinary suite and applies these thresholds.
-`rake test:contract` uses `test:runtime` as its product-test gate, so a suite
-that reaches the hard ceiling fails the contract. Coverage instrumentation is
-measured separately and is not subject to the ordinary-suite ceiling.
+`rake test:coverage` runs the full functional suite once with SimpleCov
+enabled. That single run simultaneously enforces functional correctness, the
+line/branch coverage ratchet, and the runtime ceiling.
+
+## Default safety sweep
+
+Plain `rake` runs the complete `test:contract` safety sweep in two stages.
+
+1. `test:coverage` runs by itself first. It is the canonical functional test
+   execution and enforces correctness, coverage, and runtime without competing
+   with other health checks.
+2. After it passes, `test:health` runs test-file independence and structural
+   Minitest lint checks in parallel.
+
+The default sweep is quiet on successful secondary checks. In an interactive
+terminal, a single in-place spinner shows that the parallel health phase is
+still running; redirected output prints one plain progress line instead. Its
+final health summary is:
+
+```text
+test:lint: <N> files inspected, no offenses detected
+test:deps: no broken dependencies found
+```
+
+If either secondary check fails, its captured diagnostic output is printed
+before the safety sweep fails. The raw `rake test:lint` and `rake test:deps`
+tasks remain available when detailed successful output is desired.
+
+`rake test` remains available when only the fast uninstrumented product suite
+is desired.
