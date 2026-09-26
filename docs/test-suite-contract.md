@@ -20,3 +20,17 @@ Runtime:
 - mean: 4.031 s
 - max: 4.246 s
 - stddev: 0.099 s
+
+## Whole-suite runtime ceilings
+
+The ordinary, non-coverage test suite is protected by absolute wall-clock
+ceilings measured with a monotonic clock on the same local development
+hardware used for the baseline.
+
+- warning threshold: 5.0 s
+- hard failure threshold: 5.5 s
+
+`rake test:runtime` runs the ordinary suite and applies these thresholds.
+`rake test:contract` uses `test:runtime` as its product-test gate, so a suite
+that reaches the hard ceiling fails the contract. Coverage instrumentation is
+measured separately and is not subject to the ordinary-suite ceiling.
