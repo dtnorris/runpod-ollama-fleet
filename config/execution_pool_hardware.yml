@@ -11,6 +11,7 @@ models:
     shared_model: qwen3.6:35b-a3b-q4_K_M
     qualified_gpus:
       - NVIDIA A40
+      - NVIDIA RTX PRO 6000 Blackwell Server Edition
   qwen3.6:27b:
     shared_model: qwen3.6:27b-q4_K_M
     qualified_gpus:

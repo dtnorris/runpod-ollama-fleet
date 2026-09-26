@@ -17,7 +17,7 @@ class ExecutionPoolFulfillTest < Minitest::Test
       RunpodOllamaFleet::ExecutionPoolHardware::Profile.new(
         model:,
         cloud: "SECURE",
-        gpu_ids: ["NVIDIA A40", "NVIDIA RTX A6000"],
+        gpu_ids: ["NVIDIA A40", "NVIDIA RTX PRO 6000 Blackwell Server Edition"],
         shared_model: SHARED_MODEL,
         global_volume_id: GLOBAL_VOLUME_ID,
         ollama_store_path: OLLAMA_STORE_PATH
@@ -288,6 +288,10 @@ class ExecutionPoolFulfillTest < Minitest::Test
     assert paid.all? { |argv| argv.fetch(argv.index("--global-volume-id") + 1) == GLOBAL_VOLUME_ID }
     assert paid.all? { |argv| argv.fetch(argv.index("--max-hourly-usd") + 1) == "3.0" }
     assert paid.all? { |argv| argv.fetch(argv.index("--max-total-hourly-usd") + 1) == "6.0" }
+    paid.each do |argv|
+      assert_includes argv, "NVIDIA A40"
+      assert_includes argv, "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+    end
 
     bootstraps = runner.calls.select { |row| row.fetch(:argv)[1] == "bootstrap" }.map { |row| row.fetch(:argv) }
     assert_equal %w[1 2 3 4], bootstraps.map { |argv| argv.fetch(argv.index("--workers") + 1) }

@@ -5,6 +5,17 @@ require "tmpdir"
 require_relative "../lib/runpod_ollama_fleet/execution_pool_hardware"
 
 class ExecutionPoolHardwareTest < Minitest::Test
+  def test_production_registry_qualifies_blackwell_for_qwen35
+    path = File.expand_path("../config/execution_pool_hardware.yml", __dir__)
+
+    profile = RunpodOllamaFleet::ExecutionPoolHardware.new(path:).profile_for("qwen3.6:35b-a3b")
+
+    assert_includes profile.gpu_ids, "NVIDIA A40"
+    assert_includes profile.gpu_ids, "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+    assert_equal "qwen3.6:35b-a3b-q4_K_M", profile.shared_model
+    assert_equal "SECURE", profile.cloud
+  end
+
   def test_resolves_only_explicit_rpof_owned_qualification
     Dir.mktmpdir do |root|
       path = File.join(root, "hardware.yml")
