@@ -110,6 +110,27 @@ task "test:coverage:baseline" do
   sh "bundle", "exec", "simplecov", "ratchet", "--init"
 end
 
+desc "Run scale-sensitive algorithm benchmarks"
+task "test:bench" do
+  sh "bundle", "exec", "ruby", "-Ilib:test", "bench/runpod_dispatcher_summary_benchmark.rb"
+end
+
+task "test:bench:quiet" do
+  stdout, stderr, status = Open3.capture3(
+    "bundle", "exec", "ruby", "-Ilib:test", "bench/runpod_dispatcher_summary_benchmark.rb"
+  )
+  combined = [stdout, stderr].reject(&:empty?).join
+
+  unless status.success?
+    $stdout.write(combined)
+    puts unless combined.empty? || combined.end_with?("\n")
+    abort "scale-sensitive benchmark failed"
+  end
+
+  TEST_HEALTH_RESULTS[:bench] =
+    "test:bench: dispatcher summary scaling guard passed"
+end
+
 task "test:lint:quiet" do
   stdout, stderr, status = Open3.capture3(
     "bundle", "exec", "rubocop", "--config", ".rubocop.yml", "test"
@@ -187,7 +208,8 @@ task "test:health" do
 end
 
 desc "Run the complete test-suite contract"
-task "test:contract" => ["test:coverage", "test:health"] do
+task "test:contract" => ["test:coverage", "test:bench:quiet", "test:health"] do
+  puts TEST_HEALTH_RESULTS.fetch(:bench)
   puts TEST_HEALTH_RESULTS.fetch(:lint)
   puts TEST_HEALTH_RESULTS.fetch(:deps)
 
