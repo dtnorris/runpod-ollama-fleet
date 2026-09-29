@@ -1,0 +1,48 @@
+{
+  "contract_version": "rpof-capacity-campaign/v0.1",
+  "campaign_id": "production-batch-039",
+  "max_workers": 6,
+  "max_hourly_rate_usd": 6.0,
+  "profiles": [
+    {
+      "profile_id": "qwen35",
+      "model": "qwen3.6:35b-a3b",
+      "expected_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "required_context_length": 131072,
+      "require_fully_gpu_resident": true,
+      "min_workers": 1,
+      "desired_workers": 3,
+      "max_workers": 3
+    },
+    {
+      "profile_id": "qwen27",
+      "model": "qwen3.6:27b",
+      "expected_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "required_context_length": 131072,
+      "require_fully_gpu_resident": true,
+      "min_workers": 1,
+      "desired_workers": 1,
+      "max_workers": 1
+    },
+    {
+      "profile_id": "gemma",
+      "model": "gemma4:26b",
+      "expected_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "required_context_length": 131072,
+      "require_fully_gpu_resident": true,
+      "min_workers": 1,
+      "desired_workers": 1,
+      "max_workers": 1
+    },
+    {
+      "profile_id": "gptoss",
+      "model": "gpt-oss:20b",
+      "expected_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "required_context_length": 131072,
+      "require_fully_gpu_resident": true,
+      "min_workers": 1,
+      "desired_workers": 1,
+      "max_workers": 1
+    }
+  ]
+}
