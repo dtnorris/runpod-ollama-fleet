@@ -62,16 +62,11 @@ else
   warn <<~USAGE
     Usage: bin/rpof COMMAND [options]
 
-    Commands:
+    Capacity and worker-registry commands (current production surface):
       version
-      capability-check
-      dispatch
-      dispatch-admit
-      dispatch-close
       capacity
       campaign
       fulfill
-      execution-pool-fulfill
       runtime-alias
       workers
       create
@@ -88,9 +83,17 @@ else
       status
       tunnels
 
-    capability-check + dispatch implement the frozen AFIO-facing v0.1 JSON
-    interface. dispatch-legacy and the lme-runpod helper names remain
-    compatibility surfaces.
+    Legacy workload-dispatch compatibility commands:
+      capability-check
+      dispatch
+      dispatch-admit
+      dispatch-close
+      dispatch-legacy
+      execution-pool-fulfill
+
+    The campaign and workers paths provide capacity and discovery; they do not
+    dispatch workload jobs. Legacy commands retain frozen behavior for migration
+    and rollback only and are not the WLO dynamic-worker production path.
   USAGE
   exit(command ? 2 : 0)
 end

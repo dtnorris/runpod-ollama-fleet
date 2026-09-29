@@ -1,13 +1,17 @@
 # runpod-ollama-fleet (RPOF)
 
-**RPOF (`runpod-ollama-fleet`)** owns optional RunPod/Ollama provider mechanics:
+**RPOF (`runpod-ollama-fleet`) is a provider-capacity manager and dynamic
+worker-registry publisher.** It owns optional RunPod/Ollama provider mechanics:
 fleet resources/state, readiness and bootstrap, tunnels, leases and cost
-safeguards, provider scaling/replacement, and opaque dispatch primitives.
+safeguards, provider scaling/replacement, campaign lifecycle, and worker
+capability publication.
 **AFW (`af-workloads`)** owns AdventureFinder workload intent, qualification,
 frozen scoring and result interpretation. **WLO (`workload-orchestrator`)** owns
 automatic placement, attempts, retries, pause/resume, breakers, guarded paid
-capacity and workload lifecycle. WLO invokes RPOF through a CLI and versioned
-JSON boundary; operators use `bin/rpof` directly for manual fleet administration.
+capacity and workload lifecycle. The target WLO production path discovers RPOF
+capacity through the provider-neutral worker registry and executes selected
+work itself; it does not ask RPOF to schedule or dispatch jobs. Operators use
+`bin/rpof` directly for campaign and fleet administration.
 
 The frozen `afio-rpof/v0.1` wire names are compatibility identifiers, not a
 statement that AFIO owns present-day execution.
@@ -48,16 +52,14 @@ only if it contains that exact commit.
 
 ## Operator entry point
 
-`bin/rpof` exposes the current interface and retained compatibility helper families:
+`bin/rpof` exposes the current capacity/registry interface:
 
 ```text
-bin/rpof capability-check ...
-bin/rpof dispatch ...
+bin/rpof campaign plan|start|status|stop ...
 bin/rpof workers --json
 bin/rpof create ...
 bin/rpof destroy ...
 bin/rpof bootstrap ...
-bin/rpof dispatch-legacy ...
 bin/rpof lease ...
 bin/rpof scale ...
 bin/rpof replace ...
@@ -65,16 +67,24 @@ bin/rpof status ...
 bin/rpof tunnels ...
 ```
 
-`capability-check` and `dispatch` retain the frozen `afio-rpof` v0.1 wire
-versions used by WLO's explicit compatibility adapter. `dispatch-legacy` and
-the `lme-runpod-*` executable names remain compatibility surfaces for
-pre-split workflows.
+Historical workload dispatch remains available through `dispatch`,
+`dispatch-admit`, `dispatch-close`, `dispatch-legacy`, `capability-check`, and
+`execution-pool-fulfill`. These commands, their frozen `afio-rpof` contracts,
+`RunpodDispatcher`, and the `lme-runpod-*` executable names are compatibility
+surfaces for recoverable executions and migration rollback. New campaign and
+registry code loads independently of them, and new WLO dynamic-worker
+executions must not call them.
 
 `bin/rpof workers --json` emits a short-lived
 `dynamic-worker-registry/v0.1` snapshot. This is the provider-neutral worker
 discovery seam for consumers such as WLO; consumers do not read RPOF fleet,
 bootstrap, tunnel, or provider state directly. Only records marked `READY` are
 eligible for new work.
+
+`ExecutionPoolFulfill` is also compatibility orchestration: although it uses
+legitimate provider-capacity operations underneath, it consumes the historical
+execution-pool request contract and coordinates readiness for the older guarded
+WLO/RPOF path. It is not part of the campaign/registry production surface.
 
 ## Safety
 

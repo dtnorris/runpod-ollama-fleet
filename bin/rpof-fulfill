@@ -9,7 +9,7 @@ require "rbconfig"
 ROOT = File.expand_path("..", __dir__)
 ENV["LME_REPO"] = ROOT
 $LOAD_PATH.unshift File.join(ROOT, "lib")
-require "local_model_evaluation"
+require "local_model_evaluation/capacity"
 require "local_model_evaluation/runpod_fulfill_options"
 
 opts = {

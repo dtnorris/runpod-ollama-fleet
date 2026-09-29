@@ -6,7 +6,7 @@ require "optparse"
 
 ROOT = File.expand_path("..", __dir__)
 $LOAD_PATH.unshift File.join(ROOT, "lib")
-require "runpod_ollama_fleet"
+require "runpod_ollama_fleet/compatibility"
 require "local_model_evaluation/runpod_fleet_namespace"
 require "local_model_evaluation/runpod_fleet_state"
 

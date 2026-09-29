@@ -3,8 +3,10 @@
 
 require "json"
 require "optparse"
+require "dotenv"
 
 ROOT = File.expand_path("..", __dir__)
+Dotenv.load(File.join(ROOT, ".env"))
 $LOAD_PATH.unshift File.join(ROOT, "lib")
 require "runpod_ollama_fleet"
 

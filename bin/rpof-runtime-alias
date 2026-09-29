@@ -7,7 +7,7 @@ require "optparse"
 
 ROOT = File.expand_path("..", __dir__)
 $LOAD_PATH.unshift File.join(ROOT, "lib")
-require "local_model_evaluation"
+require "local_model_evaluation/capacity"
 
 opts = {
   fleet: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY),

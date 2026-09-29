@@ -29,3 +29,11 @@ The campaign does not duplicate paid-budget fields. DW-05 remains responsible
 for the parent cumulative-spend limit, immutable deadline/runtime lease,
 guardian cadence, and crash-surviving teardown lifecycle. DW-06 will enforce
 the declared aggregate worker and hourly-rate ceilings.
+
+## Ownership boundary
+
+Campaign `plan`, `start`, `status`, and `stop` manage provider capacity only.
+They do not accept jobs, job IDs, commands, environment payloads, affinity,
+attempts, or result paths, and they do not load RPOF's historical dispatch
+implementation. Worker discovery is published separately through
+`bin/rpof workers --json`; WLO owns assignment and execution.

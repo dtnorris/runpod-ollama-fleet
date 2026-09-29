@@ -1,16 +1,10 @@
 # frozen_string_literal: true
 
-require_relative "local_model_evaluation"
 require_relative "runpod_ollama_fleet/version"
-require_relative "runpod_ollama_fleet/contract_v0_1"
 require_relative "runpod_ollama_fleet/execution_pool_hardware"
 require_relative "runpod_ollama_fleet/capacity_campaign"
 require_relative "runpod_ollama_fleet/campaign_budget_binding"
 require_relative "runpod_ollama_fleet/campaign_capacity_admission"
 require_relative "runpod_ollama_fleet/campaign_lifecycle"
 require_relative "runpod_ollama_fleet/campaign_runpod_runtime"
-require_relative "runpod_ollama_fleet/execution_pool_fulfill"
-require_relative "runpod_ollama_fleet/capability_check"
-require_relative "runpod_ollama_fleet/dispatch_v0_1"
 require_relative "runpod_ollama_fleet/dynamic_worker_registry"
-require_relative "runpod_ollama_fleet/owner_watch"

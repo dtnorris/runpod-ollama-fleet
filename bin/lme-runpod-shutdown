@@ -9,7 +9,7 @@ require "rbconfig"
 ROOT = File.expand_path("..", __dir__)
 Dotenv.load(File.join(ROOT, ".env"))
 $LOAD_PATH.unshift File.join(ROOT, "lib")
-require "local_model_evaluation"
+require "local_model_evaluation/capacity"
 
 STATE_ROOT = File.join(ROOT, "output", "runpod-fleets")
 
