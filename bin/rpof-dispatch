@@ -10,12 +10,22 @@ require "runpod_ollama_fleet"
 require "local_model_evaluation/runpod_fleet_namespace"
 require "local_model_evaluation/runpod_fleet_state"
 
-opts = { request: nil, workdir: nil, output: nil, dynamic_worker_admission: false }
+opts = { request: nil, workdir: nil, output: nil, owner_fd: nil, dynamic_worker_admission: false }
+interrupted_signal = nil
+%w[INT TERM].each do |signal|
+  Signal.trap(signal) do
+    next if interrupted_signal
+
+    interrupted_signal = signal
+    Thread.main.raise(Interrupt, "received #{signal}")
+  end
+end
 parser = OptionParser.new do |o|
   o.banner = "Usage: bin/rpof dispatch --request FILE --workdir DIR --output DIR"
   o.on("--request FILE") { |v| opts[:request] = v }
   o.on("--workdir DIR") { |v| opts[:workdir] = v }
   o.on("--output DIR") { |v| opts[:output] = v }
+  o.on("--owner-fd N", Integer, "Inherited WLO owner-liveness pipe") { |v| opts[:owner_fd] = v }
   o.on("--dynamic-worker-admission", "Allow already-prepared workers to join while jobs remain unclaimed") { opts[:dynamic_worker_admission] = true }
 end
 
@@ -32,6 +42,7 @@ rescue OptionParser::ParseError, JSON::ParserError, SystemCallError, RunpodOllam
 end
 
 begin
+  RunpodOllamaFleet::OwnerWatch.new(fd: opts.fetch(:owner_fd)).start if opts[:owner_fd]
   target = request.fetch("target")
   namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
     root: File.join(ROOT, "output", "runpod-fleets"),
@@ -51,9 +62,11 @@ begin
   ).run(request, dynamic_worker_admission: opts.fetch(:dynamic_worker_admission))
   puts "Dispatch #{summary.fetch('status')}: #{summary.fetch('completed_count')} completed, #{summary.fetch('failed_count')} failed, #{summary.fetch('not_started_count')} not started."
   exit(summary.fetch("status") == "completed" ? 0 : 1)
-rescue LocalModelEvaluation::RunpodFleetNamespace::Error => e
+rescue LocalModelEvaluation::RunpodFleetNamespace::Error, RunpodOllamaFleet::OwnerWatch::Error => e
   warn "ERROR: #{e.message}"
   exit 1
 rescue Interrupt
-  exit 130
+  signal = interrupted_signal || "INT"
+  warn "ERROR: dispatch interrupted by #{signal}; active workload children were terminated"
+  exit(128 + Signal.list.fetch(signal, 2))
 end
