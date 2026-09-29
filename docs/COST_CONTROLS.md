@@ -8,10 +8,12 @@ Nothing changes until `bin/rpof cost enable` is run.
 
 ## Recommended production pattern
 
-For a lifecycle-managed production fleet, use soft limits to stop assigning new jobs
-between inference requests and hard limits as the final emergency teardown. Managed is
-the default; use `persistent` only when automatic AFIO terminal retirement should be
-disabled:
+For a manually administered or historically managed fleet, soft limits can
+stop provider dispatch between inference requests, while hard limits remain
+the final emergency teardown. `managed` is the provider default;
+`persistent` disables that fleet's automatic terminal retirement. Automatic
+AdventureFinder workload execution instead uses WLO's finite paid budget and
+capacity lifecycle, with RPOF's independent provider safeguards:
 
 ```bash
 bin/rpof cost configure \

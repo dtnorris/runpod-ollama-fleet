@@ -1,14 +1,16 @@
 # runpod-ollama-fleet (RPOF)
 
-**RPOF (`runpod-ollama-fleet`)** is AdventureFinder's current/default supporting
-infrastructure for optional RunPod/Ollama remote compute. It owns provider mechanics,
-fleet lifecycle/state, readiness, leases/cost safety, bootstrap/tunnels, worker
-replacement/scaling, and generic remote dispatch. AdventureFinder inference intent,
-qualification, production-workload semantics, and result interpretation remain in
-**AFIO (`af-inference-orchestrator`)**.
+**RPOF (`runpod-ollama-fleet`)** owns optional RunPod/Ollama provider mechanics:
+fleet resources/state, readiness and bootstrap, tunnels, leases and cost
+safeguards, provider scaling/replacement, and opaque dispatch primitives.
+**AFW (`af-workloads`)** owns AdventureFinder workload intent, qualification,
+frozen scoring and result interpretation. **WLO (`workload-orchestrator`)** owns
+automatic placement, attempts, retries, pause/resume, breakers, guarded paid
+capacity and workload lifecycle. WLO invokes RPOF through a CLI and versioned
+JSON boundary; operators use `bin/rpof` directly for manual fleet administration.
 
-The AFIO ↔ RPOF boundary is CLI + versioned machine-readable files. The frozen v0.1
-interface is defined by the AdventureFinder architecture contracts.
+The frozen `afio-rpof/v0.1` wire names are compatibility identifiers, not a
+statement that AFIO owns present-day execution.
 
 ## Historical extraction provenance
 
@@ -27,21 +29,22 @@ surfaces. They are not the current repository identity.
 
 ## Reproduce the frozen extraction
 
-The historical extraction can still be reproduced from the renamed AFIO checkout,
-which retains the predecessor Git history and frozen source commit:
+The historical extraction can still be reproduced from an AFW checkout that
+retains the predecessor Git history and frozen source commit:
 
 ```bash
 cd /Users/davidnorris/code/runpod-ollama-fleet
-./script/import-frozen-lme
-./script/verify-frozen-import
+LME_SOURCE_REPO=../af-workloads ./script/import-frozen-lme
+LME_SOURCE_REPO=../af-workloads ./script/verify-frozen-import
 bundle install
 bundle exec rake test
 ```
 
-By default the importer reads the exact frozen Git objects from the sibling
-`af-inference-orchestrator` checkout. Override that only when necessary with
-`LME_SOURCE_REPO=/path/to/source-checkout`. The `LME_SOURCE_REPO` name is retained
-as a migration-compatibility identifier.
+The scripts still default to the historical sibling path
+`../af-inference-orchestrator`. The explicit override above points them at
+the current AFW checkout, which must retain the frozen predecessor commit.
+`LME_SOURCE_REPO` is a migration-compatibility variable; use another checkout
+only if it contains that exact commit.
 
 ## Operator entry point
 
@@ -61,9 +64,10 @@ bin/rpof status ...
 bin/rpof tunnels ...
 ```
 
-`capability-check` + `dispatch` are the frozen AFIO-facing v0.1 JSON interface.
-`dispatch-legacy` and the `lme-runpod-*` executable names remain compatibility
-surfaces for pre-split workflows.
+`capability-check` and `dispatch` retain the frozen `afio-rpof` v0.1 wire
+versions used by WLO's explicit compatibility adapter. `dispatch-legacy` and
+the `lme-runpod-*` executable names remain compatibility surfaces for
+pre-split workflows.
 
 ## Safety
 
