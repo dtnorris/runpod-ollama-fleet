@@ -92,7 +92,12 @@ class RunpodBudgetGuardianSupervisorTest < Minitest::Test
   end
 
   def test_non_darwin_platform_fails_closed_before_budget_arm
+    ENV.delete("RPOF_STATE_ROOT")
+    ENV.delete("RPOF_STATE_REPO_ROOT")
     supervisor = build_supervisor(platform: "linux")
+
+    assert_equal File.expand_path(@state_root), supervisor.instance_variable_get(:@fleet_state_root)
+    assert_equal File.expand_path(@repo), supervisor.instance_variable_get(:@fleet_state_repo_root)
 
     error = assert_raises(LocalModelEvaluation::RunpodBudgetGuardianSupervisor::Error) do
       supervisor.arm!(budget: @budget, request: budget_config)

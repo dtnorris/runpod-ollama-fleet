@@ -189,9 +189,17 @@ class CampaignLifecycleTest < Minitest::Test
   end
 
   def test_start_without_authorization_returns_plan_and_never_mutates
-    result = @lifecycle.start(authorize_paid: false)
+    lifecycle = RunpodOllamaFleet::CampaignLifecycle.new(
+      campaign: @campaign, binding: @binding,
+      runtime_factory: ->(*) { flunk "read-only start must not construct a provider runtime" },
+      wall_clock: -> { @now }
+    )
+
+    result = lifecycle.start(authorize_paid: false)
 
     assert result.fetch("authorization_required")
+    assert_nil result.fetch("projected_desired_hourly_rate_usd")
+    assert result.fetch("profiles").all? { |profile| profile["projected_worker_hourly_rate_usd"].nil? }
     refute File.exist?(@binding.state_path)
     assert_empty @events
   end

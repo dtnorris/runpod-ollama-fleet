@@ -10,6 +10,9 @@ class RunpodScriptsTest < Minitest::Test
   parallelize_me!
 
   REPO_ROOT = File.expand_path("..", __dir__)
+  SCRIPT_DEPENDENCIES = {
+    "setup_runpod_worker_remote.sh" => ["setup_runpod_ollama_worker.sh"]
+  }.freeze
 
   def setup
     @tmp = Dir.mktmpdir("lme-runpod-scripts-")
@@ -17,17 +20,7 @@ class RunpodScriptsTest < Minitest::Test
     @bin = File.join(@tmp, "bin")
     FileUtils.mkdir_p(File.join(@repo, "scripts"))
     FileUtils.mkdir_p(@bin)
-
-    %w[
-      runpod_ollama_tunnel.sh
-      setup_runpod_worker_remote.sh
-      setup_runpod_ollama_worker.sh
-    ].each do |name|
-      src = File.join(REPO_ROOT, "scripts", name)
-      dst = File.join(@repo, "scripts", name)
-      FileUtils.cp(src, dst)
-      FileUtils.chmod(0o755, dst)
-    end
+    @script_fixture_mutex = Mutex.new
 
     @identity = File.join(@tmp, "id_ed25519")
     File.write(@identity, "test-key\n")
@@ -196,6 +189,7 @@ class RunpodScriptsTest < Minitest::Test
   end
 
   def run_script(name, *args)
+    install_script_fixture(name)
     env = {
       "PATH" => "#{@bin}:#{ENV.fetch("PATH")}",
       "FAKE_SSH_LOG" => @ssh_log,
@@ -214,6 +208,17 @@ class RunpodScriptsTest < Minitest::Test
     end
 
     Open3.capture3(env, File.join(@repo, "scripts", name), *args)
+  end
+
+  def install_script_fixture(name)
+    @script_fixture_mutex.synchronize do
+      [name, *SCRIPT_DEPENDENCIES.fetch(name, [])].each do |script|
+        destination = File.join(@repo, "scripts", script)
+        next if File.file?(destination)
+
+        FileUtils.ln_s(File.join(REPO_ROOT, "scripts", script), destination)
+      end
+    end
   end
 
   def write_fake_ssh
