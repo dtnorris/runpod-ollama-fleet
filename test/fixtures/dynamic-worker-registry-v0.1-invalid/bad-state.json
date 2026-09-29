@@ -1,0 +1,23 @@
+{
+  "contract_version": "dynamic-worker-registry/v0.1",
+  "registry_id": "rpof-fixture",
+  "revision": 13,
+  "published_at": "2030-01-01T00:00:00Z",
+  "expires_at": "2030-01-01T00:05:00Z",
+  "workers": [
+    {
+      "worker_id": "worker-1",
+      "generation_id": "generation-2029-12-31T23:58:00Z",
+      "endpoint": "http://127.0.0.1:11441",
+      "state": "ready",
+      "labels": ["inference", "ollama", "remote"],
+      "capabilities": {
+        "gpu_id": "NVIDIA A40",
+        "ollama": {
+          "models": [{"model": "qualified-model:latest", "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "context_length": 131072, "fully_gpu_resident": true}]
+        }
+      },
+      "capability_fingerprint": "2995693d958654b0074ed25377b7e0a82f06b78c8411f71dcc0b4f9a0a7ea621"
+    }
+  ]
+}
