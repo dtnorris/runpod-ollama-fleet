@@ -291,6 +291,12 @@ class RunpodBootstrapTest < Minitest::Test
     assert_equal "100%", progress.fetch(:detail)
   end
 
+  def test_latest_meaningful_line_returns_nil_for_punctuation_only_output
+    runner = build_runner("/virtual/fake-remote.sh")
+
+    assert_nil runner.send(:latest_meaningful_line, "\n---\n")
+  end
+
   def test_parallel_bootstrap_emits_heartbeats_and_writes_only_current_fleet_run
     script = fake_remote_script(<<~'RUBY')
       worker = ARGV[ARGV.index("--worker") + 1]
