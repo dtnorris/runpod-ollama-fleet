@@ -70,6 +70,7 @@ module LocalModelEvaluation
       end
     rescue RunpodBudget::Error, RunpodClient::Error, RunpodFleet::Error,
            RunpodFleetNamespace::Error, KeyError, ArgumentError, TypeError => e
+      retain_teardown_failure(e)
       raise Error, e.message
     end
 
@@ -145,6 +146,15 @@ module LocalModelEvaluation
     end
 
     private
+
+    def retain_teardown_failure(error)
+      status = @budget.status
+      return unless status.fetch("state") == "TEARDOWN_REQUIRED" && status["teardown_started_at_utc"]
+
+      @budget.record_teardown_failure!(message: "#{error.class}: #{error.message}")
+    rescue RunpodBudget::Error, KeyError
+      nil
+    end
 
     def reconcile_absent_committed!(status)
       Array(status.fetch("owned_resources").values).each do |resource|

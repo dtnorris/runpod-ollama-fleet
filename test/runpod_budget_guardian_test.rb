@@ -12,6 +12,8 @@ class RunpodBudgetGuardianTest < Minitest::Test
   FakeNamespace = Struct.new(:fleet_key, :env_path, :state_root, :local_port_base, keyword_init: true)
 
   class FakeProvider
+    attr_accessor :list_error
+
     def initialize
       @pods = {}
     end
@@ -21,6 +23,7 @@ class RunpodBudgetGuardianTest < Minitest::Test
     end
 
     def list_pods
+      raise list_error if list_error
       @pods.values
     end
 
@@ -151,11 +154,19 @@ class RunpodBudgetGuardianTest < Minitest::Test
     @budget.begin_teardown!(reason: "fixture")
     # A request with no owned resources can close after a successful provider
     # absence probe; force that probe to fail before it can make the claim.
-    @provider.define_singleton_method(:list_pods) { raise LocalModelEvaluation::RunpodClient::Error.new(503, "unavailable") }
+    @provider.list_error = LocalModelEvaluation::RunpodClient::Error.new(503, "unavailable")
     assert_raises(LocalModelEvaluation::RunpodBudgetGuardian::Error) { build_guardian.tick }
     status = @budget.status
     assert_equal "in_progress", status.fetch("teardown_phase")
     assert_nil status["provider_absence_verified_at_utc"]
+    assert_equal 1, status.fetch("teardown_failures").length
+    assert_includes status.dig("teardown_failures", 0, "message"), "unavailable"
+
+    @provider.list_error = nil
+    closed = build_guardian.tick
+    assert_equal "CLOSED", closed.fetch("state")
+    assert_equal "verified_provider_absence", closed.fetch("teardown_phase")
+    assert_equal status.fetch("teardown_failures"), closed.fetch("teardown_failures")
   end
 
   def test_stale_orchestrator_heartbeat_triggers_crash_teardown_and_close

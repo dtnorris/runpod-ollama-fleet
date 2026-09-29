@@ -15,6 +15,7 @@ module LocalModelEvaluation
   # heartbeat here and calls evaluate! on its own cadence.
   class RunpodBudget
     CONTRACT_VERSION = "afio-production-burst-budget/v0.1"
+    CAMPAIGN_CONTRACT_VERSION = "rpof-capacity-campaign-parent-budget/v0.1"
     STATE_CONTRACT_VERSION = "rpof-production-burst-budget-state/v0.1"
     STATES = %w[ARMED TEARDOWN_REQUIRED CLOSED].freeze
     SOURCES = %w[guardian orchestrator].freeze
@@ -73,12 +74,14 @@ module LocalModelEvaluation
           "limits" => normalized,
           "accrued_compute_usd" => 0.0,
           "committed_rate_usd_per_hour" => 0.0,
+          "committed_worker_count" => 0,
           "committed_maximum_liability_usd" => 0.0,
           "reservations" => {},
           "owned_resources" => {},
           "teardown_reason" => nil,
           "teardown_required_at_utc" => nil,
           "teardown_started_at_utc" => nil,
+          "teardown_failures" => [],
           "provider_absence_verified_at_utc" => nil,
           "closed_at_utc" => nil
         }
@@ -233,6 +236,24 @@ module LocalModelEvaluation
             limit
           )
         end
+        if campaign_budget?(document)
+          rate_limit = Float(document.dig("limits", "max_aggregate_hourly_rate_usd"))
+          if derived.fetch("committed_rate_usd_per_hour") > rate_limit + 1e-9
+            document.fetch("reservations").delete(reservation_id)
+            raise Error, format(
+              "budget reservation would exceed aggregate hourly ceiling: $%.6f/hr > $%.6f/hr",
+              derived.fetch("committed_rate_usd_per_hour"),
+              rate_limit
+            )
+          end
+          worker_limit = Integer(document.dig("limits", "max_workers"))
+          if derived.fetch("committed_worker_count") > worker_limit
+            document.fetch("reservations").delete(reservation_id)
+            raise Error,
+                  "budget reservation would exceed worker ceiling: " \
+                  "#{derived.fetch('committed_worker_count')} > #{worker_limit}"
+          end
+        end
 
         persist!(document, now:)
         Marshal.load(Marshal.dump(reservation))
@@ -385,6 +406,28 @@ module LocalModelEvaluation
       end
     end
 
+    # Retain durable evidence when the independent guardian cannot complete
+    # teardown. A later successful retry may still verify absence and close the
+    # budget, but it must not erase the earlier failure evidence.
+    def record_teardown_failure!(message:)
+      detail = nonempty_string(message, "teardown failure")
+      with_lock do
+        document = load_state!
+        unless document.fetch("state") == "TEARDOWN_REQUIRED"
+          raise Error, "teardown failure evidence requires a teardown-required budget"
+        end
+
+        now = utc_now
+        document["teardown_failures"] ||= []
+        document.fetch("teardown_failures") << {
+          "at_utc" => now.iso8601,
+          "message" => detail
+        }
+        persist!(document, now:)
+        snapshot(document, now:)
+      end
+    end
+
     def close!
       with_lock do
         document = load_state!
@@ -407,18 +450,25 @@ module LocalModelEvaluation
       budget = value.respond_to?(:transform_keys) ? value.transform_keys(&:to_s) : nil
       raise Error, "budget must be an object" unless budget.is_a?(Hash)
 
-      required = %w[
+      base_required = %w[
         contract_version budget_id plan_sha256 max_cumulative_compute_usd
         max_runtime_seconds guardian_poll_seconds
         orchestrator_heartbeat_timeout_seconds teardown_reserve_seconds
       ]
+      version = budget.fetch("contract_version", nil)
+      required = base_required.dup
+      case version
+      when CONTRACT_VERSION
+        # Existing AFIO production-burst callers retain their frozen shape.
+      when CAMPAIGN_CONTRACT_VERSION
+        required.concat(%w[campaign_binding_sha256 max_aggregate_hourly_rate_usd max_workers])
+      else
+        raise Error, "unsupported budget contract_version #{version.inspect}"
+      end
       missing = required.reject { |key| budget.key?(key) }
       raise Error, "budget is missing required field(s): #{missing.join(', ')}" unless missing.empty?
       unknown = budget.keys - required
       raise Error, "budget has unknown field(s): #{unknown.sort.join(', ')}" unless unknown.empty?
-      unless budget.fetch("contract_version") == CONTRACT_VERSION
-        raise Error, "unsupported budget contract_version #{budget.fetch('contract_version').inspect}"
-      end
       unless budget.fetch("budget_id").to_s == @budget_id
         raise Error, "budget id does not match budget ledger identity"
       end
@@ -427,7 +477,7 @@ module LocalModelEvaluation
       end
 
       normalized = {
-        "contract_version" => CONTRACT_VERSION,
+        "contract_version" => version,
         "budget_id" => @budget_id,
         "plan_sha256" => @plan_sha256,
         "max_cumulative_compute_usd" => positive_float(budget.fetch("max_cumulative_compute_usd"), "maximum cumulative compute cost"),
@@ -439,6 +489,18 @@ module LocalModelEvaluation
         ),
         "teardown_reserve_seconds" => positive_float(budget.fetch("teardown_reserve_seconds"), "teardown reserve")
       }
+      if version == CAMPAIGN_CONTRACT_VERSION
+        binding_sha = budget.fetch("campaign_binding_sha256").to_s.downcase
+        unless binding_sha.match?(DIGEST) && binding_sha == @plan_sha256
+          raise Error, "campaign binding sha256 must match budget plan identity"
+        end
+        normalized["campaign_binding_sha256"] = binding_sha
+        normalized["max_aggregate_hourly_rate_usd"] = positive_float(
+          budget.fetch("max_aggregate_hourly_rate_usd"),
+          "maximum aggregate hourly rate"
+        )
+        normalized["max_workers"] = positive_integer(budget.fetch("max_workers"), "maximum workers")
+      end
       if normalized.fetch("orchestrator_heartbeat_timeout_seconds") < 2 * normalized.fetch("guardian_poll_seconds")
         raise Error, "orchestrator heartbeat timeout must be at least twice the guardian poll interval"
       end
@@ -468,9 +530,7 @@ module LocalModelEvaluation
                elsif heartbeat_age(document, "guardian", now:) > 2 * Float(document.dig("limits", "guardian_poll_seconds"))
                  "stale_guardian_heartbeat"
                else
-                 derived = derived_values(document, now:)
-                 limit = Float(document.dig("limits", "max_cumulative_compute_usd"))
-                 "cumulative_budget_threshold" if derived.fetch("committed_maximum_liability_usd") >= limit
+                 budget_violation(document, now:)
                end
       transition_to_teardown!(document, reason, now:) if reason
       document
@@ -509,6 +569,7 @@ module LocalModelEvaluation
 
     def snapshot(document, now:)
       copy = Marshal.load(Marshal.dump(document))
+      copy["teardown_failures"] ||= []
       update_derived!(copy, now:)
       limits = copy.fetch("limits")
       copy["remaining_uncommitted_budget_usd"] = [
@@ -521,7 +582,8 @@ module LocalModelEvaluation
                                    copy.fetch("orchestrator_heartbeat_age_seconds") <= Float(limits.fetch("orchestrator_heartbeat_timeout_seconds")) &&
                                    copy.fetch("guardian_heartbeat_age_seconds") <= 2 * Float(limits.fetch("guardian_poll_seconds")) &&
                                    now < parse_time(copy.fetch("deadline_at_utc"), "budget deadline") &&
-                                   Float(copy.fetch("committed_maximum_liability_usd")) < Float(limits.fetch("max_cumulative_compute_usd"))
+                                   Float(copy.fetch("committed_maximum_liability_usd")) < Float(limits.fetch("max_cumulative_compute_usd")) &&
+                                   campaign_capacity_within_limits?(copy)
       copy["teardown_phase"] = if copy["state"] == "CLOSED" && copy["provider_absence_verified_at_utc"]
                                   "verified_provider_absence"
                                 elsif copy["state"] == "CLOSED"
@@ -540,6 +602,7 @@ module LocalModelEvaluation
       values = derived_values(document, now:)
       document["accrued_compute_usd"] = values.fetch("accrued_compute_usd").round(6)
       document["committed_rate_usd_per_hour"] = values.fetch("committed_rate_usd_per_hour").round(6)
+      document["committed_worker_count"] = values.fetch("committed_worker_count")
       document["committed_maximum_liability_usd"] = values.fetch("committed_maximum_liability_usd").round(6)
     end
 
@@ -571,6 +634,8 @@ module LocalModelEvaluation
       end
       pending_rate = pending_reservations.sum { |reservation| Float(reservation.fetch("max_hourly_rate_delta_usd")) }
       committed_rate = active_rate + pending_rate
+      committed_workers = resources.count { |resource| resource.fetch("status") == "active" } +
+                          pending_reservations.length
       limits = document.fetch("limits")
       horizon = Float(limits.fetch("guardian_poll_seconds")) +
                 Float(limits.fetch("orchestrator_heartbeat_timeout_seconds")) +
@@ -579,6 +644,7 @@ module LocalModelEvaluation
       {
         "accrued_compute_usd" => accrued,
         "committed_rate_usd_per_hour" => committed_rate,
+        "committed_worker_count" => committed_workers,
         "committed_maximum_liability_usd" => accrued + reserve
       }
     rescue KeyError, ArgumentError, TypeError => e
@@ -588,6 +654,32 @@ module LocalModelEvaluation
     def heartbeat_age(document, source, now:)
       value = document.fetch("last_#{source}_heartbeat_at_utc")
       [now - parse_time(value, "#{source} heartbeat"), 0.0].max
+    end
+
+    def budget_violation(document, now:)
+      derived = derived_values(document, now:)
+      cumulative = Float(document.dig("limits", "max_cumulative_compute_usd"))
+      return "cumulative_budget_threshold" if derived.fetch("committed_maximum_liability_usd") >= cumulative
+      return nil unless campaign_budget?(document)
+
+      rate = Float(document.dig("limits", "max_aggregate_hourly_rate_usd"))
+      return "aggregate_hourly_rate_ceiling" if derived.fetch("committed_rate_usd_per_hour") > rate + 1e-9
+      workers = Integer(document.dig("limits", "max_workers"))
+      return "worker_ceiling" if derived.fetch("committed_worker_count") > workers
+
+      nil
+    end
+
+    def campaign_capacity_within_limits?(document)
+      return true unless campaign_budget?(document)
+
+      Float(document.fetch("committed_rate_usd_per_hour")) <=
+        Float(document.dig("limits", "max_aggregate_hourly_rate_usd")) + 1e-9 &&
+        Integer(document.fetch("committed_worker_count")) <= Integer(document.dig("limits", "max_workers"))
+    end
+
+    def campaign_budget?(document)
+      document.dig("limits", "contract_version") == CAMPAIGN_CONTRACT_VERSION
     end
 
     def ensure_guardian_fresh!(budget, guardian_at, now)
@@ -650,6 +742,12 @@ module LocalModelEvaluation
       number
     rescue ArgumentError, TypeError
       raise Error, "#{label} must be positive and finite"
+    end
+
+    def positive_integer(value, label)
+      return value if value.is_a?(Integer) && value.positive?
+
+      raise Error, "#{label} must be a positive integer"
     end
 
     def parse_time(value, label)
