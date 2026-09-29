@@ -213,6 +213,7 @@ class RunpodBudgetTest < Minitest::Test
 
     closed = @budget.close!
     assert_equal "CLOSED", closed.fetch("state")
+    assert_equal "closed_without_provider_verification", closed.fetch("teardown_phase")
   end
 
   def test_stale_orchestrator_heartbeat_transitions_to_teardown_and_blocks_mutation

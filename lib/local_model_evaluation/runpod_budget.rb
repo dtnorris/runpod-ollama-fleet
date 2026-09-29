@@ -78,6 +78,8 @@ module LocalModelEvaluation
           "owned_resources" => {},
           "teardown_reason" => nil,
           "teardown_required_at_utc" => nil,
+          "teardown_started_at_utc" => nil,
+          "provider_absence_verified_at_utc" => nil,
           "closed_at_utc" => nil
         }
         persist!(document, now:)
@@ -356,6 +358,33 @@ module LocalModelEvaluation
       end
     end
 
+    # The guardian records these transitions around its provider calls. A
+    # teardown request alone is never evidence that paid pods are absent.
+    def mark_teardown_in_progress!
+      with_lock do
+        document = load_state!
+        raise Error, "teardown has not been requested" unless document.fetch("state") == "TEARDOWN_REQUIRED"
+        now = utc_now
+        document["teardown_started_at_utc"] ||= now.iso8601
+        persist!(document, now:)
+        snapshot(document, now:)
+      end
+    end
+
+    def mark_provider_absence_verified!
+      with_lock do
+        document = load_state!
+        raise Error, "teardown has not started" unless document["teardown_started_at_utc"]
+        active = document.fetch("owned_resources").values.any? { |row| row.fetch("status") == "active" }
+        pending = document.fetch("reservations").values.any? { |row| row.fetch("status") == "pending" }
+        raise Error, "budget still has provider liability" if active || pending
+        now = utc_now
+        document["provider_absence_verified_at_utc"] ||= now.iso8601
+        persist!(document, now:)
+        snapshot(document, now:)
+      end
+    end
+
     def close!
       with_lock do
         document = load_state!
@@ -493,6 +522,17 @@ module LocalModelEvaluation
                                    copy.fetch("guardian_heartbeat_age_seconds") <= 2 * Float(limits.fetch("guardian_poll_seconds")) &&
                                    now < parse_time(copy.fetch("deadline_at_utc"), "budget deadline") &&
                                    Float(copy.fetch("committed_maximum_liability_usd")) < Float(limits.fetch("max_cumulative_compute_usd"))
+      copy["teardown_phase"] = if copy["state"] == "CLOSED" && copy["provider_absence_verified_at_utc"]
+                                  "verified_provider_absence"
+                                elsif copy["state"] == "CLOSED"
+                                  "closed_without_provider_verification"
+                                elsif copy["teardown_started_at_utc"]
+                                  "in_progress"
+                                elsif copy["state"] == "TEARDOWN_REQUIRED"
+                                  "requested"
+                                else
+                                  "not_requested"
+                                end
       copy
     end
 

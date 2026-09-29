@@ -164,6 +164,7 @@ module LocalModelEvaluation
     end
 
     def teardown!(status)
+      @budget.mark_teardown_in_progress!
       reason = status.fetch("teardown_reason").to_s
       reason = "budget_guardian" if reason.empty?
       active = status.fetch("owned_resources").values.select { |row| row.fetch("status") == "active" }
@@ -211,6 +212,7 @@ module LocalModelEvaluation
       pending_remaining = latest.fetch("reservations").values.any? { |row| row.fetch("status") == "pending" }
       return latest if active_remaining || pending_remaining
 
+      @budget.mark_provider_absence_verified!
       @budget.close!
     end
 
