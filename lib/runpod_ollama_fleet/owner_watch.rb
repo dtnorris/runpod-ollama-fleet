@@ -18,7 +18,9 @@ module RunpodOllamaFleet
     end
 
     def start
-      io = IO.for_fd(@fd, autoclose: true)
+      # The caller owns the inherited descriptor. A second autoclosing IO
+      # would close it later during GC, possibly after its number was reused.
+      io = IO.for_fd(@fd, autoclose: false)
       Thread.new do
         io.read
         @on_loss.call

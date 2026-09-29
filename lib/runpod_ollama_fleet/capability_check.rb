@@ -267,7 +267,7 @@ module RunpodOllamaFleet
       requirements.fetch("models").each do |requirement|
         name = requirement.fetch("name").to_s
         digest = requirement.fetch("expected_digest").to_s.downcase
-        observations = workers.map do |worker|
+        workers.each do |worker|
           index = Integer(worker.fetch("index"))
           pod_id = worker.fetch("pod_id").to_s
           row = rows.reverse.find do |candidate|

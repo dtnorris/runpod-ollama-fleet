@@ -14,6 +14,9 @@ class OwnerWatchTest < Minitest::Test
 
     assert_equal :lost, losses.pop
     thread.join
+    thread = nil
+    GC.start
+    assert reader.stat.pipe?, "the owner watch must not close the caller's descriptor"
   ensure
     reader&.close unless reader&.closed?
     writer&.close unless writer&.closed?
