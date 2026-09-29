@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "digest"
 require "fileutils"
 require "json"
 require "time"
@@ -7,7 +8,8 @@ require_relative "runpod_workers"
 
 module LocalModelEvaluation
   class RunpodFleetState
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
+    LEGACY_SCHEMA_VERSION = 1
     STATE_FILE = "fleet.json"
     CURRENT_FILE = "current"
     ARTIFACT_DIRS = %w[bootstrap tunnels lease runtime-alias].freeze
@@ -73,7 +75,13 @@ module LocalModelEvaluation
 
       worker_started_at = lease ? Time.parse(lease.fetch("started_at_utc")).utc : timestamp
       worker_records = workers.map do |worker|
-        worker_record(worker, created_at: worker_started_at, generation: 1, gpu_id: gpu_id)
+        worker_record(
+          worker,
+          fleet_id:,
+          created_at: worker_started_at,
+          generation: 1,
+          gpu_id:
+        )
       end
 
       record = {
@@ -114,7 +122,7 @@ module LocalModelEvaluation
     end
 
     def add_workers(workers:, created_at_utc_by_index:, gpu_id: nil)
-      record = active_record!
+      record = identity_record!
       workers = Array(workers).sort_by(&:index)
       raise Error, "cannot add an empty worker set" if workers.empty?
       existing_count = Integer(record.fetch("worker_count"))
@@ -130,7 +138,14 @@ module LocalModelEvaluation
         started_at = parse_time(created_at_utc_by_index.fetch(index), "burst_#{worker.index} created_at_utc")
         retired = latest_retired_worker(record, index)
         generation = retired ? Integer(retired.fetch("generation", 1)) + 1 : 1
-        entry = worker_record(worker, created_at: started_at, generation:, gpu_id:)
+        entry = worker_record(
+          worker,
+          fleet_id: record.fetch("fleet_id"),
+          created_at: started_at,
+          generation:,
+          worker_id: retired && retired.fetch("worker_id"),
+          gpu_id:
+        )
         if retired
           history = Array(retired["history"]).map(&:dup)
           history << historical_worker(retired)
@@ -184,7 +199,7 @@ module LocalModelEvaluation
     end
 
     def begin_replacement(index)
-      record = active_record!
+      record = identity_record!
       worker = fetch_worker!(record, index)
       return record if worker["status"] == "replacing"
       unless %w[active destroyed].include?(worker["status"].to_s)
@@ -230,7 +245,7 @@ module LocalModelEvaluation
     end
 
     def complete_replacement(worker:, created_at_utc:, gpu_id: nil)
-      record = active_record!
+      record = identity_record!
       index = Integer(worker.index)
       old = fetch_worker!(record, index)
       unless old["status"] == "destroyed" && old["replacement_pending"]
@@ -252,8 +267,10 @@ module LocalModelEvaluation
       history << historical_worker(old)
       replacement = worker_record(
         worker,
+        fleet_id: record.fetch("fleet_id"),
         created_at: parse_time(created_at_utc, "burst_#{index} replacement created_at_utc"),
         generation: Integer(old.fetch("generation", 1)) + 1,
+        worker_id: old.fetch("worker_id"),
         gpu_id: gpu_id || old["gpu_id"] || record.dig("gpu", "id")
       )
       replacement["history"] = history
@@ -340,6 +357,34 @@ module LocalModelEvaluation
       File.join(fleet_dir(fleet_id), key)
     end
 
+    # Returns the provider-neutral identities that DW-02 may place in a
+    # dynamic-worker-registry/v0.1 record. Provider observation is mandatory:
+    # authoritative state must never be projected onto a replacement pod that
+    # happens to reuse the same slot or local endpoint.
+    def registry_identity(index:, observed_pod_id:)
+      record = identity_record!
+      worker = fetch_worker!(record, index)
+      observed = nonempty_string(observed_pod_id, "observed provider pod id")
+      persisted = nonempty_string(worker.fetch("pod_id"), "persisted provider pod id")
+      unless observed == persisted
+        raise Error,
+              "burst_#{index} provider pod identity mismatch: state records #{persisted.inspect}, " \
+              "observation reports #{observed.inspect}"
+      end
+
+      {
+        "worker_id" => worker.fetch("worker_id"),
+        "generation_id" => worker.fetch("generation_id")
+      }
+    rescue KeyError => e
+      raise Error, "worker identity is incomplete: #{e.message}"
+    end
+
+    def assert_durable_worker_identity!
+      identity_record!
+      true
+    end
+
     private
 
     def current_path
@@ -395,6 +440,18 @@ module LocalModelEvaluation
       record
     end
 
+    def identity_record!
+      record = active_record!
+      version = Integer(record.fetch("schema_version"))
+      return record if version == SCHEMA_VERSION
+
+      raise Error,
+            "fleet state schema #{version} predates durable worker identity; " \
+            "destroy/recreate the fleet before identity-sensitive lifecycle or registry publication"
+    rescue KeyError, ArgumentError, TypeError => e
+      raise Error, "fleet state lacks unambiguous durable worker identity: #{e.message}"
+    end
+
     def fetch_worker!(record, index)
       index = RunpodWorkers.validate_index(index)
       worker = record.fetch("workers").find { |candidate| Integer(candidate.fetch("index")) == index }
@@ -410,17 +467,25 @@ module LocalModelEvaluation
         .max_by { |worker| Integer(worker.fetch("generation", 1)) }
     end
 
-    def worker_record(worker, created_at:, generation:, gpu_id: nil)
+    def worker_record(worker, fleet_id:, created_at:, generation:, worker_id: nil, gpu_id: nil)
+      index = Integer(worker.index)
+      pod_id = nonempty_string(worker.pod_id, "provider pod id")
+      generation = Integer(generation)
+      raise Error, "worker generation must be positive" unless generation.positive?
+      worker_id ||= build_worker_id(fleet_id, index)
+      generation_id = build_generation_id(worker_id, generation, pod_id)
       record = {
-        "index" => Integer(worker.index),
+        "index" => index,
         "name" => worker.name,
-        "pod_id" => worker.pod_id,
+        "pod_id" => pod_id,
         "host" => worker.host,
         "ssh_port" => Integer(worker.ssh_port),
         "hourly_rate_usd" => Float(worker.hourly_rate),
-        "local_ollama_url" => "http://127.0.0.1:#{@local_port_base + Integer(worker.index) - 1}",
+        "local_ollama_url" => "http://127.0.0.1:#{@local_port_base + index - 1}",
         "status" => "active",
-        "generation" => Integer(generation),
+        "generation" => generation,
+        "worker_id" => worker_id,
+        "generation_id" => generation_id,
         "created_at_utc" => created_at.utc.iso8601
       }
       selected_gpu = gpu_id.to_s.strip
@@ -429,9 +494,31 @@ module LocalModelEvaluation
     end
 
     def historical_worker(worker)
-      %w[generation name pod_id host ssh_port hourly_rate_usd gpu_id created_at_utc destroyed_at_utc].each_with_object({}) do |key, out|
+      %w[
+        generation worker_id generation_id name pod_id host ssh_port hourly_rate_usd gpu_id
+        created_at_utc destroyed_at_utc
+      ].each_with_object({}) do |key, out|
         out[key] = worker[key] if worker.key?(key)
       end
+    end
+
+    def build_worker_id(fleet_id, index)
+      digest = Digest::SHA256.hexdigest(JSON.generate(["rpof-worker", fleet_id, index]))
+      "worker-#{digest}"
+    end
+
+    def build_generation_id(worker_id, generation, pod_id)
+      digest = Digest::SHA256.hexdigest(
+        JSON.generate(["rpof-generation", worker_id, generation, pod_id])
+      )
+      "generation-#{digest}"
+    end
+
+    def nonempty_string(value, label)
+      result = value.to_s
+      raise Error, "#{label} must not be empty" if result.empty?
+
+      result
     end
 
     def worker_started_at(worker, record)
@@ -549,6 +636,10 @@ module LocalModelEvaluation
     end
 
     def validate_record!(record)
+      schema_version = Integer(record.fetch("schema_version"))
+      unless [LEGACY_SCHEMA_VERSION, SCHEMA_VERSION].include?(schema_version)
+        raise Error, "unsupported fleet state schema #{schema_version}"
+      end
       workers = Array(record.fetch("workers"))
       validate_worker_indices!(workers.map { |worker| worker.fetch("index") })
       expected_count = RunpodWorkers.validate_count(record.fetch("worker_count"))
@@ -557,10 +648,16 @@ module LocalModelEvaluation
       end
       normalize_lease(record["lease"]) if record["lease"]
       normalize_provisioning(record["provisioning"]) if record["provisioning"]
+      if schema_version == SCHEMA_VERSION
+        worker_ids = workers.map { |worker| worker.fetch("worker_id") }
+        raise Error, "active worker_id values must be unique" unless worker_ids.uniq.length == worker_ids.length
+      end
+
       tracked_workers = workers + Array(record["retired_workers"])
       tracked_workers.each do |worker|
-        RunpodWorkers.validate_index(worker.fetch("index"))
-        Integer(worker.fetch("generation", 1))
+        index = RunpodWorkers.validate_index(worker.fetch("index"))
+        generation = Integer(worker.fetch("generation", 1))
+        validate_worker_identity!(record, worker, index, generation) if schema_version == SCHEMA_VERSION
         if worker.key?("gpu_id") && worker.fetch("gpu_id").to_s.strip.empty?
           raise Error, "worker gpu_id must not be empty"
         end
@@ -569,12 +666,43 @@ module LocalModelEvaluation
           parse_time(worker.fetch("destroyed_at_utc"), "worker destroyed_at_utc")
         end
         Array(worker["history"]).each do |prior|
-          Integer(prior.fetch("generation", 1))
+          prior_generation = Integer(prior.fetch("generation", 1))
           prior.fetch("pod_id")
+          validate_historical_identity!(worker, prior, prior_generation) if schema_version == SCHEMA_VERSION
         end
       end
     rescue KeyError, ArgumentError, TypeError, RunpodWorkers::Error => e
       raise Error, "invalid fleet state: #{e.message}"
+    end
+
+    def validate_worker_identity!(record, worker, index, generation)
+      raise Error, "worker generation must be positive" unless generation.positive?
+
+      worker_id = nonempty_string(worker.fetch("worker_id"), "worker_id")
+      unless worker_id.match?(/\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z/)
+        raise Error, "worker_id has invalid contract syntax"
+      end
+      expected_worker_id = build_worker_id(record.fetch("fleet_id"), index)
+      raise Error, "worker_id does not match its durable fleet slot" unless worker_id == expected_worker_id
+
+      validate_generation_identity!(worker, worker_id, generation)
+    end
+
+    def validate_historical_identity!(worker, prior, generation)
+      worker_id = prior.fetch("worker_id")
+      unless worker_id == worker.fetch("worker_id")
+        raise Error, "worker history changes logical worker_id"
+      end
+
+      validate_generation_identity!(prior, worker_id, generation)
+    end
+
+    def validate_generation_identity!(worker, worker_id, generation)
+      pod_id = nonempty_string(worker.fetch("pod_id"), "provider pod id")
+      generation_id = nonempty_string(worker.fetch("generation_id"), "generation_id")
+      raise Error, "generation_id exceeds 256 characters" if generation_id.length > 256
+      expected = build_generation_id(worker_id, generation, pod_id)
+      raise Error, "generation_id does not match durable generation evidence" unless generation_id == expected
     end
 
     def validate_worker_indices!(values)

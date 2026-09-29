@@ -273,6 +273,7 @@ class RunpodFleetLifecycleTest < Minitest::Test
 
   def test_replace_preserves_logical_slot_and_records_physical_generation
     activate([worker(1, "old_1"), worker(2, "old_2")])
+    original = @state.current.fetch("workers").find { |entry| entry.fetch("index") == 2 }
     preflight = @lifecycle.preflight_replace(worker_index: 2, max_fleet_hourly_usd: 3.0)
     @client.events.clear
 
@@ -290,6 +291,8 @@ class RunpodFleetLifecycleTest < Minitest::Test
     current = state.fetch("workers").find { |entry| entry.fetch("index") == 2 }
     assert_equal "new_2_1", current.fetch("pod_id")
     assert_equal 2, current.fetch("generation")
+    assert_equal original.fetch("worker_id"), current.fetch("worker_id")
+    refute_equal original.fetch("generation_id"), current.fetch("generation_id")
     assert_equal "old_2", current.fetch("history").last.fetch("pod_id")
     assert_equal "http://127.0.0.1:11442", current.fetch("local_ollama_url")
     assert_equal "new_2_1", env_value("RUNPOD_BURST_2_POD_ID")
@@ -316,6 +319,31 @@ class RunpodFleetLifecycleTest < Minitest::Test
     assert_equal true, slot.fetch("replacement_pending")
     assert_in_delta 0.5, state.fetch("fleet_hourly_rate_usd"), 0.0001
     assert_nil env_value("RUNPOD_BURST_2_POD_ID")
+  end
+
+  def test_identity_sensitive_preflights_reject_legacy_state_before_provider_calls
+    fleet = activate([worker(1, "old_1")])
+    path = @state.state_path(fleet.fetch("fleet_id"))
+    record = JSON.parse(File.read(path))
+    record["schema_version"] = 1
+    record.fetch("workers").each do |entry|
+      entry.delete("worker_id")
+      entry.delete("generation_id")
+    end
+    File.write(path, JSON.pretty_generate(record))
+
+    scale_error = assert_raises(LocalModelEvaluation::RunpodFleetLifecycle::Error) do
+      @lifecycle.preflight_scale(target_worker_count: 2, max_fleet_hourly_usd: 3.0)
+    end
+    replace_error = assert_raises(LocalModelEvaluation::RunpodFleetLifecycle::Error) do
+      @lifecycle.preflight_replace(worker_index: 1, max_fleet_hourly_usd: 3.0)
+    end
+
+    assert_includes scale_error.message, "predates durable worker identity"
+    assert_includes replace_error.message, "predates durable worker identity"
+    assert_empty @client.catalog_calls
+    assert_empty @client.created_bodies
+    assert_empty @client.deleted_ids
   end
 
   def test_lifecycle_refuses_legacy_fleet_without_provisioning_metadata

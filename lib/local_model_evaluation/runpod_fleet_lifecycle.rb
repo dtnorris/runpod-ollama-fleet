@@ -63,6 +63,7 @@ module LocalModelEvaluation
       cap = positive_float(max_fleet_hourly_usd, "max fleet hourly cost")
 
       if target > current_count
+        assert_durable_worker_identity!
         ensure_lease_active!(fleet)
         inactive = Array(fleet.fetch("workers")).reject { |worker| worker["status"] == "active" }
         unless inactive.empty?
@@ -141,6 +142,7 @@ module LocalModelEvaluation
 
     def preflight_replace(worker_index:, max_fleet_hourly_usd: RunpodFleet::DEFAULT_MAX_FLEET_HOURLY_USD)
       fleet = lifecycle_fleet!
+      assert_durable_worker_identity!
       index = validate_worker_index(worker_index)
       worker = worker_by_index(fleet, index)
       raise Error, "current fleet does not contain burst_#{index}" unless worker
@@ -374,6 +376,12 @@ module LocalModelEvaluation
     end
 
     private
+
+    def assert_durable_worker_identity!
+      @fleet_state.assert_durable_worker_identity!
+    rescue RunpodFleetState::Error => e
+      raise Error, e.message
+    end
 
     def with_lifecycle_lock(fleet_id)
       path = File.join(@fleet_state.fleet_dir(fleet_id), ".lifecycle.lock")
