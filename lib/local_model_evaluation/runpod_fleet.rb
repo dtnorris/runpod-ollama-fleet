@@ -119,7 +119,8 @@ module LocalModelEvaluation
     end
 
     def initialize(client:, env_path:, out: $stdout, sleeper: nil, clock: nil, state_root: nil, wall_clock: nil,
-                   fleet_key: "default", local_port_base: RunpodFleetState::DEFAULT_LOCAL_PORT_BASE)
+                   fleet_key: "default", local_port_base: RunpodFleetState::DEFAULT_LOCAL_PORT_BASE,
+                   capacity_admission: nil)
       @client = client
       @fleet_key = fleet_key.to_s
       unless @fleet_key.match?(/\A[a-z0-9][a-z0-9_-]{0,31}\z/)
@@ -136,6 +137,8 @@ module LocalModelEvaluation
       @out = out
       @sleeper = sleeper || ->(seconds) { sleep seconds }
       @clock = clock || -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+      @capacity_admission = capacity_admission
+      validate_capacity_admission!
     end
 
     attr_reader :env_file, :fleet_state, :fleet_key
@@ -300,6 +303,7 @@ module LocalModelEvaluation
       validate_public_key_value!(ssh_public_key)
 
       created = []
+      campaign_handles = {}
       workers = []
       fleet_record = nil
       lease_started_at = if lease_configured?(max_runtime_seconds, max_spend_usd) || lease_deadline_at
@@ -324,10 +328,19 @@ module LocalModelEvaluation
 
       begin
         (1..worker_count).each do |index|
-          pod = @client.create_pod(
-            create_body(index, ssh_public_key, cloud, container_disk_gb:, volume_gb:, network_volume_id:,
-                        global_volume_id:)
+          body = create_body(
+            index, ssh_public_key, cloud, container_disk_gb:, volume_gb:, network_volume_id:,
+            global_volume_id:
           )
+          handle = reserve_campaign_capacity(
+            operation_type: "create",
+            logical_resource_id: "burst_#{index}",
+            max_hourly_rate_delta_usd: preflight.hourly_rate,
+            gpu_id: preflight.gpu.fetch("id"),
+            cloud:
+          )
+          campaign_handles[index] = handle if handle
+          pod = attempt_campaign_create(handle) { @client.create_pod(body) }
           pod_id = pod["id"].to_s
           raise Error, "RunPod create response for #{worker_name(index)} did not include a pod id" if pod_id.empty?
 
@@ -349,7 +362,7 @@ module LocalModelEvaluation
           min_ready_workers:
         )
         unless unaccepted.empty?
-          delete_unaccepted_created(unaccepted)
+          delete_unaccepted_created(unaccepted, campaign_handles:)
           accepted_indices = workers.map(&:index)
           created = created.select { |index, _pod_id| accepted_indices.include?(index) }
           @out.puts "Partial fleet accepted: #{workers.length}/#{worker_count} requested worker(s); minimum was #{min_ready_workers}."
@@ -363,6 +376,13 @@ module LocalModelEvaluation
           )
         end
         validate_initial_lease!(lease, actual_fleet_rate) if lease
+        workers.each do |worker|
+          commit_campaign_capacity(
+            campaign_handles[worker.index],
+            provider_resource_id: worker.pod_id,
+            actual_hourly_rate_usd: worker.hourly_rate
+          )
+        end
 
         fleet_record = with_fleet_state do
           @fleet_state.activate(
@@ -371,6 +391,7 @@ module LocalModelEvaluation
             gpu_id: gpu_id,
             image: IMAGE,
             lease:,
+            campaign_authority: @capacity_admission&.authority_identity,
             provisioning: {
               "container_disk_gb" => container_disk_gb,
               "volume_gb" => volume_gb
@@ -397,7 +418,7 @@ module LocalModelEvaluation
           end
           remove_worker_env(workers.map(&:index), clear_fleet: true)
         end
-        rollback(created)
+        rollback(created, campaign_handles:)
         raise
       end
     end
@@ -588,15 +609,26 @@ module LocalModelEvaluation
       accepted
     end
 
-    def delete_unaccepted_created(unaccepted)
+    def delete_unaccepted_created(unaccepted, campaign_handles: {})
       @out.puts "Deleting #{unaccepted.length} unaccepted requested pod(s) before fleet activation."
       unaccepted.reverse_each do |index, pod_id|
         begin
           @client.delete_pod(pod_id)
           @out.puts "Deleted unaccepted #{worker_name(index)}: #{pod_id}"
+          verify_pod_absent!(pod_id, wait_seconds: 30.0, poll_seconds: 1.0) if campaign_handles[index]
+          record_campaign_absence(
+            campaign_handles[index],
+            provider_resource_id: pod_id,
+            reason: "unaccepted initial campaign worker verified absent"
+          )
         rescue RunpodClient::Error => e
           if e.status == 404
             @out.puts "Already absent unaccepted #{worker_name(index)}: #{pod_id}"
+            record_campaign_absence(
+              campaign_handles[index],
+              provider_resource_id: pod_id,
+              reason: "unaccepted initial campaign worker already absent"
+            )
           else
             raise
           end
@@ -656,7 +688,7 @@ module LocalModelEvaluation
       @env_file.update({}, remove: keys)
     end
 
-    def rollback(created)
+    def rollback(created, campaign_handles: {})
       return if created.empty?
 
       @out.puts "Provisioning failed; deleting #{created.length} newly-created pod(s)."
@@ -664,11 +696,72 @@ module LocalModelEvaluation
         begin
           @client.delete_pod(pod_id)
           @out.puts "Rolled back #{worker_name(index)}: #{pod_id}"
+          if campaign_handles[index]
+            verify_pod_absent!(pod_id, wait_seconds: 30.0, poll_seconds: 1.0)
+            record_campaign_absence(
+              campaign_handles[index],
+              provider_resource_id: pod_id,
+              reason: "failed initial campaign provisioning verified absent"
+            )
+          end
         rescue StandardError => e
           @out.puts "WARNING: rollback failed for #{worker_name(index)} #{pod_id}: #{e.message}"
         end
       end
       @out.puts "Local .env was not updated."
+    end
+
+    def validate_capacity_admission!
+      return unless @capacity_admission
+
+      required = %i[
+        authority_identity profile_id reserve! attempt_provider_create! commit!
+        provider_absence_verified!
+      ]
+      missing = required.reject { |name| @capacity_admission.respond_to?(name) }
+      unless missing.empty?
+        raise Error, "campaign capacity admission is missing: #{missing.join(', ')}"
+      end
+      unless @capacity_admission.profile_id == @fleet_key
+        raise Error,
+              "campaign profile #{@capacity_admission.profile_id.inspect} must use matching fleet namespace #{@fleet_key.inspect}"
+      end
+
+      true
+    end
+
+    def reserve_campaign_capacity(**keywords)
+      return nil unless @capacity_admission
+
+      @capacity_admission.reserve!(**keywords)
+    rescue StandardError => e
+      raise Error, e.message
+    end
+
+    def attempt_campaign_create(handle, &)
+      return yield unless handle
+
+      @capacity_admission.attempt_provider_create!(handle, &)
+    end
+
+    def commit_campaign_capacity(handle, provider_resource_id:, actual_hourly_rate_usd:)
+      return unless handle
+
+      @capacity_admission.commit!(handle, provider_resource_id:, actual_hourly_rate_usd:)
+    rescue StandardError => e
+      raise Error, e.message
+    end
+
+    def record_campaign_absence(handle, provider_resource_id:, reason:)
+      return unless handle
+
+      @capacity_admission.provider_absence_verified!(
+        handle,
+        provider_resource_id:,
+        reason:
+      )
+    rescue StandardError => e
+      @out.puts "WARNING: could not release campaign liability for #{provider_resource_id}: #{e.message}"
     end
 
     def resolve_pod_for_destroy(index, pod_id, live_pods)

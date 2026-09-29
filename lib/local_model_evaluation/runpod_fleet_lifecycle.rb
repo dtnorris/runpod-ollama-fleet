@@ -34,7 +34,8 @@ module LocalModelEvaluation
     )
 
     def initialize(client:, fleet_state:, env_path:, fleet_key:, local_port_base:, out: $stdout,
-                   sleeper: nil, monotonic_clock: nil, wall_clock: nil)
+                   sleeper: nil, monotonic_clock: nil, wall_clock: nil,
+                   capacity_admission: nil)
       @client = client
       @fleet_state = fleet_state
       @env_file = RunpodFleet::EnvFile.new(File.expand_path(env_path))
@@ -44,6 +45,8 @@ module LocalModelEvaluation
       @sleeper = sleeper || ->(seconds) { sleep seconds }
       @monotonic_clock = monotonic_clock || -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
       @wall_clock = wall_clock || -> { Time.now.utc }
+      @capacity_admission = capacity_admission
+      validate_capacity_admission!
     rescue ArgumentError, TypeError
       raise Error, "local port base must be an integer"
     end
@@ -187,6 +190,7 @@ module LocalModelEvaluation
 
       with_lifecycle_lock(preflight.fleet_id) do
         fleet = lifecycle_fleet!(expected_fleet_id: preflight.fleet_id)
+        require_matching_campaign_admission!(fleet)
         current_count = Integer(fleet.fetch("worker_count"))
         target = validate_worker_count(target_worker_count)
         unless current_count == preflight.current_worker_count && target == preflight.target_worker_count
@@ -203,6 +207,7 @@ module LocalModelEvaluation
         created = []
         created_at = {}
         pending_rates = {}
+        campaign_handles = {}
         env_written = false
 
         begin
@@ -210,9 +215,16 @@ module LocalModelEvaluation
             current = lifecycle_fleet!(expected_fleet_id: preflight.fleet_id)
             ensure_lease_capacity!(current, pending_started_at: created_at, pending_rates:)
             created_at[index] = utc_now
-            pod = @client.create_pod(
-              create_body(index, ssh_public_key, fleet.fetch("cloud"), profile:, gpu_id: selected_gpu_id)
+            body = create_body(index, ssh_public_key, fleet.fetch("cloud"), profile:, gpu_id: selected_gpu_id)
+            handle = reserve_campaign_capacity(
+              operation_type: "scale_up",
+              logical_resource_id: "burst_#{index}",
+              max_hourly_rate_delta_usd: preflight.hourly_rate,
+              gpu_id: selected_gpu_id,
+              cloud: fleet.fetch("cloud")
             )
+            campaign_handles[index] = handle if handle
+            pod = attempt_campaign_create(handle) { @client.create_pod(body) }
             pod_id = pod["id"].to_s
             raise Error, "RunPod create response for #{worker_name(index)} did not include a pod id" if pod_id.empty?
 
@@ -238,6 +250,13 @@ module LocalModelEvaluation
           ensure_lease_capacity!(current, pending_started_at: created_at, pending_rates: actual_pending_rates)
           projected_rate = active_hourly_rate(current) + workers.sum(&:hourly_rate)
           enforce_fleet_cap!(projected_rate, cap)
+          workers.each do |worker|
+            commit_campaign_capacity(
+              campaign_handles[worker.index],
+              provider_resource_id: worker.pod_id,
+              actual_hourly_rate_usd: worker.hourly_rate
+            )
+          end
 
           write_worker_env(workers, fleet_id: preflight.fleet_id)
           env_written = true
@@ -245,7 +264,7 @@ module LocalModelEvaluation
           workers
         rescue Interrupt, StandardError => e
           remove_worker_env(preflight.worker_indices) if env_written
-          rollback(created)
+          rollback(created, campaign_handles:)
           raise e if e.is_a?(Interrupt) || e.is_a?(Error)
           raise Error, e.message
         end
@@ -258,6 +277,7 @@ module LocalModelEvaluation
 
       with_lifecycle_lock(preflight.fleet_id) do
         fleet = lifecycle_fleet!(expected_fleet_id: preflight.fleet_id, enforce_lease: false)
+        require_matching_campaign_admission!(fleet) if @capacity_admission
         current_count = Integer(fleet.fetch("worker_count"))
         target = validate_worker_count(target_worker_count)
         unless current_count == preflight.current_worker_count && target == preflight.target_worker_count
@@ -280,6 +300,10 @@ module LocalModelEvaluation
 
           reject_unexpected_replacement_name!(worker)
           delete_scaled_worker_pod(worker)
+          if @capacity_admission
+            verify_provider_absent!(worker.fetch("pod_id"))
+            mark_campaign_resource_absent!(worker.fetch("pod_id"))
+          end
           @fleet_state.retire_tail_worker(index, destroyed_at_utc: utc_now)
           remove_worker_env([index])
           retired << index
@@ -296,6 +320,7 @@ module LocalModelEvaluation
 
       with_lifecycle_lock(preflight.fleet_id) do
         fleet = lifecycle_fleet!(expected_fleet_id: preflight.fleet_id)
+        require_matching_campaign_admission!(fleet)
         provisioning_profile!(fleet)
         validate_public_key_value!(ssh_public_key)
         cap = positive_float(max_fleet_hourly_usd, "max fleet hourly cost")
@@ -312,6 +337,10 @@ module LocalModelEvaluation
         @fleet_state.begin_replacement(index)
         begin
           delete_replaced_pod(old_worker)
+          if @capacity_admission
+            verify_provider_absent!(old_worker.fetch("pod_id"))
+            mark_campaign_resource_absent!(old_worker.fetch("pod_id"))
+          end
         rescue Interrupt, StandardError => e
           begin
             @fleet_state.cancel_replacement(index)
@@ -325,6 +354,7 @@ module LocalModelEvaluation
         remove_worker_env([index])
 
         created = []
+        campaign_handles = {}
         env_written = false
         begin
           current = lifecycle_fleet!(expected_fleet_id: preflight.fleet_id)
@@ -332,9 +362,16 @@ module LocalModelEvaluation
           started_at = utc_now
           profile = provisioning_profile!(current)
           selected_gpu_id = preflight.gpu.fetch("id").to_s
-          pod = @client.create_pod(
-            create_body(index, ssh_public_key, fleet.fetch("cloud"), profile:, gpu_id: selected_gpu_id)
+          body = create_body(index, ssh_public_key, fleet.fetch("cloud"), profile:, gpu_id: selected_gpu_id)
+          handle = reserve_campaign_capacity(
+            operation_type: "replace",
+            logical_resource_id: "burst_#{index}",
+            max_hourly_rate_delta_usd: preflight.hourly_rate,
+            gpu_id: selected_gpu_id,
+            cloud: fleet.fetch("cloud")
           )
+          campaign_handles[index] = handle if handle
+          pod = attempt_campaign_create(handle) { @client.create_pod(body) }
           pod_id = pod["id"].to_s
           raise Error, "RunPod create response for #{worker_name(index)} did not include a pod id" if pod_id.empty?
           created << [index, pod_id]
@@ -361,6 +398,11 @@ module LocalModelEvaluation
           )
           projected_rate = active_hourly_rate(current) + worker.hourly_rate
           enforce_fleet_cap!(projected_rate, cap)
+          commit_campaign_capacity(
+            handle,
+            provider_resource_id: worker.pod_id,
+            actual_hourly_rate_usd: worker.hourly_rate
+          )
 
           write_worker_env([worker], fleet_id: preflight.fleet_id)
           env_written = true
@@ -368,7 +410,7 @@ module LocalModelEvaluation
           worker
         rescue Interrupt, StandardError => e
           remove_worker_env([index]) if env_written
-          rollback(created)
+          rollback(created, campaign_handles:)
           raise e if e.is_a?(Interrupt) || e.is_a?(Error)
           raise Error, e.message
         end
@@ -661,17 +703,114 @@ module LocalModelEvaluation
       @env_file.update({}, remove: keys)
     end
 
-    def rollback(created)
+    def rollback(created, campaign_handles: {})
       return if created.empty?
       @out.puts "Lifecycle operation failed; deleting #{created.length} newly-created pod(s)."
       created.reverse_each do |index, pod_id|
         begin
           @client.delete_pod(pod_id)
           @out.puts "Rolled back #{worker_name(index)}: #{pod_id}"
+          if campaign_handles[index]
+            verify_provider_absent!(pod_id)
+            record_campaign_absence(
+              campaign_handles[index],
+              provider_resource_id: pod_id,
+              reason: "failed campaign lifecycle mutation verified absent"
+            )
+          end
         rescue StandardError => e
           @out.puts "WARNING: rollback failed for #{worker_name(index)} #{pod_id}: #{e.message}"
         end
       end
+    end
+
+    def validate_capacity_admission!
+      return unless @capacity_admission
+
+      required = %i[
+        authority_identity profile_id assert_matches! reserve! attempt_provider_create!
+        commit! provider_absence_verified! mark_resource_absent!
+      ]
+      missing = required.reject { |name| @capacity_admission.respond_to?(name) }
+      unless missing.empty?
+        raise Error, "campaign capacity admission is missing: #{missing.join(', ')}"
+      end
+      unless @capacity_admission.profile_id == @fleet_key
+        raise Error,
+              "campaign profile #{@capacity_admission.profile_id.inspect} must use matching fleet namespace #{@fleet_key.inspect}"
+      end
+
+      true
+    end
+
+    def require_matching_campaign_admission!(fleet)
+      authority = fleet["campaign_authority"]
+      if authority && !@capacity_admission
+        raise Error, "campaign-owned fleet requires its matching parent campaign authority"
+      end
+      if @capacity_admission && !authority
+        raise Error, "campaign authority cannot mutate a legacy non-campaign fleet"
+      end
+      @capacity_admission&.assert_matches!(authority)
+      true
+    rescue StandardError => e
+      raise Error, e.message
+    end
+
+    def reserve_campaign_capacity(**keywords)
+      return nil unless @capacity_admission
+
+      @capacity_admission.reserve!(**keywords)
+    rescue StandardError => e
+      raise Error, e.message
+    end
+
+    def attempt_campaign_create(handle, &)
+      return yield unless handle
+
+      @capacity_admission.attempt_provider_create!(handle, &)
+    end
+
+    def commit_campaign_capacity(handle, provider_resource_id:, actual_hourly_rate_usd:)
+      return unless handle
+
+      @capacity_admission.commit!(handle, provider_resource_id:, actual_hourly_rate_usd:)
+    rescue StandardError => e
+      raise Error, e.message
+    end
+
+    def record_campaign_absence(handle, provider_resource_id:, reason:)
+      @capacity_admission.provider_absence_verified!(
+        handle,
+        provider_resource_id:,
+        reason:
+      )
+    rescue StandardError => e
+      @out.puts "WARNING: could not release campaign liability for #{provider_resource_id}: #{e.message}"
+    end
+
+    def mark_campaign_resource_absent!(provider_resource_id)
+      @capacity_admission.mark_resource_absent!(provider_resource_id:)
+    rescue StandardError => e
+      raise Error, "could not release verified-absent campaign resource: #{e.message}"
+    end
+
+    def verify_provider_absent!(provider_resource_id, wait_seconds: 30.0, poll_seconds: 1.0)
+      deadline = @monotonic_clock.call + wait_seconds
+      loop do
+        begin
+          @client.get_pod(provider_resource_id)
+        rescue RunpodClient::Error => e
+          return true if e.status == 404
+          raise
+        end
+        if @monotonic_clock.call >= deadline
+          raise Error, "provider still reports deleted pod #{provider_resource_id} after #{wait_seconds} seconds"
+        end
+        @sleeper.call(poll_seconds)
+      end
+    rescue RunpodClient::Error => e
+      raise Error, e.message
     end
 
     def ensure_lease_active!(fleet)

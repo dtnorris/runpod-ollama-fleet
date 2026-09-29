@@ -14,6 +14,11 @@ module LocalModelEvaluation
     CURRENT_FILE = "current"
     ARTIFACT_DIRS = %w[bootstrap tunnels lease runtime-alias].freeze
     DEFAULT_LOCAL_PORT_BASE = 11_441
+    CAMPAIGN_AUTHORITY_VERSION = "rpof-capacity-campaign-fleet-authority/v0.1"
+    CAMPAIGN_AUTHORITY_KEYS = %w[
+      contract_version binding_sha256 campaign_identity_sha256 budget_id profile_id
+    ].freeze
+    SHA256 = /\A[0-9a-f]{64}\z/
 
     class Error < StandardError; end
 
@@ -59,7 +64,8 @@ module LocalModelEvaluation
       clear_current(record.fetch("fleet_id"))
     end
 
-    def activate(workers:, cloud:, gpu_id:, image:, lease: nil, provisioning: nil)
+    def activate(workers:, cloud:, gpu_id:, image:, lease: nil, provisioning: nil,
+                 campaign_authority: nil)
       assert_no_active!
 
       workers = Array(workers).sort_by(&:index)
@@ -67,6 +73,7 @@ module LocalModelEvaluation
       validate_worker_indices!(workers.map(&:index))
       lease = normalize_lease(lease)
       provisioning = normalize_provisioning(provisioning)
+      campaign_authority = normalize_campaign_authority(campaign_authority)
 
       timestamp = utc_now
       fleet_id = build_fleet_id(timestamp, workers.first.pod_id)
@@ -108,6 +115,7 @@ module LocalModelEvaluation
       }
       record["lease"] = lease if lease
       record["provisioning"] = provisioning if provisioning
+      record["campaign_authority"] = campaign_authority if campaign_authority
 
       begin
         ARTIFACT_DIRS.each { |name| FileUtils.mkdir_p(File.join(dir, name)) }
@@ -583,6 +591,32 @@ module LocalModelEvaluation
       raise Error, "invalid provisioning metadata: #{e.message}"
     end
 
+    def normalize_campaign_authority(value)
+      return nil if value.nil?
+      raise Error, "campaign authority must be a hash" unless value.is_a?(Hash)
+
+      data = value.transform_keys(&:to_s)
+      missing = CAMPAIGN_AUTHORITY_KEYS - data.keys
+      unknown = data.keys - CAMPAIGN_AUTHORITY_KEYS
+      raise Error, "campaign authority missing field(s): #{missing.join(', ')}" unless missing.empty?
+      raise Error, "campaign authority has unknown field(s): #{unknown.sort.join(', ')}" unless unknown.empty?
+      unless data.fetch("contract_version") == CAMPAIGN_AUTHORITY_VERSION
+        raise Error, "campaign authority contract version is unsupported"
+      end
+      %w[binding_sha256 campaign_identity_sha256].each do |key|
+        unless data.fetch(key).is_a?(String) && data.fetch(key).match?(SHA256)
+          raise Error, "campaign authority #{key} must be a lowercase SHA-256 digest"
+        end
+      end
+      %w[budget_id profile_id].each do |key|
+        text = data.fetch(key)
+        unless text.is_a?(String) && text.match?(/\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z/)
+          raise Error, "campaign authority #{key} has invalid format"
+        end
+      end
+      data
+    end
+
     def positive_integer(value, label)
       number = Integer(value)
       raise Error, "#{label} must be a positive integer" unless number.positive?
@@ -648,6 +682,7 @@ module LocalModelEvaluation
       end
       normalize_lease(record["lease"]) if record["lease"]
       normalize_provisioning(record["provisioning"]) if record["provisioning"]
+      normalize_campaign_authority(record["campaign_authority"]) if record["campaign_authority"]
       if schema_version == SCHEMA_VERSION
         worker_ids = workers.map { |worker| worker.fetch("worker_id") }
         raise Error, "active worker_id values must be unique" unless worker_ids.uniq.length == worker_ids.length

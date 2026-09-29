@@ -192,12 +192,13 @@ module RunpodOllamaFleet
     # Produces an immutable proof that a proposed capacity mutation is within
     # the parent authority. DW-06 will wire this seam into live admission.
     def mutation_authority!(expected_binding_sha256:, additional_workers:,
-                            additional_hourly_rate_usd:)
+                            additional_hourly_rate_usd:, profile_id: nil)
       with_lock do
         mutation_authority_locked!(
           expected_binding_sha256:,
           additional_workers:,
-          additional_hourly_rate_usd:
+          additional_hourly_rate_usd:,
+          profile_id:
         )
       end
     rescue LocalModelEvaluation::RunpodBudget::Error,
@@ -212,15 +213,17 @@ module RunpodOllamaFleet
                                    logical_resource_id:, max_hourly_rate_delta_usd:,
                                    additional_workers: 1, reservation_id: nil)
       profile = profile_id.to_s
-      unless campaign.profiles.any? { |row| row.fetch("profile_id") == profile }
-        raise Error, "unknown campaign profile_id #{profile_id.inspect}"
+      profile_definition!(profile)
+      unless additional_workers == 1
+        raise Error, "one durable campaign reservation must represent exactly one worker"
       end
 
       with_lock do
         proof = mutation_authority_locked!(
           expected_binding_sha256:,
           additional_workers:,
-          additional_hourly_rate_usd: max_hourly_rate_delta_usd
+          additional_hourly_rate_usd: max_hourly_rate_delta_usd,
+          profile_id: profile
         )
         reservation = @parent_budget.reserve_mutation!(
           operation_type:,
@@ -237,6 +240,61 @@ module RunpodOllamaFleet
         }
       end
     rescue LocalModelEvaluation::RunpodBudget::Error => e
+      raise Error, e.message
+    end
+
+    def commit_capacity_mutation!(expected_binding_sha256:, profile_id:, reservation_id:,
+                                  provider_resource_id:, actual_hourly_rate_usd:,
+                                  started_at_utc: nil)
+      with_lock do
+        verify_expected_binding!(expected_binding_sha256)
+        verify_capacity_reservation!(reservation_id, profile_id:, expected_status: "pending")
+        @parent_budget.commit_mutation!(
+          reservation_id:,
+          provider_resource_id:,
+          actual_hourly_rate_usd:,
+          started_at_utc:
+        )
+      end
+    rescue LocalModelEvaluation::RunpodBudget::Error => e
+      raise Error, e.message
+    end
+
+    def release_capacity_reservation!(expected_binding_sha256:, profile_id:, reservation_id:,
+                                      reason:, mutation_not_attempted: false,
+                                      provider_absence_verified: false)
+      with_lock do
+        verify_expected_binding!(expected_binding_sha256)
+        verify_capacity_reservation!(reservation_id, profile_id:, expected_status: "pending")
+        @parent_budget.release_reservation!(
+          reservation_id:,
+          reason:,
+          mutation_not_attempted:,
+          provider_absence_verified:
+        )
+      end
+    rescue LocalModelEvaluation::RunpodBudget::Error => e
+      raise Error, e.message
+    end
+
+    def mark_capacity_resource_absent!(expected_binding_sha256:, profile_id:,
+                                       provider_resource_id:, stopped_at_utc: nil)
+      with_lock do
+        verify_expected_binding!(expected_binding_sha256)
+        ledger = @parent_budget.status
+        resource = ledger.fetch("owned_resources").fetch(provider_resource_id.to_s) do
+          raise Error, "provider resource is not owned by this campaign authority"
+        end
+        unless resource.fetch("fleet_key") == profile_id.to_s
+          raise Error, "provider resource belongs to a different campaign profile"
+        end
+        @parent_budget.mark_resource_absent!(
+          provider_resource_id:,
+          verified_absent: true,
+          stopped_at_utc:
+        )
+      end
+    rescue LocalModelEvaluation::RunpodBudget::Error, KeyError => e
       raise Error, e.message
     end
 
@@ -324,9 +382,8 @@ module RunpodOllamaFleet
     end
 
     def mutation_authority_locked!(expected_binding_sha256:, additional_workers:,
-                                   additional_hourly_rate_usd:)
-      expected = digest!(expected_binding_sha256, "expected binding sha256")
-      raise Error, "mutation authority belongs to a different campaign budget" unless expected == binding_sha256
+                                   additional_hourly_rate_usd:, profile_id: nil)
+      verify_expected_binding!(expected_binding_sha256)
 
       binding = load_state!
       unless binding.fetch("phase") == "ARMED"
@@ -352,6 +409,13 @@ module RunpodOllamaFleet
       if projected_rate > declaration.fetch("max_aggregate_hourly_rate_usd") + 1e-9
         raise Error, "capacity mutation would exceed campaign aggregate hourly ceiling"
       end
+      profile = profile_id && profile_definition!(profile_id.to_s)
+      if profile
+        current_profile_workers = authority.fetch("committed_workers_by_profile").fetch(profile_id.to_s, 0)
+        if current_profile_workers + workers > profile.fetch("max_workers")
+          raise Error, "capacity mutation would exceed profile #{profile_id.inspect} worker ceiling"
+        end
+      end
 
       projected_additional = projected_rate * authority.fetch("crash_liability_horizon_seconds") / 3600.0
       projected_total = ledger.fetch("accrued_compute_usd") + projected_additional
@@ -372,6 +436,12 @@ module RunpodOllamaFleet
         "projected_hourly_rate_usd" => projected_rate.round(6),
         "projected_maximum_liability_usd" => projected_total.round(6)
       }
+      if profile
+        proof["profile_id"] = profile_id.to_s
+        proof["profile_max_workers"] = profile.fetch("max_workers")
+        proof["projected_profile_workers"] =
+          authority.fetch("committed_workers_by_profile").fetch(profile_id.to_s, 0) + workers
+      end
       deep_freeze(proof)
     end
 
@@ -379,6 +449,13 @@ module RunpodOllamaFleet
       active = ledger.fetch("owned_resources").values.count { |row| row.fetch("status") == "active" }
       pending = ledger.fetch("reservations").values.count { |row| row.fetch("status") == "pending" }
       workers = active + pending
+      by_profile = Hash.new(0)
+      ledger.fetch("owned_resources").each_value do |row|
+        by_profile[row.fetch("fleet_key")] += 1 if row.fetch("status") == "active"
+      end
+      ledger.fetch("reservations").each_value do |row|
+        by_profile[row.fetch("fleet_key")] += 1 if row.fetch("status") == "pending"
+      end
       rate = Float(ledger.fetch("committed_rate_usd_per_hour"))
       horizon = declaration.fetch("guardian_poll_seconds") +
                 declaration.fetch("orchestrator_heartbeat_timeout_seconds") +
@@ -403,6 +480,7 @@ module RunpodOllamaFleet
         "max_workers" => declaration.fetch("max_workers"),
         "original_deadline_at_utc" => ledger.fetch("deadline_at_utc"),
         "committed_workers" => workers,
+        "committed_workers_by_profile" => by_profile.sort.to_h.freeze,
         "committed_hourly_rate_usd" => rate.round(6),
         "accrued_compute_usd" => Float(ledger.fetch("accrued_compute_usd")),
         "crash_liability_horizon_seconds" => horizon,
@@ -411,6 +489,31 @@ module RunpodOllamaFleet
         "violations" => violations.freeze,
         "mutation_allowed" => violations.empty?
       }.freeze
+    end
+
+    def verify_expected_binding!(value)
+      expected = digest!(value, "expected binding sha256")
+      return true if expected == binding_sha256
+
+      raise Error, "mutation authority belongs to a different campaign budget"
+    end
+
+    def profile_definition!(profile_id)
+      campaign.profiles.find { |row| row.fetch("profile_id") == profile_id } ||
+        raise(Error, "unknown campaign profile_id #{profile_id.inspect}")
+    end
+
+    def verify_capacity_reservation!(reservation_id, profile_id:, expected_status:)
+      reservation = @parent_budget.status.fetch("reservations").fetch(reservation_id.to_s) do
+        raise Error, "unknown campaign reservation #{reservation_id.inspect}"
+      end
+      unless reservation.fetch("fleet_key") == profile_id.to_s
+        raise Error, "campaign reservation belongs to a different profile"
+      end
+      unless reservation.fetch("status") == expected_status
+        raise Error, "campaign reservation is #{reservation.fetch('status').inspect}, not #{expected_status}"
+      end
+      reservation
     end
 
     def verify_ledger!(ledger)
