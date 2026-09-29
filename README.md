@@ -53,6 +53,7 @@ only if it contains that exact commit.
 ```text
 bin/rpof capability-check ...
 bin/rpof dispatch ...
+bin/rpof workers --json
 bin/rpof create ...
 bin/rpof destroy ...
 bin/rpof bootstrap ...
@@ -68,6 +69,12 @@ bin/rpof tunnels ...
 versions used by WLO's explicit compatibility adapter. `dispatch-legacy` and
 the `lme-runpod-*` executable names remain compatibility surfaces for
 pre-split workflows.
+
+`bin/rpof workers --json` emits a short-lived
+`dynamic-worker-registry/v0.1` snapshot. This is the provider-neutral worker
+discovery seam for consumers such as WLO; consumers do not read RPOF fleet,
+bootstrap, tunnel, or provider state directly. Only records marked `READY` are
+eligible for new work.
 
 ## Safety
 

@@ -1,0 +1,37 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "optparse"
+require "dotenv"
+
+ROOT = File.expand_path("..", __dir__)
+Dotenv.load(File.join(ROOT, ".env"))
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "runpod_ollama_fleet/dynamic_worker_registry"
+
+json = false
+parser = OptionParser.new do |options|
+  options.banner = "Usage: bin/rpof workers --json"
+  options.on("--json", "Emit dynamic-worker-registry/v0.1 JSON") { json = true }
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::MissingArgument, "--json" unless json
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+
+  state_root = ENV["RPOF_STATE_ROOT"].to_s.strip
+  state_root = File.join(ROOT, "output", "runpod-fleets") if state_root.empty?
+  state_repo_root = ENV["RPOF_STATE_REPO_ROOT"].to_s.strip
+  state_repo_root = ROOT if state_repo_root.empty?
+  registry = RunpodOllamaFleet::DynamicWorkerRegistry.new(state_root:, repo_root: state_repo_root)
+  $stdout.write(JSON.generate(registry.snapshot) + "\n")
+rescue OptionParser::ParseError => e
+  warn "ERROR: #{e.message}"
+  warn parser
+  exit 2
+rescue RunpodOllamaFleet::DynamicWorkerRegistry::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end

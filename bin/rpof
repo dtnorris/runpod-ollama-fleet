@@ -28,6 +28,8 @@ when "execution-pool-fulfill"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-execution-pool-fulfill"), *ARGV
 when "runtime-alias"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-runtime-alias"), *ARGV
+when "workers"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-workers"), *ARGV
 when "create"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-fleet"), "create", *ARGV
 when "destroy"
@@ -68,6 +70,7 @@ else
       fulfill
       execution-pool-fulfill
       runtime-alias
+      workers
       create
       destroy
       bootstrap
