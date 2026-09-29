@@ -109,13 +109,13 @@ module RunpodOllamaFleet
       runtime_aliases = load_runtime_aliases(state, fleet)
       tunnels = load_tunnels(state, fleet)
       Array(fleet.fetch("workers")).filter_map do |worker|
-        build_worker(fleet_key:, fleet:, worker:, bootstrap:, runtime_aliases:, tunnels:)
+        build_worker(state:, fleet:, worker:, bootstrap:, runtime_aliases:, tunnels:)
       end
     rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError, TypeError => e
       raise Error, "invalid source state for fleet #{fleet_key.inspect}: #{e.message}"
     end
 
-    def build_worker(fleet_key:, fleet:, worker:, bootstrap:, runtime_aliases:, tunnels:)
+    def build_worker(state:, fleet:, worker:, bootstrap:, runtime_aliases:, tunnels:)
       index = positive_integer(worker.fetch("index"), "worker index")
       pod_id = nonempty(worker.fetch("pod_id"), "worker pod identity")
       gpu_id = worker_gpu_id(fleet, worker)
@@ -123,10 +123,13 @@ module RunpodOllamaFleet
       return nil if models.empty?
 
       endpoint = valid_endpoint(worker.fetch("local_ollama_url"))
-      worker_id = logical_worker_id(fleet_key, index)
+      identity = state.registry_identity(
+        index:,
+        observed_pod_id: tunnels.dig(index, "pod_id")
+      )
       record = {
-        "worker_id" => worker_id,
-        "generation_id" => generation_id(fleet, worker, pod_id),
+        "worker_id" => identity.fetch("worker_id"),
+        "generation_id" => identity.fetch("generation_id"),
         "endpoint" => endpoint,
         "state" => registry_state(fleet, worker, bootstrap, tunnels, endpoint, pod_id),
         "labels" => LABELS,
@@ -310,24 +313,6 @@ module RunpodOllamaFleet
       nonempty(value, "worker GPU identity", max: 256)
     end
 
-    def logical_worker_id(fleet_key, index)
-      key = fleet_key.empty? ? LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY : fleet_key
-      value = "#{key}.burst-#{index}"
-      raise Error, "logical worker identity is invalid" unless value.match?(ID)
-      value
-    end
-
-    def generation_id(fleet, worker, pod_id)
-      material = JSON.generate(
-        "fleet_id" => nonempty(fleet.fetch("fleet_id"), "fleet identity"),
-        "worker_index" => positive_integer(worker.fetch("index"), "worker index"),
-        "generation" => positive_integer(worker.fetch("generation"), "worker generation"),
-        "pod_id" => pod_id,
-        "created_at_utc" => canonical_source_time(worker.fetch("created_at_utc"))
-      )
-      "rpof-generation-#{Digest::SHA256.hexdigest(material)}"
-    end
-
     def valid_endpoint(value)
       uri = URI.parse(value.to_s)
       unless %w[http https].include?(uri.scheme) && uri.host && !uri.host.empty? &&
@@ -385,12 +370,6 @@ module RunpodOllamaFleet
 
     def timestamp(value)
       value.utc.iso8601(0)
-    end
-
-    def canonical_source_time(value)
-      Time.iso8601(value.to_s).utc.iso8601(0)
-    rescue ArgumentError
-      raise Error, "worker generation time is invalid"
     end
 
     def nonempty(value, label, max: 256)

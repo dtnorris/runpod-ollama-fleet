@@ -10,13 +10,17 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
   DIGEST = "a" * 64
   NOW = Time.utc(2026, 9, 29, 18, 0, 0)
   REPO_ROOT = File.expand_path("..", __dir__)
+  FleetWorker = Struct.new(:index, :pod_id, :name, :host, :ssh_port, :hourly_rate, keyword_init: true)
 
   class FakeState
     attr_accessor :fleet
+    attr_reader :identities, :identity_observations
 
     def initialize(root, fleet)
       @root = root
       @fleet = fleet
+      @identities = {}
+      @identity_observations = []
     end
 
     def current = Marshal.load(Marshal.dump(fleet))
@@ -24,6 +28,17 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     def artifact_dir(fleet_id, name)
       raise "wrong fleet" unless fleet_id == fleet.fetch("fleet_id")
       File.join(@root, fleet_id, name)
+    end
+
+    def registry_identity(index:, observed_pod_id:)
+      worker = fleet.fetch("workers").find { |candidate| candidate.fetch("index") == index }
+      raise LocalModelEvaluation::RunpodFleetState::Error, "missing worker" unless worker
+      unless worker.fetch("pod_id") == observed_pod_id
+        raise LocalModelEvaluation::RunpodFleetState::Error, "provider pod identity mismatch"
+      end
+
+      identity_observations << { "index" => index, "pod_id" => observed_pod_id }
+      identities.fetch(index)
     end
   end
 
@@ -55,6 +70,7 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     @publisher_root = File.join(@tmp, "publisher")
     @fleet = fleet
     @state = FakeState.new(File.join(@tmp, "fleet-state"), @fleet)
+    @state.identities[1] = identity(1, 1)
     @process = FakeProcess.new
     @health = FakeHealth.new
     write_bootstrap
@@ -76,7 +92,8 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     assert_equal "2026-09-29T18:00:30Z", snapshot.fetch("expires_at")
     assert_equal %w[contract_version expires_at published_at registry_id revision workers], snapshot.keys.sort
     assert_equal %w[capabilities capability_fingerprint endpoint generation_id labels state worker_id], worker.keys.sort
-    assert_equal "main.burst-1", worker.fetch("worker_id")
+    assert_equal @state.identities.fetch(1), worker.slice("worker_id", "generation_id")
+    assert_equal [{ "index" => 1, "pod_id" => "pod-1" }], @state.identity_observations
     assert_equal "http://127.0.0.1:11441", worker.fetch("endpoint")
     assert_equal "READY", worker.fetch("state")
     assert_equal %w[inference ollama remote], worker.fetch("labels")
@@ -118,11 +135,20 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
 
   def test_missing_or_stale_tunnel_is_not_ready
     File.delete(File.join(@state.artifact_dir(@fleet.fetch("fleet_id"), "tunnels"), "tunnels.json"))
-    assert_equal "NOT_READY", registry.snapshot.dig("workers", 0, "state")
+    error = assert_raises(RunpodOllamaFleet::DynamicWorkerRegistry::Error) { registry.snapshot }
+    assert_includes error.message, "provider pod identity mismatch"
 
     write_tunnels
     @process.alive = false
     assert_equal "NOT_READY", registry.snapshot.dig("workers", 0, "state")
+  end
+
+  def test_stale_provider_pod_observation_fails_closed
+    write_tunnels(pod_id: "replacement-pod")
+
+    error = assert_raises(RunpodOllamaFleet::DynamicWorkerRegistry::Error) { registry.snapshot }
+
+    assert_includes error.message, "provider pod identity mismatch"
   end
 
   def test_conflicting_model_evidence_fails_closed
@@ -136,26 +162,48 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
   end
 
   def test_replacement_changes_generation_when_endpoint_is_reused
-    first = registry.snapshot.fetch("workers").first
-
-    worker = @fleet.fetch("workers").first
-    worker.merge!(
-      "pod_id" => "pod-replacement",
-      "generation" => 2,
-      "created_at_utc" => "2026-09-29T18:01:00Z"
+    @state = LocalModelEvaluation::RunpodFleetState.new(
+      root: File.join(@tmp, "persisted-fleet-state"),
+      clock: -> { NOW }
     )
+    @fleet = @state.activate(
+      workers: [fleet_worker("pod-1")],
+      cloud: "SECURE",
+      gpu_id: "NVIDIA A40",
+      image: "example/image"
+    )
+    write_bootstrap
+    write_tunnels
+
+    expected_first = @state.registry_identity(index: 1, observed_pod_id: "pod-1")
+    first = registry.snapshot.fetch("workers").first
+    ordinary_read = registry.snapshot.fetch("workers").first
+
+    assert_equal expected_first, first.slice("worker_id", "generation_id")
+    assert_equal expected_first, ordinary_read.slice("worker_id", "generation_id")
+    endpoint = first.fetch("endpoint")
+
+    @state.begin_replacement(1)
+    @state.mark_replacement_destroyed(1)
+    @state.complete_replacement(
+      worker: fleet_worker("pod-replacement"),
+      created_at_utc: (NOW + 60).iso8601
+    )
+    @fleet = @state.current
     write_bootstrap(bootstrap_record(pod_id: "pod-replacement"))
     write_tunnels(pod_id: "pod-replacement")
+    expected_second = @state.registry_identity(index: 1, observed_pod_id: "pod-replacement")
     second_snapshot = registry.snapshot
     second = second_snapshot.fetch("workers").first
 
-    assert_equal 2, second_snapshot.fetch("revision")
+    assert_equal 3, second_snapshot.fetch("revision")
+    assert_equal expected_second, second.slice("worker_id", "generation_id")
     assert_equal first.fetch("worker_id"), second.fetch("worker_id")
-    assert_equal first.fetch("endpoint"), second.fetch("endpoint")
+    assert_equal endpoint, second.fetch("endpoint")
     refute_equal first.fetch("generation_id"), second.fetch("generation_id")
   end
 
-  def test_worker_order_and_fingerprint_are_deterministic
+  def test_ordinary_reads_keep_fleet_state_identities_and_deterministic_order
     worker_two = @fleet.fetch("workers").first.merge(
       "index" => 2,
       "name" => "burst-2",
@@ -163,6 +211,7 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
       "local_ollama_url" => "http://127.0.0.1:11442"
     )
     @fleet.fetch("workers").unshift(worker_two)
+    @state.identities[2] = identity(2, 1)
     record = bootstrap_record
     record.fetch("workers") << bootstrap_worker(index: 2, pod_id: "pod-2")
     write_bootstrap(record)
@@ -171,8 +220,10 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     first = registry.snapshot.fetch("workers")
     second = registry.snapshot.fetch("workers")
 
-    assert_equal %w[main.burst-1 main.burst-2], first.map { |row| row.fetch("worker_id") }
+    assert_equal %w[state-worker-1 state-worker-2], first.map { |row| row.fetch("worker_id") }
     assert_equal first, second
+    assert_equal @state.identities.values.sort_by { |row| row.fetch("worker_id") },
+                 first.map { |row| row.slice("worker_id", "generation_id") }
   end
 
   def test_malformed_source_state_fails_before_revision_is_published
@@ -212,6 +263,24 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
   end
 
   private
+
+  def identity(index, generation)
+    {
+      "worker_id" => "state-worker-#{index}",
+      "generation_id" => "state-generation-#{index}-#{generation}"
+    }
+  end
+
+  def fleet_worker(pod_id)
+    FleetWorker.new(
+      index: 1,
+      pod_id:,
+      name: "af-lme-burst-1",
+      host: "198.51.100.11",
+      ssh_port: 22_001,
+      hourly_rate: 0.50
+    )
+  end
 
   def registry
     RunpodOllamaFleet::DynamicWorkerRegistry.new(
