@@ -3,6 +3,7 @@
 require_relative "test_helper"
 require "json"
 require "rbconfig"
+require_relative "../lib/runpod_ollama_fleet"
 
 class RpofCampaignCliTest < Minitest::Test
   ExitStatus = Struct.new(:exitstatus) do
@@ -14,6 +15,33 @@ class RpofCampaignCliTest < Minitest::Test
   ROOT = File.expand_path("..", __dir__)
   CAMPAIGN = File.join(ROOT, "test", "fixtures", "rpof-capacity-campaign-v0.1.json")
   BUDGET = File.join(ROOT, "test", "fixtures", "rpof-capacity-campaign-budget-v0.1.json")
+  HARDWARE = File.join(ROOT, "config", "execution_pool_hardware.yml")
+  HARDWARE_DOCUMENT = {
+    "contract_version" => "rpof-execution-pool-hardware/v0.1",
+    "default_cloud" => "SECURE",
+    "global_volume" => {
+      "id" => "cmu4n7zhq000007lb6u7f43m9",
+      "ollama_store_path" => "/workspace-global/ollama-models"
+    },
+    "models" => {
+      "qwen3.6:35b-a3b" => {
+        "shared_model" => "qwen3.6:35b-a3b-q4_K_M",
+        "qualified_gpus" => ["NVIDIA A40", "NVIDIA RTX PRO 6000 Blackwell Server Edition"]
+      },
+      "qwen3.6:27b" => {
+        "shared_model" => "qwen3.6:27b-q4_K_M",
+        "qualified_gpus" => ["NVIDIA A40", "NVIDIA RTX A6000"]
+      },
+      "gemma4:26b" => {
+        "shared_model" => "gemma4:26b-a4b-it-mtp-q4_K_M",
+        "qualified_gpus" => ["NVIDIA L40S"]
+      },
+      "gpt-oss:20b" => {
+        "shared_model" => "gpt-oss:20b",
+        "qualified_gpus" => ["NVIDIA A40"]
+      }
+    }
+  }.freeze
 
   def setup
     @tmp = Dir.mktmpdir("rpof-campaign-cli-")
@@ -24,21 +52,28 @@ class RpofCampaignCliTest < Minitest::Test
   end
 
   def test_plan_json_is_read_only_without_credentials
-    stdout, stderr, status = run_cli("plan", "--json")
+    expected = {
+      "command" => "campaign plan",
+      "read_only" => true,
+      "paid_resources_created" => false,
+      "campaign" => { "campaign_id" => "production-batch-039" }
+    }
+    stdout, stderr, status = with_stubbed_campaign(expected) { run_cli("plan", "--json") }
 
     assert status.success?, stderr
-    result = JSON.parse(stdout)
-    assert result.fetch("read_only")
-    refute result.fetch("paid_resources_created")
-    assert_equal "production-batch-039", result.dig("campaign", "campaign_id")
+    assert_equal expected, JSON.parse(stdout)
     refute File.exist?(File.join(@tmp, "campaign-budgets"))
   end
 
   def test_start_without_authorization_prints_plan_and_exits_before_mutation
-    stdout, stderr, status = run_cli("start", "--json")
+    stdout, stderr, status = with_stubbed_hardware_file { run_cli("start", "--json") }
 
     assert_equal 2, status.exitstatus, stderr
-    assert JSON.parse(stdout).fetch("authorization_required")
+    result = JSON.parse(stdout)
+    assert result.fetch("authorization_required")
+    assert result.fetch("read_only")
+    refute result.fetch("paid_resources_created")
+    assert_equal "production-batch-039", result.dig("campaign", "campaign_id")
     refute File.exist?(File.join(@tmp, "campaign-budgets"))
   end
 
@@ -55,6 +90,31 @@ class RpofCampaignCliTest < Minitest::Test
   end
 
   private
+
+  def with_stubbed_campaign(result)
+    hardware = Object.new
+    campaign = Object.new
+    binding = Object.new
+    lifecycle = Object.new
+    lifecycle.define_singleton_method(:plan) { result }
+
+    RunpodOllamaFleet::ExecutionPoolHardware.stub(:new, hardware) do
+      RunpodOllamaFleet::CapacityCampaign.stub(:load, campaign) do
+        RunpodOllamaFleet::CampaignBudgetBinding.stub(:new, binding) do
+          RunpodOllamaFleet::CampaignLifecycle.stub(:new, lifecycle) { yield }
+        end
+      end
+    end
+  end
+
+  def with_stubbed_hardware_file
+    loader = lambda do |path, aliases:|
+      assert_equal HARDWARE, path
+      refute aliases
+      HARDWARE_DOCUMENT
+    end
+    YAML.stub(:safe_load_file, loader) { yield }
+  end
 
   def run_cli(command, *extra, top_level: false)
     executable = File.join(ROOT, "bin", top_level ? "rpof" : "rpof-campaign")

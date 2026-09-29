@@ -45,4 +45,20 @@ class ExecutionPoolHardwareTest < Minitest::Test
       end
     end
   end
+
+  def test_reuses_the_validated_document_for_multiple_profile_lookups
+    Dir.mktmpdir do |root|
+      source = File.expand_path("../config/execution_pool_hardware.yml", __dir__)
+      path = File.join(root, "hardware.yml")
+      File.binwrite(path, File.binread(source))
+      hardware = RunpodOllamaFleet::ExecutionPoolHardware.new(path:)
+
+      first = hardware.profile_for("qwen3.6:35b-a3b")
+      File.binwrite(path, "invalid: [")
+      second = hardware.profile_for("qwen3.6:27b")
+
+      assert_equal "qwen3.6:35b-a3b-q4_K_M", first.shared_model
+      assert_equal "qwen3.6:27b-q4_K_M", second.shared_model
+    end
+  end
 end

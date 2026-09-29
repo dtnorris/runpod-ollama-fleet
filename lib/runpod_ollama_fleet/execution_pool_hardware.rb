@@ -17,6 +17,7 @@ module RunpodOllamaFleet
 
     def initialize(path:)
       @path = File.expand_path(path)
+      @document = nil
     end
 
     def profile_for(model)
@@ -54,6 +55,8 @@ module RunpodOllamaFleet
     private
 
     def load_document
+      return @document if @document
+
       data = YAML.safe_load_file(@path, aliases: false)
       raise Error, "hardware qualification config must contain a mapping" unless data.is_a?(Hash)
       data = data.transform_keys(&:to_s)
@@ -83,7 +86,7 @@ module RunpodOllamaFleet
       normalized = models.to_h do |key, value|
         [key.to_s, value.is_a?(Hash) ? value.transform_keys(&:to_s) : value]
       end
-      data.merge(
+      @document = data.merge(
         "models" => normalized,
         "default_cloud" => default_cloud,
         "global_volume" => {
