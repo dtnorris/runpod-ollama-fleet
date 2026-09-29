@@ -5,6 +5,12 @@ require "json"
 require "rbconfig"
 
 class RpofCampaignCliTest < Minitest::Test
+  ExitStatus = Struct.new(:exitstatus) do
+    def success?
+      exitstatus.zero?
+    end
+  end
+
   ROOT = File.expand_path("..", __dir__)
   CAMPAIGN = File.join(ROOT, "test", "fixtures", "rpof-capacity-campaign-v0.1.json")
   BUDGET = File.join(ROOT, "test", "fixtures", "rpof-capacity-campaign-budget-v0.1.json")
@@ -62,66 +68,67 @@ class RpofCampaignCliTest < Minitest::Test
     capture_loaded_executable(executable, argv, env:, intercept_exec: top_level)
   end
 
-  # These tests exercise the exact executable files, but fork the already
-  # loaded test process instead of cold-starting Ruby and the complete RPOF
-  # dependency graph for every assertion. exit! prevents inherited Minitest
-  # and SimpleCov at_exit hooks from running a second suite in the child.
+  # Exercise the exact executable files inside an anonymous module. This keeps
+  # executable constants and helper methods isolated without paying the
+  # platform-sensitive cost of forking the complete test process.
   def capture_loaded_executable(executable, argv, env:, intercept_exec:)
-    stdout_reader, stdout_writer = IO.pipe
-    stderr_reader, stderr_writer = IO.pipe
-    exec_capture = File.join(@tmp, "exec-#{Process.pid}-#{rand(1_000_000)}.json")
+    previous_argv = ARGV.dup
+    previous_env = env.to_h { |key, _value| [key, [ENV.key?(key), ENV[key]]] }
+    previous_stdout = $stdout
+    previous_stderr = $stderr
+    stdout = StringIO.new
+    stderr = StringIO.new
+    exec_argv = nil
+    exit_status = 0
 
-    pid = Process.fork do
-      stdout_reader.close
-      stderr_reader.close
-      STDOUT.reopen(stdout_writer)
-      STDERR.reopen(stderr_writer)
-      stdout_writer.close
-      stderr_writer.close
-      $stdout.sync = true
-      $stderr.sync = true
+    env.each { |key, value| value.nil? ? ENV.delete(key) : ENV.store(key, value) }
+    ARGV.replace(argv)
+    $stdout = stdout
+    $stderr = stderr
 
-      env.each { |key, value| value.nil? ? ENV.delete(key) : ENV.store(key, value) }
-      ARGV.replace(argv)
-      install_exec_capture(exec_capture) if intercept_exec
-
-      exit_status = 0
-      begin
-        Dir.chdir(ROOT) { load executable }
-      rescue SystemExit => e
-        exit_status = e.status
-      rescue Exception => e # rubocop:disable Lint/RescueException
-        warn "#{e.class}: #{e.message}"
-        warn e.backtrace.join("\n")
-        exit_status = 1
-      ensure
-        $stdout.flush
-        $stderr.flush
-        exit!(exit_status)
+    begin
+      exec_argv = with_exec_capture(intercept_exec) do
+        Dir.chdir(ROOT) { load executable, true }
+        nil
       end
+    rescue SystemExit => e
+      exit_status = e.status
     end
 
-    stdout_writer.close
-    stderr_writer.close
-    stdout_thread = Thread.new { stdout_reader.read }
-    stderr_thread = Thread.new { stderr_reader.read }
-    _child, status = Process.wait2(pid)
-    stdout = stdout_thread.value
-    stderr = stderr_thread.value
-    exec_argv = JSON.parse(File.binread(exec_capture)) if File.file?(exec_capture)
-    [stdout, stderr, status, exec_argv]
+    [stdout.string, stderr.string, ExitStatus.new(exit_status), exec_argv]
   ensure
-    stdout_reader&.close unless stdout_reader&.closed?
-    stderr_reader&.close unless stderr_reader&.closed?
+    ARGV.replace(previous_argv) if previous_argv
+    previous_env&.each do |key, (present, value)|
+      present ? ENV.store(key, value) : ENV.delete(key)
+    end
+    $stdout = previous_stdout if previous_stdout
+    $stderr = previous_stderr if previous_stderr
   end
 
-  def install_exec_capture(path)
+  def with_exec_capture(enabled)
+    return yield unless enabled
+
+    original_exec = Kernel.instance_method(:exec)
+    exec_argv = nil
     Kernel.module_eval do
       define_method(:exec) do |*args|
-        File.binwrite(path, JSON.generate(args))
+        exec_argv = args
         raise SystemExit, 0
       end
       private :exec
+    end
+
+    yield
+  rescue SystemExit => e
+    raise unless e.success?
+
+    exec_argv
+  ensure
+    if original_exec
+      Kernel.module_eval do
+        define_method(:exec, original_exec)
+        private :exec
+      end
     end
   end
 end

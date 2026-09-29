@@ -1,89 +1,89 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
-require "open3"
-require "rbconfig"
-require "tmpdir"
+require_relative "../lib/runpod_ollama_fleet"
 
 class CapacityOnlyLoadTest < Minitest::Test
   ROOT = File.expand_path("..", __dir__)
-  CAMPAIGN = File.join(ROOT, "test", "fixtures", "rpof-capacity-campaign-v0.1.json")
-  BUDGET = File.join(ROOT, "test", "fixtures", "rpof-capacity-campaign-budget-v0.1.json")
+  PRIMARY_LOADER = File.join(ROOT, "lib", "runpod_ollama_fleet.rb")
+  RUNPOD_BUDGET = File.join(ROOT, "lib", "local_model_evaluation", "runpod_budget.rb")
+  RUNPOD_FLEET = File.join(ROOT, "lib", "local_model_evaluation", "runpod_fleet.rb")
+  DISPATCHER = File.join(ROOT, "lib", "local_model_evaluation", "runpod_dispatcher.rb")
+  DISPATCH_V01 = File.join(ROOT, "lib", "runpod_ollama_fleet", "dispatch_v0_1.rb")
+  EXECUTION_POOL_FULFILL = File.join(ROOT, "lib", "runpod_ollama_fleet", "execution_pool_fulfill.rb")
 
   def test_capacity_and_compatibility_load_boundaries
-    Dir.mktmpdir("capacity-only-load-") do |state_root|
-      stdout, stderr, status = Open3.capture3(
-        RbConfig.ruby, "-I#{File.join(ROOT, 'lib')}", "-e", probe_source(state_root), chdir: ROOT
-      )
+    registry_dependencies = local_dependencies("lib/runpod_ollama_fleet/dynamic_worker_registry.rb")
+    primary_dependencies = local_dependencies("lib/runpod_ollama_fleet.rb")
+    capacity_dependencies = local_dependencies("lib/local_model_evaluation/capacity.rb")
+    campaign_cli_dependencies = local_dependencies("bin/rpof-campaign")
+    compatibility_dependencies = local_dependencies("lib/runpod_ollama_fleet/compatibility.rb")
 
-      assert status.success?, [stdout, stderr].reject(&:empty?).join("\n")
+    [registry_dependencies, primary_dependencies, capacity_dependencies, campaign_cli_dependencies].each do |dependencies|
+      refute_includes dependencies, DISPATCHER
+      refute_includes dependencies, DISPATCH_V01
+      refute_includes dependencies, EXECUTION_POOL_FULFILL
     end
+    assert_includes compatibility_dependencies, DISPATCHER
+    assert_includes compatibility_dependencies, DISPATCH_V01
+    assert_includes compatibility_dependencies, EXECUTION_POOL_FULFILL
+    assert_includes capacity_dependencies, RUNPOD_BUDGET
+    assert_includes capacity_dependencies, RUNPOD_FLEET
+    assert_includes campaign_cli_dependencies, PRIMARY_LOADER
+
+    required = %i[
+      CapacityCampaign CampaignBudgetBinding CampaignCapacityAdmission
+      CampaignLifecycle CampaignRunpodRuntime DynamicWorkerRegistry
+    ]
+    missing = required.reject { |name| RunpodOllamaFleet.const_defined?(name, false) }
+    assert_empty missing, "missing capacity constants: #{missing.join(', ')}"
+
+    forbidden = %i[job jobs job_id argv env affinity attempt attempts result results result_path]
+    classes = [
+      RunpodOllamaFleet::CampaignLifecycle,
+      RunpodOllamaFleet::CampaignCapacityAdmission,
+      RunpodOllamaFleet::CampaignRunpodRuntime,
+      RunpodOllamaFleet::DynamicWorkerRegistry
+    ]
+    leaks = classes.flat_map do |klass|
+      klass.public_instance_methods(false).filter_map do |method_name|
+        values = klass.instance_method(method_name).parameters.map(&:last).compact & forbidden
+        "#{klass}##{method_name}: #{values.join(', ')}" unless values.empty?
+      end
+    end
+    assert_empty leaks, "capacity API workload leakage: #{leaks.join('; ')}"
   end
 
   private
 
-  def probe_source(state_root)
-    <<~RUBY
-      forbidden = %i[job jobs job_id argv env affinity attempt attempts result results result_path]
+  def local_dependencies(relative_entrypoint)
+    pending = [File.join(ROOT, relative_entrypoint)]
+    visited = []
 
-      require "runpod_ollama_fleet/dynamic_worker_registry"
-      raise "registry missing" unless defined?(RunpodOllamaFleet::DynamicWorkerRegistry)
-      raise "registry loaded dispatch" if defined?(LocalModelEvaluation::RunpodDispatcher)
+    until pending.empty?
+      path = File.realpath(pending.pop)
+      next if visited.include?(path)
 
-      require "runpod_ollama_fleet"
-      required = %i[
-        CapacityCampaign CampaignBudgetBinding CampaignCapacityAdmission
-        CampaignLifecycle CampaignRunpodRuntime DynamicWorkerRegistry
-      ]
-      missing = required.reject { |name| RunpodOllamaFleet.const_defined?(name, false) }
-      raise "missing capacity constants: \#{missing.join(', ')}" unless missing.empty?
-      raise "primary loader exposed DispatchV01" if RunpodOllamaFleet.const_defined?(:DispatchV01, false)
-      if RunpodOllamaFleet.const_defined?(:ExecutionPoolFulfill, false)
-        raise "primary loader exposed ExecutionPoolFulfill"
+      visited << path
+      File.foreach(path) do |line|
+        match = line.match(/^\s*require(_relative)?\s+["']([^"']+)["']/)
+        next unless match
+
+        dependency = resolve_local_dependency(path, match[2], relative: !match[1].nil?)
+        pending << dependency if dependency
       end
-      raise "primary loader loaded dispatcher" if defined?(LocalModelEvaluation::RunpodDispatcher)
+    end
 
-      classes = [
-        RunpodOllamaFleet::CampaignLifecycle,
-        RunpodOllamaFleet::CampaignCapacityAdmission,
-        RunpodOllamaFleet::CampaignRunpodRuntime,
-        RunpodOllamaFleet::DynamicWorkerRegistry
-      ]
-      leaks = classes.flat_map do |klass|
-        klass.public_instance_methods(false).filter_map do |method_name|
-          names = klass.instance_method(method_name).parameters.map(&:last).compact
-          values = names & forbidden
-          "\#{klass}##\#{method_name}: \#{values.join(', ')}" unless values.empty?
-        end
-      end
-      raise "capacity API workload leakage: \#{leaks.join('; ')}" unless leaks.empty?
+    visited.sort
+  end
 
-      require "local_model_evaluation/capacity"
-      raise "RunpodFleet missing" unless defined?(LocalModelEvaluation::RunpodFleet)
-      raise "RunpodBudget missing" unless defined?(LocalModelEvaluation::RunpodBudget)
-      raise "capacity loader loaded dispatcher" if defined?(LocalModelEvaluation::RunpodDispatcher)
-
-      ENV.delete("RUNPOD_API_KEY")
-      ENV.delete("RUNPOD_API_BASE_URL")
-      ARGV.replace([
-        "plan", "--campaign", #{CAMPAIGN.dump}, "--budget", #{BUDGET.dump},
-        "--state-root", #{state_root.dump}, "--json"
-      ])
-      $stdout.reopen(File::NULL, "w")
-      exit_status = begin
-        Dir.chdir(#{ROOT.dump}) { load File.join(#{ROOT.dump}, "bin", "rpof-campaign") }
-        0
-      rescue SystemExit => e
-        e.status
-      end
-      raise "campaign plan exited \#{exit_status}" unless exit_status.zero?
-      raise "campaign CLI exposed DispatchV01" if defined?(RunpodOllamaFleet::DispatchV01)
-      raise "campaign CLI loaded dispatcher" if defined?(LocalModelEvaluation::RunpodDispatcher)
-
-      require "runpod_ollama_fleet/compatibility"
-      raise "DispatchV01 missing" unless defined?(RunpodOllamaFleet::DispatchV01)
-      raise "ExecutionPoolFulfill missing" unless defined?(RunpodOllamaFleet::ExecutionPoolFulfill)
-      raise "RunpodDispatcher missing" unless defined?(LocalModelEvaluation::RunpodDispatcher)
-    RUBY
+  def resolve_local_dependency(source, feature, relative:)
+    candidate = if relative
+                  File.expand_path(feature, File.dirname(source))
+                else
+                  File.join(ROOT, "lib", feature)
+                end
+    candidate += ".rb" unless File.extname(candidate) == ".rb"
+    candidate if File.file?(candidate)
   end
 end
