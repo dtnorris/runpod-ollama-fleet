@@ -22,6 +22,8 @@ when "dispatch-close"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-dispatch-close"), *ARGV
 when "capacity"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-capacity"), *ARGV
+when "campaign"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-campaign"), *ARGV
 when "fulfill"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-fulfill"), *ARGV
 when "execution-pool-fulfill"
@@ -67,6 +69,7 @@ else
       dispatch-admit
       dispatch-close
       capacity
+      campaign
       fulfill
       execution-pool-fulfill
       runtime-alias

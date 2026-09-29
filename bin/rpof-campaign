@@ -1,0 +1,147 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "runpod_ollama_fleet"
+
+command = ARGV.shift
+options = {
+  campaign: nil,
+  budget: nil,
+  hardware: File.join(ROOT, "config", "execution_pool_hardware.yml"),
+  state_root: File.join(ROOT, "output", "runpod-fleets"),
+  ssh_public_key: ENV.fetch("RUNPOD_SSH_PUBLIC_KEY_PATH", "~/.ssh/id_ed25519.pub"),
+  authorize_paid: false,
+  json: false,
+  reason: "operator requested campaign stop"
+}
+
+parser = OptionParser.new do |o|
+  o.banner = "Usage: bin/rpof campaign plan|start|status|stop --campaign FILE --budget FILE [options]"
+  o.on("--campaign FILE", "DW-04 campaign declaration") { |v| options[:campaign] = v }
+  o.on("--budget FILE", "DW-05 campaign budget declaration") { |v| options[:budget] = v }
+  o.on("--hardware FILE", "Hardware qualification registry") { |v| options[:hardware] = v }
+  o.on("--state-root DIR", "Durable RPOF state root") { |v| options[:state_root] = v }
+  o.on("--ssh-public-key FILE", "OpenSSH public key for authorized start") { |v| options[:ssh_public_key] = v }
+  o.on("--authorize-paid", "Explicitly authorize provider creation (start only)") { options[:authorize_paid] = true }
+  o.on("--reason TEXT", "Teardown reason (stop only)") { |v| options[:reason] = v }
+  o.on("--json", "Emit machine-readable JSON") { options[:json] = true }
+end
+
+def load_json_object(path, label)
+  value = JSON.parse(File.binread(File.expand_path(path)))
+  raise ArgumentError, "#{label} must be a JSON object" unless value.is_a?(Hash)
+  value
+end
+
+def render_human(command, result)
+  case command
+  when "plan"
+    puts "READ-ONLY campaign plan: #{result.dig('campaign', 'campaign_id')}"
+    puts "Identity: #{result.dig('campaign', 'identity_sha256')}"
+    puts "Binding: #{result.fetch('binding_sha256')}"
+    result.fetch("profiles").each do |row|
+      rate = row["projected_desired_hourly_rate_usd"]
+      puts "  #{row.fetch('profile_id')}: #{row.fetch('model')} desired=#{row.fetch('desired_workers')} " \
+           "max=#{row.fetch('max_workers')} GPUs=#{row.fetch('qualified_gpu_ids').join(',')}" \
+           "#{rate ? format(' projected=$%.4f/hr', rate) : ''}"
+      puts "    digest=#{row.fetch('expected_digest')} context=#{row.fetch('required_context_length')} " \
+           "fully_gpu_resident=#{row.fetch('require_fully_gpu_resident')} min=#{row.fetch('min_workers')}"
+    end
+    budget = result.fetch("budget")
+    puts "Ceilings: workers=#{budget.fetch('max_workers')} rate=$#{budget.fetch('max_aggregate_hourly_rate_usd')}/hr " \
+         "cumulative=$#{budget.fetch('max_cumulative_compute_usd')} runtime=#{budget.fetch('max_runtime_seconds')}s"
+    puts "NO PAID RESOURCES WERE CREATED"
+  when "start"
+    if result["authorization_required"]
+      render_human("plan", result)
+      puts "PAID START NOT AUTHORIZED: repeat with --authorize-paid"
+    else
+      puts "PAID campaign start authorized: #{result.dig('campaign', 'campaign_id')}"
+      puts "Budget=#{result['budget_state']} active+pending=#{result['active_plus_pending_workers']}/#{result['max_workers']}"
+    end
+  when "status"
+    puts "READ-ONLY campaign status: #{result.dig('campaign', 'campaign_id')}"
+    puts "Budget=#{result['budget_state']} guardian_healthy=#{result['guardian_healthy']} deadline=#{result['deadline_at_utc']}"
+    puts "Workers active=#{result['active_workers']} pending=#{result['pending_workers']} max=#{result['max_workers']}"
+    puts "Rate active+pending=$#{result['active_plus_pending_hourly_rate_usd']}/hr max=$#{result['max_aggregate_hourly_rate_usd']}/hr"
+    puts "Liability=$#{result['reserved_maximum_liability_usd']} cap=$#{result['max_cumulative_compute_usd']}"
+    puts "Pending ambiguous reservations=#{result.fetch('pending_ambiguous_reservations').length}"
+    result.fetch("profiles").each do |row|
+      puts "  #{row.fetch('profile_id')}: current=#{row.fetch('current_workers')} " \
+           "ready=#{row.fetch('ready_workers')} desired=#{row.fetch('desired_workers')} max=#{row.fetch('max_workers')}"
+    end
+  when "stop"
+    puts "Campaign stop: budget=#{result.fetch('budget_state')} absence_verified=#{result.fetch('provider_absence_verified')}"
+    puts result.fetch("message")
+  end
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+  raise OptionParser::InvalidArgument, "command must be plan, start, status, or stop" unless %w[plan start status stop].include?(command)
+  raise OptionParser::MissingArgument, "--campaign" unless options[:campaign]
+  raise OptionParser::MissingArgument, "--budget" unless options[:budget]
+  if options[:authorize_paid] && command != "start"
+    raise OptionParser::InvalidArgument, "--authorize-paid is valid only for campaign start"
+  end
+
+  hardware = RunpodOllamaFleet::ExecutionPoolHardware.new(path: options[:hardware])
+  campaign = RunpodOllamaFleet::CapacityCampaign.load(path: options[:campaign], hardware:)
+  budget_declaration = load_json_object(options[:budget], "campaign budget")
+  binding = RunpodOllamaFleet::CampaignBudgetBinding.new(
+    root: options[:state_root], repo_root: ROOT, campaign:, declaration: budget_declaration
+  )
+
+  api_key = ENV["RUNPOD_API_KEY"].to_s
+  client = if api_key.empty?
+             nil
+           else
+             LocalModelEvaluation::RunpodClient.new(
+               api_key:, base_url: ENV.fetch("RUNPOD_API_BASE_URL", LocalModelEvaluation::RunpodClient::DEFAULT_BASE_URL)
+             )
+           end
+  if command == "start" && options[:authorize_paid] && !client
+    raise ArgumentError, "RUNPOD_API_KEY is required for an authorized campaign start"
+  end
+
+  price_resolver = if client
+                     lambda do |profile, qualification|
+                       rows = client.list_gpu_types(
+                         cloud: qualification.fetch("cloud"), count: profile.fetch("desired_workers")
+                       )
+                       qualified = rows.select { |row| qualification.fetch("qualified_gpu_ids").include?(row["id"]) }
+                       qualified.filter_map { |row| row.dig("price", qualification.fetch("cloud").downcase) }.map(&:to_f).min
+                     end
+                   end
+  runtime_factory = lambda do |profile, qualification, admission|
+    RunpodOllamaFleet::CampaignRunpodRuntime.new(
+      root: options[:state_root], repo_root: ROOT, profile:, hardware: qualification,
+      client:, admission:
+    )
+  end
+  lifecycle = RunpodOllamaFleet::CampaignLifecycle.new(
+    campaign:, binding:, runtime_factory:, price_resolver:
+  )
+  result = case command
+           when "plan" then lifecycle.plan
+           when "start"
+             lifecycle.start(authorize_paid: options[:authorize_paid], ssh_public_key_path: options[:ssh_public_key])
+           when "status" then lifecycle.status
+           when "stop" then lifecycle.stop(reason: options[:reason])
+           end
+  options[:json] ? puts(JSON.pretty_generate(result)) : render_human(command, result)
+  exit 2 if command == "start" && !options[:authorize_paid]
+rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError, OptionParser::ParseError,
+       RunpodOllamaFleet::CapacityCampaign::Error,
+       RunpodOllamaFleet::CampaignBudgetBinding::Error,
+       RunpodOllamaFleet::CampaignLifecycle::Error,
+       LocalModelEvaluation::RunpodClient::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end
