@@ -16,6 +16,21 @@ class ExecutionPoolHardwareTest < Minitest::Test
     assert_equal "SECURE", profile.cloud
   end
 
+  def test_production_registry_has_blackwell_fallback_for_all_four_models
+    path = File.expand_path("../config/execution_pool_hardware.yml", __dir__)
+    hardware = RunpodOllamaFleet::ExecutionPoolHardware.new(path:)
+    blackwell = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+
+    [
+      "qwen3.6:35b-a3b",
+      "qwen3.6:27b",
+      "gemma4:26b",
+      "gpt-oss:20b"
+    ].each do |model|
+      assert_includes hardware.profile_for(model).gpu_ids, blackwell, model
+    end
+  end
+
   def test_resolves_only_explicit_rpof_owned_qualification
     Dir.mktmpdir do |root|
       path = File.join(root, "hardware.yml")

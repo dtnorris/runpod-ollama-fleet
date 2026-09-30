@@ -10,7 +10,7 @@ class CampaignBudgetBindingTest < Minitest::Test
   FIXTURE = File.expand_path("fixtures/rpof-capacity-campaign-v0.1.json", __dir__)
   BUDGET_FIXTURE = File.expand_path("fixtures/rpof-capacity-campaign-budget-v0.1.json", __dir__)
   HARDWARE = File.expand_path("../config/execution_pool_hardware.yml", __dir__)
-  BINDING_SHA256 = "6352abb4d2272033f44d112341a385df8c368008366cc0391c52f9587c952509"
+  BINDING_SHA256 = "8fa9c11293e80c4987c035acd2918fdbf32a262b5c44a626d58e8f78ed6b234e"
 
   class FakeGuardianSupervisor
     attr_accessor :healthy, :fail_after_arm

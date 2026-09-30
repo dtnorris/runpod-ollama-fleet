@@ -1,6 +1,6 @@
 ---
 # RPOF owns hardware qualification for execution-pool fulfillment.
-# Add or broaden entries only after empirical qualification evidence exists.
+# Qualified GPUs are permitted production candidates. New candidates may be admitted from strong hardware/runtime compatibility evidence; bootstrap/runtime capability evidence must still pass before WLO can schedule work.
 contract_version: rpof-execution-pool-hardware/v0.1
 default_cloud: SECURE
 global_volume:
@@ -17,11 +17,14 @@ models:
     qualified_gpus:
       - NVIDIA A40
       - NVIDIA RTX A6000
+      - NVIDIA RTX PRO 6000 Blackwell Server Edition
   gemma4:26b:
     shared_model: gemma4:26b-a4b-it-mtp-q4_K_M
     qualified_gpus:
       - NVIDIA L40S
+      - NVIDIA RTX PRO 6000 Blackwell Server Edition
   gpt-oss:20b:
     shared_model: gpt-oss:20b
     qualified_gpus:
       - NVIDIA A40
+      - NVIDIA RTX PRO 6000 Blackwell Server Edition

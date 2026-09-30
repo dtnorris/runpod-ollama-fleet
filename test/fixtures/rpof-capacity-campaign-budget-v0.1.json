@@ -4,9 +4,9 @@
     "contract_version": "rpof-capacity-campaign-identity/v0.1",
     "campaign_id": "production-batch-039",
     "campaign_sha256": "3bde2853ec51980537953ceb6e85e91314041397328c433bde20a7889b58c575",
-    "hardware_qualification_sha256": "2b238e97b9de66a335fad4f40b69eb178ddee2157bab7f762a2b8e8e73502d50"
+    "hardware_qualification_sha256": "8145fe4dd7f5fabd896c19401ac657dd0fa5accebfaab680b088dcbf2a33af15"
   },
-  "campaign_identity_sha256": "e5bfc39c8e3275eef65d17104887fef0d11cb1c1321b04744a31404dad9a8442",
+  "campaign_identity_sha256": "1e1032508ac938c6e26aa6ca1b4d2e8328635fe728f49332906fa0cc56d69fa5",
   "budget_id": "batch039-parent",
   "max_cumulative_compute_usd": 30.0,
   "max_aggregate_hourly_rate_usd": 6.0,

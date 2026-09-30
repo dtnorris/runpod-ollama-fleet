@@ -3,6 +3,7 @@
 require_relative "../local_model_evaluation/runpod_fleet"
 require_relative "../local_model_evaluation/runpod_fleet_lifecycle"
 require_relative "../local_model_evaluation/runpod_fleet_namespace"
+require_relative "../local_model_evaluation/runpod_capacity_policy"
 
 module RunpodOllamaFleet
   # Adapter from campaign intent to the existing fleet mutation paths. It has
@@ -51,7 +52,11 @@ module RunpodOllamaFleet
         fleet_key: namespace.fleet_key, local_port_base: namespace.local_port_base,
         capacity_admission: @admission, out: @out, wall_clock: @wall_clock
       )
-      fleet.gpu_id = @hardware.fetch("qualified_gpu_ids").first
+      selected_gpu = qualified_gpu_id(
+        max_hourly_rate_usd: max_hourly_rate_usd,
+        desired_workers: desired_workers
+      )
+      fleet.gpu_id = selected_gpu
       ssh_key = fleet.read_ssh_public_key(ssh_public_key_path)
       current = fleet.fleet_state.current
       if current && current["status"] == "active"
@@ -62,7 +67,7 @@ module RunpodOllamaFleet
         )
         preflight = lifecycle.preflight_scale(
           target_worker_count: desired_workers,
-          gpu_id: @hardware.fetch("qualified_gpu_ids").first,
+          gpu_id: selected_gpu,
           max_fleet_hourly_usd: max_hourly_rate_usd
         )
         lifecycle.scale(
@@ -90,6 +95,29 @@ module RunpodOllamaFleet
     end
 
     private
+
+    def qualified_gpu_id(max_hourly_rate_usd:, desired_workers:)
+      worker_count = Integer(desired_workers)
+      raise Error, "desired worker count must be positive" unless worker_count.positive?
+
+      per_worker_cap = Float(max_hourly_rate_usd) / worker_count
+      ranking = LocalModelEvaluation::RunpodCapacityPolicy.new(client: @client).rank(
+        gpu_ids: @hardware.fetch("qualified_gpu_ids"),
+        cloud: @hardware.fetch("cloud"),
+        max_hourly_per_worker_usd: per_worker_cap
+      )
+
+      candidate = ranking.candidates.first
+      return candidate.gpu_id if candidate
+
+      detail = ranking.rejections.map do |row|
+        "#{row.gpu_id}: #{row.reason}"
+      end.join("; ")
+      suffix = detail.empty? ? "" : ": #{detail}"
+      raise Error, "no currently available qualified GPU#{suffix}"
+    rescue LocalModelEvaluation::RunpodCapacityPolicy::Error, ArgumentError, TypeError => e
+      raise Error, e.message
+    end
 
     def profile_id
       @profile.fetch("profile_id")

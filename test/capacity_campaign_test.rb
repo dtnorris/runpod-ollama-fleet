@@ -8,8 +8,8 @@ class CapacityCampaignTest < Minitest::Test
   FIXTURE = File.expand_path("fixtures/rpof-capacity-campaign-v0.1.json", __dir__)
   HARDWARE = File.expand_path("../config/execution_pool_hardware.yml", __dir__)
   CAMPAIGN_SHA256 = "3bde2853ec51980537953ceb6e85e91314041397328c433bde20a7889b58c575"
-  HARDWARE_SHA256 = "2b238e97b9de66a335fad4f40b69eb178ddee2157bab7f762a2b8e8e73502d50"
-  IDENTITY_SHA256 = "e5bfc39c8e3275eef65d17104887fef0d11cb1c1321b04744a31404dad9a8442"
+  HARDWARE_SHA256 = "8145fe4dd7f5fabd896c19401ac657dd0fa5accebfaab680b088dcbf2a33af15"
+  IDENTITY_SHA256 = "1e1032508ac938c6e26aa6ca1b4d2e8328635fe728f49332906fa0cc56d69fa5"
 
   def test_valid_multi_model_campaign_normalizes_and_binds_identity
     campaign = load_campaign(fixture)
