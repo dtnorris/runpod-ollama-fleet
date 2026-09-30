@@ -69,13 +69,11 @@ bin/rpof status ...
 bin/rpof tunnels ...
 ```
 
-Historical workload dispatch remains available through `dispatch`,
-`dispatch-admit`, `dispatch-close`, `dispatch-legacy`, `capability-check`, and
-`execution-pool-fulfill`. These commands, their frozen `afio-rpof` contracts,
-`RunpodDispatcher`, and the `lme-runpod-*` executable names are compatibility
-surfaces for recoverable executions and migration rollback. New campaign and
-registry code loads independently of them, and new WLO dynamic-worker
-executions must not call them.
+DW-33 removed `dispatch`, `dispatch-admit`, `dispatch-close`, `dispatch-legacy`
+and `execution-pool-fulfill`, including their direct executables and workload
+orchestration modules. Frozen `afio-rpof` contract validators remain available
+for audit; historical dispatch artifacts are not runnable through current code.
+Read-only `capability-check` and capacity-only `fulfill` remain supported.
 
 `bin/rpof workers --json` emits a short-lived
 `dynamic-worker-registry/v0.1` snapshot. This is the provider-neutral worker
@@ -83,10 +81,8 @@ discovery seam for consumers such as WLO; consumers do not read RPOF fleet,
 bootstrap, tunnel, or provider state directly. Only records marked `READY` are
 eligible for new work.
 
-`ExecutionPoolFulfill` is also compatibility orchestration: although it uses
-legitimate provider-capacity operations underneath, it consumes the historical
-execution-pool request contract and coordinates readiness for the older guarded
-WLO/RPOF path. It is not part of the campaign/registry production surface.
+`RPOF_STATE_ROOT` and `RPOF_STATE_REPO_ROOT` select the same state namespace
+for `workers --json` and `status --all` (also single-fleet status).
 
 ## Safety
 

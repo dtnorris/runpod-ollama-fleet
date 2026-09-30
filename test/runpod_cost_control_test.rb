@@ -59,6 +59,14 @@ class RunpodCostControlTest < Minitest::Test
     end
   end
 
+  def test_unconfigured_historical_fleet_defaults_to_managed_lifecycle
+    Dir.mktmpdir("rpof-cost-") do |root|
+      control = LocalModelEvaluation::RunpodCostControl.new(root: root, repo_root: root)
+
+      assert_equal "managed", control.fleet_lifecycle("historical-fleet")
+    end
+  end
+
   def test_soft_limit_must_precede_hard_limit
     Dir.mktmpdir("rpof-cost-") do |root|
       control = LocalModelEvaluation::RunpodCostControl.new(root: root, repo_root: root)

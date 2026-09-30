@@ -52,4 +52,18 @@ class RpofContractV01Test < Minitest::Test
       RunpodOllamaFleet::ContractV01.validate_dispatch_request!(request)
     end
   end
+
+  def test_historical_dispatch_request_with_environment_remains_inspectable
+    request = {
+      "contract_version" => RunpodOllamaFleet::ContractV01::DISPATCH_REQUEST_VERSION,
+      "target" => { "fleet_key" => "fixture", "expected_fleet_id" => "opaque", "worker_indices" => [1] },
+      "group_by_affinity" => true,
+      "jobs" => [{
+        "job_id" => "one", "argv" => ["fixture", "--inspect"],
+        "env" => { "AF_OLLAMA_BASE_URL" => "http://fixture.invalid" }, "affinity" => "model-a"
+      }]
+    }
+
+    assert_same request, RunpodOllamaFleet::ContractV01.validate_dispatch_request!(request)
+  end
 end

@@ -19,14 +19,12 @@ class CapacityOnlyLoadTest < Minitest::Test
     campaign_cli_dependencies = local_dependencies("bin/rpof-campaign")
     compatibility_dependencies = local_dependencies("lib/runpod_ollama_fleet/compatibility.rb")
 
-    [registry_dependencies, primary_dependencies, capacity_dependencies, campaign_cli_dependencies].each do |dependencies|
+    [registry_dependencies, primary_dependencies, capacity_dependencies, campaign_cli_dependencies,
+     compatibility_dependencies].each do |dependencies|
       refute_includes dependencies, DISPATCHER
       refute_includes dependencies, DISPATCH_V01
       refute_includes dependencies, EXECUTION_POOL_FULFILL
     end
-    assert_includes compatibility_dependencies, DISPATCHER
-    assert_includes compatibility_dependencies, DISPATCH_V01
-    assert_includes compatibility_dependencies, EXECUTION_POOL_FULFILL
     assert_includes capacity_dependencies, RUNPOD_BUDGET
     assert_includes capacity_dependencies, RUNPOD_FLEET
     assert_includes campaign_cli_dependencies, PRIMARY_LOADER

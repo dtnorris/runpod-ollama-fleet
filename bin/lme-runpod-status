@@ -22,7 +22,10 @@ unless ARGV.empty? || all_fleets
   exit 2
 end
 
-state_root = File.join(ROOT, "output", "runpod-fleets")
+state_root = ENV["RPOF_STATE_ROOT"].to_s.strip
+state_root = File.join(ROOT, "output", "runpod-fleets") if state_root.empty?
+state_repo_root = ENV["RPOF_STATE_REPO_ROOT"].to_s.strip
+state_repo_root = ROOT if state_repo_root.empty?
 api_key = ENV["RUNPOD_API_KEY"].to_s
 client = unless api_key.empty?
            LocalModelEvaluation::RunpodClient.new(
@@ -49,7 +52,7 @@ begin
   if all_fleets
     root_namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
       root: state_root,
-      repo_root: ROOT,
+      repo_root: state_repo_root,
       fleet_key: LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY
     )
     fleet_keys = [
@@ -63,7 +66,7 @@ begin
                   else
                     LocalModelEvaluation::RunpodFleetNamespace.new(
                       root: state_root,
-                      repo_root: ROOT,
+                      repo_root: state_repo_root,
                       fleet_key: fleet_key
                     )
                   end
@@ -76,16 +79,16 @@ begin
     overview = LocalModelEvaluation::RunpodStatusAll.new
     snapshot = overview.snapshot(entries)
     $stdout.write(overview.render(snapshot))
-    shutdown = LocalModelEvaluation::RunpodShutdownControl.new(root: state_root, repo_root: ROOT)
+    shutdown = LocalModelEvaluation::RunpodShutdownControl.new(root: state_root, repo_root: state_repo_root)
     $stdout.write("\n")
     $stdout.write(shutdown.render(fleet_aliases: snapshot.fetch("fleet_aliases")))
-    cost = LocalModelEvaluation::RunpodCostControl.new(root: state_root, repo_root: ROOT)
+    cost = LocalModelEvaluation::RunpodCostControl.new(root: state_root, repo_root: state_repo_root)
     $stdout.write("\n")
     $stdout.write(cost.render)
   else
     namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
       root: state_root,
-      repo_root: ROOT,
+      repo_root: state_repo_root,
       fleet_key: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY)
     )
     status, snapshot = build_status.call(namespace)

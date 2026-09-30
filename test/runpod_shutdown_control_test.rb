@@ -99,6 +99,9 @@ class RunpodShutdownControlTest < Minitest::Test
     assert_empty @destroyed
     gate = control.status_snapshot.fetch("gates").fetch("main")
     assert_equal "timed_out", gate.fetch("status")
+    dispatch = control.dispatch_gate(fleet_key: "main", fleet_id: gate.fetch("fleet_id"), worker_indices: [1])
+    refute dispatch.fetch("allowed")
+    assert_equal "shutdown.timed_out", dispatch.fetch("code")
   end
 
   def test_status_renders_countdown_and_copy_paste_keep_command

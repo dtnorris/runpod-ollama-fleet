@@ -14,20 +14,12 @@ when "version"
   puts RunpodOllamaFleet::VERSION
 when "capability-check"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-capability-check"), *ARGV
-when "dispatch"
-  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-dispatch"), *ARGV
-when "dispatch-admit"
-  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-dispatch-admit"), *ARGV
-when "dispatch-close"
-  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-dispatch-close"), *ARGV
 when "capacity"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-capacity"), *ARGV
 when "campaign"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-campaign"), *ARGV
 when "fulfill"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-fulfill"), *ARGV
-when "execution-pool-fulfill"
-  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-execution-pool-fulfill"), *ARGV
 when "runtime-alias"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-runtime-alias"), *ARGV
 when "workers"
@@ -38,8 +30,6 @@ when "destroy"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-fleet"), "destroy", *ARGV
 when "bootstrap"
   exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-bootstrap"), *ARGV
-when "dispatch-legacy"
-  exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-dispatch"), *ARGV
 when "lease"
   exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-lease"), *ARGV
 when "cost"
@@ -72,7 +62,6 @@ else
       create
       destroy
       bootstrap
-      dispatch-legacy
       lease
       cost
       budget
@@ -83,17 +72,11 @@ else
       status
       tunnels
 
-    Legacy workload-dispatch compatibility commands:
+    Read-only capability checks:
       capability-check
-      dispatch
-      dispatch-admit
-      dispatch-close
-      dispatch-legacy
-      execution-pool-fulfill
 
-    The campaign and workers paths provide capacity and discovery; they do not
-    dispatch workload jobs. Legacy commands retain frozen behavior for migration
-    and rollback only and are not the WLO dynamic-worker production path.
+    Campaigns and workers provide capacity and discovery. Historical workload
+    dispatch and execution-pool fulfillment are retired; contracts remain readable.
   USAGE
   exit(command ? 2 : 0)
 end
