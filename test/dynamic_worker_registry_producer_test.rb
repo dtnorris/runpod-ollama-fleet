@@ -9,6 +9,7 @@ require_relative "../lib/runpod_ollama_fleet/dynamic_worker_registry"
 class DynamicWorkerRegistryProducerTest < Minitest::Test
   DIGEST = "a" * 64
   NOW = Time.utc(2026, 9, 29, 18, 0, 0)
+  CANONICAL_TIMESTAMP = /\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\z/
   REPO_ROOT = File.expand_path("..", __dir__)
   FleetWorker = Struct.new(:index, :pod_id, :name, :host, :ssh_port, :hourly_rate, keyword_init: true)
 
@@ -73,6 +74,7 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     @state.identities[1] = identity(1, 1)
     @process = FakeProcess.new
     @health = FakeHealth.new
+    @now = NOW + 0.987654
     write_bootstrap
     write_tunnels
   end
@@ -90,6 +92,7 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     assert_equal 1, snapshot.fetch("revision")
     assert_equal "2026-09-29T18:00:00Z", snapshot.fetch("published_at")
     assert_equal "2026-09-29T18:00:30Z", snapshot.fetch("expires_at")
+    assert_operator Time.iso8601(snapshot.fetch("published_at")), :<=, @now
     assert_equal %w[contract_version expires_at published_at registry_id revision workers], snapshot.keys.sort
     assert_equal %w[capabilities capability_fingerprint endpoint generation_id labels state worker_id], worker.keys.sort
     assert_equal @state.identities.fetch(1), worker.slice("worker_id", "generation_id")
@@ -130,6 +133,7 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     assert_equal "NOT_READY", registry.snapshot.dig("workers", 0, "state")
 
     @fleet.fetch("workers").first["status"] = "destroyed"
+    @now += 1
     assert_equal "UNAVAILABLE", registry.snapshot.dig("workers", 0, "state")
   end
 
@@ -140,6 +144,7 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
 
     write_tunnels
     @process.alive = false
+    @now += 1
     assert_equal "NOT_READY", registry.snapshot.dig("workers", 0, "state")
   end
 
@@ -193,10 +198,11 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     write_bootstrap(bootstrap_record(pod_id: "pod-replacement"))
     write_tunnels(pod_id: "pod-replacement")
     expected_second = @state.registry_identity(index: 1, observed_pod_id: "pod-replacement")
+    @now += 1
     second_snapshot = registry.snapshot
     second = second_snapshot.fetch("workers").first
 
-    assert_equal 3, second_snapshot.fetch("revision")
+    assert_equal 2, second_snapshot.fetch("revision")
     assert_equal expected_second, second.slice("worker_id", "generation_id")
     assert_equal first.fetch("worker_id"), second.fetch("worker_id")
     assert_equal endpoint, second.fetch("endpoint")
@@ -217,9 +223,13 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     write_bootstrap(record)
     write_tunnels(workers: [tunnel_worker(index: 2, pod_id: "pod-2", endpoint: "http://127.0.0.1:11442"), tunnel_worker])
 
-    first = registry.snapshot.fetch("workers")
-    second = registry.snapshot.fetch("workers")
+    first_snapshot = registry.snapshot
+    second_snapshot = registry.snapshot
+    first = first_snapshot.fetch("workers")
+    second = second_snapshot.fetch("workers")
 
+    assert_equal first_snapshot, second_snapshot
+    assert_equal 1, second_snapshot.fetch("revision")
     assert_equal %w[state-worker-1 state-worker-2], first.map { |row| row.fetch("worker_id") }
     assert_equal first, second
     assert_equal @state.identities.values.sort_by { |row| row.fetch("worker_id") },
@@ -247,7 +257,59 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
                  RunpodOllamaFleet::DynamicWorkerRegistry.capability_fingerprint(worker)
   end
 
-  def test_workers_json_cli_emits_empty_valid_snapshots_and_advances_revision
+  def test_next_second_advances_revision_and_clock_rollback_fails_closed
+    first = registry.snapshot
+    @now += 1
+    second = registry.snapshot
+    state_path = File.join(@publisher_root, RunpodOllamaFleet::DynamicWorkerRegistry::PUBLISHER_STATE_FILE)
+    state_before_rollback = File.binread(state_path)
+
+    assert_equal first.fetch("registry_id"), second.fetch("registry_id")
+    assert_equal first.fetch("revision") + 1, second.fetch("revision")
+    assert_operator Time.iso8601(second.fetch("published_at")), :>,
+                    Time.iso8601(first.fetch("published_at"))
+
+    @now -= 2
+    error = assert_raises(RunpodOllamaFleet::DynamicWorkerRegistry::Error) { registry.snapshot }
+    assert_includes error.message, "clock moved backwards"
+    assert_equal state_before_rollback, File.binread(state_path)
+  end
+
+  def test_legacy_publisher_state_migrates_fail_closed_to_cached_snapshot
+    FileUtils.mkdir_p(@publisher_root)
+    state_path = File.join(@publisher_root, RunpodOllamaFleet::DynamicWorkerRegistry::PUBLISHER_STATE_FILE)
+    File.write(
+      state_path,
+      JSON.generate("schema_version" => 1, "registry_id" => "legacy-registry", "revision" => 7) + "\n"
+    )
+    File.utime(@now, @now, state_path)
+
+    error = assert_raises(RunpodOllamaFleet::DynamicWorkerRegistry::Error) { registry.snapshot }
+    assert_includes error.message, "cannot safely advance in the current second"
+
+    @now = Time.at(@now.to_i + 1).utc
+    snapshot = registry.snapshot
+    state = JSON.parse(File.read(state_path))
+
+    assert_equal "legacy-registry", snapshot.fetch("registry_id")
+    assert_equal 8, snapshot.fetch("revision")
+    assert_equal 2, state.fetch("schema_version")
+    assert_equal snapshot, state.fetch("snapshot")
+  end
+
+  def test_cached_snapshot_tampering_fails_closed
+    registry.snapshot
+    state_path = File.join(@publisher_root, RunpodOllamaFleet::DynamicWorkerRegistry::PUBLISHER_STATE_FILE)
+    state = JSON.parse(File.read(state_path))
+    state.fetch("snapshot")["revision"] += 1
+    File.write(state_path, JSON.generate(state) + "\n")
+
+    error = assert_raises(RunpodOllamaFleet::DynamicWorkerRegistry::Error) { registry.snapshot }
+
+    assert_includes error.message, "snapshot identity is invalid"
+  end
+
+  def test_workers_json_cli_emits_canonical_monotonic_or_reused_snapshots
     state_root = File.join(@tmp, "cli-state")
     env = {
       "RPOF_STATE_ROOT" => state_root,
@@ -259,9 +321,17 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     assert_equal "dynamic-worker-registry/v0.1", first.fetch("contract_version")
     assert_empty first.fetch("workers")
     assert_equal first.fetch("registry_id"), second.fetch("registry_id")
-    assert_equal first.fetch("revision") + 1, second.fetch("revision")
-    assert_operator Time.iso8601(second.fetch("published_at")), :>,
-                    Time.iso8601(first.fetch("published_at"))
+    [first, second].each do |snapshot|
+      assert_match CANONICAL_TIMESTAMP, snapshot.fetch("published_at")
+      assert_match CANONICAL_TIMESTAMP, snapshot.fetch("expires_at")
+    end
+    if first.fetch("published_at") == second.fetch("published_at")
+      assert_equal first, second
+    else
+      assert_equal first.fetch("revision") + 1, second.fetch("revision")
+      assert_operator Time.iso8601(second.fetch("published_at")), :>,
+                      Time.iso8601(first.fetch("published_at"))
+    end
   end
 
   private
@@ -288,7 +358,7 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     RunpodOllamaFleet::DynamicWorkerRegistry.new(
       state_root: @publisher_root,
       repo_root: @tmp,
-      clock: -> { NOW },
+      clock: -> { @now },
       process_adapter: @process,
       health_checker: @health,
       fleet_sources: [{ "fleet_key" => "main", "state" => @state }],

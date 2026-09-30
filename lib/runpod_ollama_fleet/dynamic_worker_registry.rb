@@ -20,6 +20,8 @@ module RunpodOllamaFleet
     ID = /\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z/
     PUBLISHER_STATE_FILE = "dynamic-worker-registry-v0.1-publisher.json"
     PUBLISHER_LOCK_FILE = ".dynamic-worker-registry-v0.1.lock"
+    PUBLISHER_STATE_SCHEMA = 2
+    CANONICAL_TIMESTAMP = /\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\z/
 
     class Error < StandardError; end
 
@@ -42,16 +44,7 @@ module RunpodOllamaFleet
       identities = workers.map { |worker| worker.fetch("worker_id") }
       raise Error, "worker identities are not unique" unless identities.uniq.length == identities.length
 
-      published_at = utc_now
-      registry_id, revision = advance_publication!
-      {
-        "contract_version" => CONTRACT_VERSION,
-        "registry_id" => registry_id,
-        "revision" => revision,
-        "published_at" => timestamp(published_at),
-        "expires_at" => timestamp(published_at + @ttl_seconds),
-        "workers" => workers
-      }
+      publish_snapshot(workers, utc_now)
     rescue LocalModelEvaluation::RunpodFleetNamespace::Error,
            LocalModelEvaluation::RunpodFleetState::Error => e
       raise Error, e.message
@@ -327,40 +320,108 @@ module RunpodOllamaFleet
       raise Error, "worker endpoint is invalid"
     end
 
-    def advance_publication!
+    def publish_snapshot(workers, observed_at)
+      published_at = Time.at(observed_at.to_i).utc
       FileUtils.mkdir_p(@state_root)
       File.open(File.join(@state_root, PUBLISHER_LOCK_FILE), File::RDWR | File::CREAT, 0o600) do |lock|
         lock.flock(File::LOCK_EX)
         state = load_publisher_state
         registry_id = state ? state.fetch("registry_id") : @id_generator.call.to_s
-        raise Error, "publisher registry_id is invalid" unless registry_id.match?(ID)
+        raise Error, "publisher registry_id is invalid" unless registry_id.is_a?(String) && registry_id.match?(ID)
+
+        if state && state.fetch("schema_version") == 1
+          legacy_publication_floor = Time.at(File.mtime(publisher_state_path).to_i).utc
+          unless published_at > legacy_publication_floor
+            raise Error, "legacy publisher state cannot safely advance in the current second"
+          end
+        end
+        if state && state.fetch("schema_version") == PUBLISHER_STATE_SCHEMA
+          previous = state.fetch("snapshot")
+          previous_time = Time.iso8601(previous.fetch("published_at"))
+          raise Error, "publisher clock moved backwards" if published_at < previous_time
+          return previous if published_at == previous_time
+        end
+
         revision = state ? Integer(state.fetch("revision")) + 1 : 1
         raise Error, "publisher revision is invalid" unless revision.positive?
 
-        write_publisher_state("schema_version" => 1, "registry_id" => registry_id, "revision" => revision)
-        [registry_id, revision]
+        snapshot = {
+          "contract_version" => CONTRACT_VERSION,
+          "registry_id" => registry_id,
+          "revision" => revision,
+          "published_at" => timestamp(published_at),
+          "expires_at" => timestamp(published_at + @ttl_seconds),
+          "workers" => workers
+        }
+        write_publisher_state(
+          "schema_version" => PUBLISHER_STATE_SCHEMA,
+          "registry_id" => registry_id,
+          "revision" => revision,
+          "snapshot_sha256" => Digest::SHA256.hexdigest(JSON.generate(snapshot)),
+          "snapshot" => snapshot
+        )
+        snapshot
       end
     rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError, TypeError => e
       raise Error, "could not advance registry publication: #{e.message}"
     end
 
     def load_publisher_state
-      path = File.join(@state_root, PUBLISHER_STATE_FILE)
+      path = publisher_state_path
       return nil unless File.file?(path)
 
       state = JSON.parse(File.read(path))
-      raise Error, "publisher state schema is invalid" unless state["schema_version"] == 1
+      schema = state.fetch("schema_version")
+      raise Error, "publisher state schema is invalid" unless [1, PUBLISHER_STATE_SCHEMA].include?(schema)
+      return state if schema == 1
+
+      validate_publisher_snapshot!(state)
       state
     end
 
+    def validate_publisher_snapshot!(state)
+      expected = %w[registry_id revision schema_version snapshot snapshot_sha256]
+      raise Error, "publisher state fields are invalid" unless state.keys.sort == expected
+      raise Error, "publisher registry_id is invalid" unless
+        state.fetch("registry_id").is_a?(String) && state.fetch("registry_id").match?(ID)
+      raise Error, "publisher revision is invalid" unless
+        state.fetch("revision").is_a?(Integer) && state.fetch("revision").positive?
+
+      snapshot = state.fetch("snapshot")
+      snapshot_keys = %w[contract_version expires_at published_at registry_id revision workers]
+      raise Error, "publisher snapshot fields are invalid" unless
+        snapshot.is_a?(Hash) && snapshot.keys.sort == snapshot_keys
+      raise Error, "publisher snapshot contract is invalid" unless
+        snapshot.fetch("contract_version") == CONTRACT_VERSION
+      raise Error, "publisher snapshot identity is invalid" unless
+        snapshot.fetch("registry_id") == state.fetch("registry_id") &&
+        snapshot.fetch("revision") == state.fetch("revision")
+      %w[published_at expires_at].each do |field|
+        raise Error, "publisher snapshot #{field} is not canonical" unless
+          snapshot.fetch(field).is_a?(String) && snapshot.fetch(field).match?(CANONICAL_TIMESTAMP)
+      end
+      raise Error, "publisher snapshot workers are invalid" unless snapshot.fetch("workers").is_a?(Array)
+
+      expected_digest = Digest::SHA256.hexdigest(JSON.generate(snapshot))
+      raise Error, "publisher snapshot digest is invalid" unless
+        state.fetch("snapshot_sha256") == expected_digest
+      published_at = Time.iso8601(snapshot.fetch("published_at"))
+      expires_at = Time.iso8601(snapshot.fetch("expires_at"))
+      raise Error, "publisher snapshot expiry is invalid" unless expires_at > published_at
+    end
+
     def write_publisher_state(document)
-      path = File.join(@state_root, PUBLISHER_STATE_FILE)
+      path = publisher_state_path
       tmp = "#{path}.tmp.#{$$}.#{Thread.current.object_id}"
       File.write(tmp, JSON.generate(document) + "\n")
       File.chmod(0o600, tmp)
       File.rename(tmp, path)
     ensure
       File.delete(tmp) if defined?(tmp) && tmp && File.exist?(tmp)
+    end
+
+    def publisher_state_path
+      File.join(@state_root, PUBLISHER_STATE_FILE)
     end
 
     def utc_now
@@ -372,7 +433,7 @@ module RunpodOllamaFleet
     end
 
     def timestamp(value)
-      value.utc.iso8601(value.nsec.zero? ? 0 : 6)
+      value.utc.iso8601(0)
     end
 
     def nonempty(value, label, max: 256)
