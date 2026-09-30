@@ -41,17 +41,16 @@ retains the predecessor Git history and frozen source commit:
 
 ```bash
 cd /Users/davidnorris/code/runpod-ollama-fleet
-LME_SOURCE_REPO=../af-workloads ./script/import-frozen-lme
-LME_SOURCE_REPO=../af-workloads ./script/verify-frozen-import
+./script/import-frozen-lme
+./script/verify-frozen-import
 bundle install
 bundle exec rake test
 ```
 
-The scripts still default to the historical sibling path
-`../af-inference-orchestrator`. The explicit override above points them at
-the current AFW checkout, which must retain the frozen predecessor commit.
-`LME_SOURCE_REPO` is a migration-compatibility variable; use another checkout
-only if it contains that exact commit.
+The scripts default to the current sibling path `../af-workloads`, whose Git
+history must retain the frozen predecessor commit. `LME_SOURCE_REPO` is a
+migration-compatibility variable; use it to select another historical checkout
+only if that checkout contains the exact frozen commit.
 
 ## Operator entry point
 
