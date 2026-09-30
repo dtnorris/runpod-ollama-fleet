@@ -372,7 +372,7 @@ module RunpodOllamaFleet
     end
 
     def timestamp(value)
-      value.utc.iso8601(0)
+      value.utc.iso8601(value.nsec.zero? ? 0 : 6)
     end
 
     def nonempty(value, label, max: 256)

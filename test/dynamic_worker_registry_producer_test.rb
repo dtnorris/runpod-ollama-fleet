@@ -260,6 +260,8 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     assert_empty first.fetch("workers")
     assert_equal first.fetch("registry_id"), second.fetch("registry_id")
     assert_equal first.fetch("revision") + 1, second.fetch("revision")
+    assert_operator Time.iso8601(second.fetch("published_at")), :>,
+                    Time.iso8601(first.fetch("published_at"))
   end
 
   private
