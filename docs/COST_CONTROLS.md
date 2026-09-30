@@ -9,11 +9,13 @@ Nothing changes until `bin/rpof cost enable` is run.
 ## Recommended production pattern
 
 For a manually administered or historically managed fleet, soft limits can
-stop provider dispatch between inference requests, while hard limits remain
-the final emergency teardown. `managed` is the provider default;
-`persistent` disables that fleet's automatic terminal retirement. Automatic
-AdventureFinder workload execution instead uses WLO's finite paid budget and
-capacity lifecycle, with RPOF's independent provider safeguards:
+stop RPOF's compatibility dispatch between inference requests, while hard
+limits remain the final emergency teardown. `managed` is the provider default;
+`persistent` disables that fleet's automatic terminal retirement. Production
+AdventureFinder execution instead uses an RPOF capacity campaign with its
+original cumulative cap, deadline, hourly cap, worker limit and independent
+guardian. WLO consumes the registry and owns no paid budget or provider
+lifecycle:
 
 ```bash
 bin/rpof cost configure \
@@ -67,8 +69,9 @@ Set the normal aggregate managed-rate ceiling and start the local watchdog:
 bin/rpof cost enable --max-total-hourly-usd 5.00 --poll-seconds 15
 ```
 
-Exceeding this runtime cap blocks new dispatch and drains queued dispatch work
-between jobs; it does not interrupt a request already in flight. The hard
+For manual or compatibility dispatch, exceeding this runtime cap blocks new
+dispatch and drains queued dispatch work between jobs; it does not interrupt a
+request already in flight. The hard
 per-fleet lease remains the emergency breaker. Existing `--max-runtime-minutes`
 and `--max-spend-usd` leases are still hard-stop controls; set them at or beyond
 the cost policy's hard thresholds so they do not preempt graceful drain.

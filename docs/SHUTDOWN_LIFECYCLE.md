@@ -1,16 +1,19 @@
 # RunPod shutdown lifecycle
 
-RPOF owns the mechanics and provider verification for retiring paid RunPod
-capacity. WLO owns terminal workload state and the automatic guarded-capacity
-lifecycle. Older AFIO terminal handoffs below describe historical managed
-campaigns, not the current AFW-to-WLO production path.
+RPOF owns the complete paid-capacity campaign lifecycle and the mechanics and
+provider verification for retiring RunPod capacity. WLO owns only generic
+workload terminal state. A WLO pause, stop or crash does not retire provider
+capacity; the RPOF campaign's independent guardian continues enforcing its
+original limits and teardown policy. Older AFIO terminal handoffs below
+describe historical managed fleets, not the current AFW-to-WLO production
+path.
 
 ## Historical AFIO terminal gate
 
 An older AFIO campaign could arm a terminal gate after reaching a terminal
-result. WLO-managed executions use their original paid budget and capacity
-session instead. Managed
-fleets use a five-minute continuous-idle window by default:
+result. Legacy v0.2 WLO/RPOF executions used a WLO-owned paid budget and
+capacity session; that path is compatibility-only. Managed fleets use a
+five-minute continuous-idle window by default:
 
 ```text
 RUNNING
@@ -76,10 +79,11 @@ into terminal RPOF state. Worker and fleet records retain their teardown reason.
 
 ## Relationship to cost control
 
-Workload lifecycle is the normal shutdown path. Runtime cost control remains the
-backstop:
+For a production capacity campaign, campaign stop or guardian enforcement is
+the normal shutdown path. Manual and historical managed-fleet controls remain
+additional backstops:
 
-1. WLO guarded-capacity retirement, historical AFIO terminal gate, or operator shutdown
+1. RPOF campaign stop/guardian, historical AFIO terminal gate, or operator shutdown
 2. ephemeral idle or unavailable reaping
 3. soft runtime/spend drain
 4. hard runtime/spend teardown

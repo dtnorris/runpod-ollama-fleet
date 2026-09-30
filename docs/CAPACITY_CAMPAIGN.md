@@ -9,7 +9,7 @@ Required top-level fields are:
 - `contract_version`: exactly `rpof-capacity-campaign/v0.1`;
 - `campaign_id`: durable operator-selected identity;
 - `max_workers`: aggregate worker ceiling;
-- `max_hourly_rate_usd`: aggregate rate ceiling reserved for DW-06 enforcement;
+- `max_hourly_rate_usd`: enforced aggregate rate ceiling;
 - `profiles`: one or more model-capacity declarations.
 
 Each profile requires `profile_id`, `model`, `expected_digest`,
@@ -25,10 +25,12 @@ lifecycle identity consists of its `campaign_id`, normalized declaration hash,
 and hardware-qualification hash. This prevents provider qualification changes
 from silently retaining an earlier lifecycle identity.
 
-The campaign does not duplicate paid-budget fields. DW-05 remains responsible
-for the parent cumulative-spend limit, immutable deadline/runtime lease,
-guardian cadence, and crash-surviving teardown lifecycle. DW-06 will enforce
-the declared aggregate worker and hourly-rate ceilings.
+The campaign does not duplicate paid-budget fields. Its bound parent budget
+owns the cumulative-spend limit, immutable deadline/runtime lease, guardian
+cadence, and crash-surviving teardown lifecycle. Live mutation admission
+enforces the declared aggregate worker and hourly-rate ceilings. These limits
+remain bound to the original campaign after the WLO consumer pauses, stops or
+crashes.
 
 ## Ownership boundary
 

@@ -65,8 +65,8 @@ The independent guardian continues heartbeat evaluation and teardown after the
 campaign-starting process exits. Guardian teardown errors are retained in the
 parent ledger until a later retry verifies provider absence and closes it.
 
-`mutation_authority!` and `reserve_capacity_mutation!` are the zero-provider
-seams for DW-06. They prove the original binding and reject projected worker,
-hourly-rate, or cumulative-liability widening. No current provisioning or
-fulfillment path calls them in DW-05; DW-06 remains responsible for wiring
-live aggregate admission, and DW-07 remains responsible for operator CLI.
+`mutation_authority!` and `reserve_capacity_mutation!` prove the original
+binding and reject projected worker, hourly-rate or cumulative-liability
+widening. Campaign start and later scale or replacement mutations use that
+authority, and the operator CLI reports the same durable budget and guardian
+state. WLO has no API that can reset, widen or replace this authority.

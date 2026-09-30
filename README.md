@@ -7,11 +7,14 @@ safeguards, provider scaling/replacement, campaign lifecycle, and worker
 capability publication.
 **AFW (`af-workloads`)** owns AdventureFinder workload intent, qualification,
 frozen scoring and result interpretation. **WLO (`workload-orchestrator`)** owns
-automatic placement, attempts, retries, pause/resume, breakers, guarded paid
-capacity and workload lifecycle. The target WLO production path discovers RPOF
-capacity through the provider-neutral worker registry and executes selected
-work itself; it does not ask RPOF to schedule or dispatch jobs. Operators use
-`bin/rpof` directly for campaign and fleet administration.
+generic scheduling and execution state: placement, attempts, retries,
+pause/resume and breakers. **RPOF owns the paid-capacity campaign lifecycle,**
+including cumulative and hourly limits, deadlines, worker ceilings, the
+independent guardian, provider replacement and teardown. The production WLO
+path discovers RPOF capacity through the provider-neutral worker registry and
+executes selected work itself; it does not ask RPOF to schedule or dispatch
+jobs. Stopping WLO does not stop or widen a campaign. Operators use `bin/rpof`
+directly for campaign and fleet administration.
 
 The frozen `afio-rpof/v0.1` wire names are compatibility identifiers, not a
 statement that AFIO owns present-day execution.
