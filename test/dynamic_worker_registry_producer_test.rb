@@ -133,10 +133,10 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     assert_equal "UNAVAILABLE", registry.snapshot.dig("workers", 0, "state")
   end
 
-  def test_missing_or_stale_tunnel_is_not_ready
+  def test_missing_tunnel_omits_worker_and_stale_tunnel_is_not_ready
     File.delete(File.join(@state.artifact_dir(@fleet.fetch("fleet_id"), "tunnels"), "tunnels.json"))
-    error = assert_raises(RunpodOllamaFleet::DynamicWorkerRegistry::Error) { registry.snapshot }
-    assert_includes error.message, "provider pod identity mismatch"
+
+    assert_empty registry.snapshot.fetch("workers")
 
     write_tunnels
     @process.alive = false

@@ -7,10 +7,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FLEET_KEY="${LME_RUNPOD_FLEET:-default}"
+STATE_ROOT="${RPOF_STATE_ROOT:-$ROOT/output/runpod-fleets}"
 if [[ "$FLEET_KEY" == "default" ]]; then
   ENV_FILE="$ROOT/.env"
 else
-  ENV_FILE="$ROOT/output/runpod-fleets/fleets/$FLEET_KEY/fleet.env"
+  ENV_FILE="$STATE_ROOT/fleets/$FLEET_KEY/fleet.env"
 fi
 REMOTE_SETUP="$ROOT/scripts/setup_runpod_ollama_worker.sh"
 WORKER=""

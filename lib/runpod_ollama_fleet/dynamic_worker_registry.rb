@@ -122,10 +122,13 @@ module RunpodOllamaFleet
       models = capability_models(worker, gpu_id, bootstrap, runtime_aliases)
       return nil if models.empty?
 
+      tunnel = tunnels[index]
+      return nil unless tunnel
+
       endpoint = valid_endpoint(worker.fetch("local_ollama_url"))
       identity = state.registry_identity(
         index:,
-        observed_pod_id: tunnels.dig(index, "pod_id")
+        observed_pod_id: tunnel.fetch("pod_id")
       )
       record = {
         "worker_id" => identity.fetch("worker_id"),
