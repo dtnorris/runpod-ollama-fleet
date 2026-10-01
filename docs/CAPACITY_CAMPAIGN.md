@@ -32,6 +32,19 @@ enforces the declared aggregate worker and hourly-rate ceilings. These limits
 remain bound to the original campaign after the WLO consumer pauses, stops or
 crashes.
 
+`campaign start` is a short-lived mutation client, not a continuing campaign
+controller. After it returns, provider resources remain and the independent
+guardian continues enforcing the original authority. The guardian is a safety
+enforcer: it does not schedule WLO jobs, maintain desired capacity continuously,
+or replace a future FO-09 controller.
+
+`campaign status` is a one-shot read-only observer. Interrupting or closing it
+changes no workload or provider lifecycle. `campaign stop` durably requests
+guardian-owned teardown; the request returning is not proof of completion.
+Teardown is complete only when subsequent status reports the budget `CLOSED`
+and records provider-absence verification. Ctrl-C or terminal loss during any
+campaign command is never a substitute for `wlo pause` or `campaign stop`.
+
 ## Ownership boundary
 
 Campaign `plan`, `start`, `status`, and `stop` manage provider capacity only.

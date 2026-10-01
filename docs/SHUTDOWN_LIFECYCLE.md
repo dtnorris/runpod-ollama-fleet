@@ -90,3 +90,10 @@ additional backstops:
 
 `keep` only cancels the workload-lifecycle shutdown gate. It does not override a
 hard lease or runtime cost policy.
+
+The initiating `campaign stop` CLI does not remain alive as a controller. It
+records a teardown request for the independent guardian, which continues after
+the CLI and terminal exit. A successful request is therefore not synonymous
+with completed teardown: campaign status must report `CLOSED` and verified
+provider absence. Interrupting campaign status closes only that observation;
+interrupting a teardown CLI does not prove that paid resources stopped.

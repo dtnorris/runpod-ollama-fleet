@@ -84,6 +84,47 @@ eligible for new work.
 `RPOF_STATE_ROOT` and `RPOF_STATE_REPO_ROOT` select the same state namespace
 for `workers --json` and `status --all` (also single-fleet status).
 
+## Operator process ownership
+
+RPOF command completion, process lifetime and provider-resource lifetime are
+separate facts. The classifications below describe the invoking process:
+
+- **FOREGROUND WORK OWNER**: the CLI owns the active local operation;
+- **DETACHED WORK LAUNCHER**: continuing local subprocesses outlive the CLI;
+- **ONE-SHOT INSPECTION/PUBLICATION**: the CLI reads or publishes current state
+  without owning workload or paid-capacity lifecycle;
+- **CONTROL REQUEST** / **RESOURCE MUTATION**: the CLI changes durable local or
+  provider state but is not a continuing controller; and
+- **TEARDOWN REQUEST**: the CLI requests deletion/retirement, whose success
+  requires the command-specific provider-absence condition.
+
+| Command | Classification | What remains after return | Ctrl-C / terminal loss | Correct lifecycle command |
+| --- | --- | --- | --- | --- |
+| `campaign plan`, `campaign status` | ONE-SHOT INSPECTION | Existing guardian, provider resources, tunnels and WLO execution continue. | Interrupts only the request/view. | `wlo pause` pauses work; `campaign stop` requests paid teardown. |
+| `campaign start` | RESOURCE MUTATION | The independent launchd guardian and any created provider resources continue. There is no continuing campaign controller. | May interrupt an in-flight mutation; it is not rollback, WLO pause or teardown. Inspect campaign status before retrying. | `campaign stop`, then status until `CLOSED` with provider absence verified. |
+| `campaign stop` | TEARDOWN REQUEST | The independent guardian continues teardown and retries after the CLI returns. | Interrupts only the requesting CLI; it does not cancel the durable teardown request or prove its completion. | Re-run status/stop until provider absence is verified and the budget is `CLOSED`. |
+| `workers --json`, `status`, `capacity`, `capability-check` | ONE-SHOT INSPECTION/PUBLICATION | Workloads, guardians, tunnels and provider resources continue. Registry publication may advance its durable revision but owns no work or capacity. | Interrupts only the request. | Use WLO and RPOF lifecycle commands explicitly. |
+| `create`, `fulfill`, `scale`, `replace` | RESOURCE MUTATION | Provider resources remain; a configured lease watchdog is detached and remains independently responsible for its lease. | May leave a partial or completed mutation; it is not rollback or teardown. Inspect state/provider evidence before retrying. | For campaign-owned capacity use `campaign stop`; otherwise use `destroy` or `shutdown` as applicable. |
+| `destroy` | TEARDOWN REQUEST | No selected paid worker should remain only after synchronous provider-absence verification succeeds; unrelated resources/watchdogs may remain. | Interrupting the CLI does not prove deletion. | Inspect `status`; repeat explicit teardown if required. |
+| `shutdown` | TEARDOWN REQUEST | Immediate graceful/force modes own the request until verified completion; `--terminal` launches a detached shutdown watchdog. | Ctrl-C of an immediate request is not completion. After `--terminal` returns, shell Ctrl-C has no effect on its watchdog. | Inspect `status`; use `keep` only to cancel a pending lifecycle gate, not a hard lease. |
+| `keep` | CONTROL REQUEST | Paid resources continue; only the pending/timed-out lifecycle shutdown gate is cancelled. | Interrupts only the request. | Use `shutdown`, `destroy` or `campaign stop` for teardown. |
+| `bootstrap`, `runtime-alias` | FOREGROUND WORK OWNER | Paid resources remain. Remote/model state may be partial if interrupted. | Interrupts the CLI operation; it does not stop WLO or delete provider capacity. | Inspect evidence/readiness before retrying; use an explicit teardown command for capacity. |
+| `tunnels start`, `tunnels repair` | DETACHED WORK LAUNCHER | Healthy managed SSH tunnel processes continue after the CLI returns. A Ctrl-C during start cleans up tunnels newly started by that invocation, but existing tunnels and paid workers remain. | Never pauses WLO or tears down provider capacity. | `tunnels stop` stops selected tunnels only. |
+| `tunnels status`, `tunnels stop` | ONE-SHOT INSPECTION / CONTROL REQUEST | `status` leaves tunnels unchanged apart from health-state reconciliation; `stop` removes selected local tunnels but leaves paid workers alive. | Interrupts only this request. | Use provider teardown separately. |
+| `lease status` | ONE-SHOT INSPECTION | The lease watchdog, provider resources and WLO continue. | Interrupts only the request. | Use the applicable provider teardown command. |
+| `lease watch` | FOREGROUND WORK OWNER | When invoked directly, that watchdog is the foreground owner; `create`/`fulfill` normally launch it detached. | Ctrl-C stops only the directly invoked watchdog and leaves paid resources alive; it is not teardown. | Restore lease enforcement or explicitly tear down capacity. |
+| `cost enable` | DETACHED WORK LAUNCHER | The detached cost watchdog continues after the CLI or terminal exits. | Later shell Ctrl-C has no effect. | `cost disable` stops the watchdog only; provider teardown remains separate. |
+| `cost watch` | FOREGROUND WORK OWNER | The foreground watchdog enforces configured cost policy while alive. | Ctrl-C stops that watchdog, not paid resources. | `cost enable` restores detached enforcement; use explicit teardown for resources. |
+| Other `cost` controls | CONTROL REQUEST / ONE-SHOT INSPECTION | Configured resources and any running watchdog continue unless `disable` explicitly stops that watchdog. | Interrupts only the request. | Provider teardown remains separate. |
+| `budget arm` | DETACHED WORK LAUNCHER | The independent launchd budget guardian continues after the CLI returns. It enforces authority but is not a workload or campaign controller. | Ctrl-C does not constitute teardown and may leave arm evidence requiring inspection. | Use campaign stop/budget teardown flow and verify provider absence. |
+| Other `budget` commands | CONTROL REQUEST / ONE-SHOT INSPECTION | The guardian/resources continue according to retained budget state. `begin-teardown` requests guardian-owned teardown; `close` is not a substitute for provider-absence proof. | Interrupts only the request. | Use the bound campaign teardown/status flow for production capacity. |
+
+Across every row, `wlo pause` is the command for intentional graceful workload
+pause. It does not tear down paid resources. For production campaign capacity,
+`rpof campaign stop` is the teardown request, and completion requires a later
+status proving provider absence and `CLOSED`. Closing a view, pressing Ctrl-C,
+losing a shell or losing a terminal is never a substitute for either action.
+
 ## Safety
 
 No command in `script/import-frozen-lme` or `script/verify-frozen-import` contacts RunPod or creates paid infrastructure. The imported provider helper commands retain their existing confirmations, dry-run behavior, cost caps, managed-pod deletion checks, leases, and fail-closed behavior from the frozen source.

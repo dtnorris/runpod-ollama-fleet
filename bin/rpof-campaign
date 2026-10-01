@@ -10,7 +10,6 @@ Dotenv.load(File.join(ROOT, ".env"))
 $LOAD_PATH.unshift File.join(ROOT, "lib")
 require "runpod_ollama_fleet"
 
-command = ARGV.shift
 options = {
   campaign: nil,
   budget: nil,
@@ -32,7 +31,17 @@ parser = OptionParser.new do |o|
   o.on("--authorize-paid", "Explicitly authorize provider creation (start only)") { options[:authorize_paid] = true }
   o.on("--reason TEXT", "Teardown reason (stop only)") { |v| options[:reason] = v }
   o.on("--json", "Emit machine-readable JSON") { options[:json] = true }
+  o.separator ""
+  o.separator "Process ownership:"
+  o.separator "  plan/status  ONE-SHOT INSPECTION; Ctrl-C interrupts only this request."
+  o.separator "  start        RESOURCE MUTATION; the CLI returns, while paid resources and the"
+  o.separator "               independent guardian continue. The guardian is not a campaign controller."
+  o.separator "  stop         TEARDOWN REQUEST; Ctrl-C only interrupts the request, and teardown"
+  o.separator "               is not complete until status reports provider absence and CLOSED."
+  o.separator "WLO execution is separate: use `wlo pause` to pause work. Shell loss is neither pause nor teardown."
 end
+
+command = ARGV.shift unless %w[--help -h].include?(ARGV.first)
 
 def load_json_object(path, label)
   value = JSON.parse(File.binread(File.expand_path(path)))
@@ -65,6 +74,8 @@ def render_human(command, result)
     else
       puts "PAID campaign start authorized: #{result.dig('campaign', 'campaign_id')}"
       puts "Budget=#{result['budget_state']} active+pending=#{result['active_plus_pending_workers']}/#{result['max_workers']}"
+      puts "The initiating CLI is finished; paid resources and the independent guardian continue."
+      puts "The guardian enforces safety but is not a continuing campaign controller."
     end
   when "status"
     puts "READ-ONLY campaign status: #{result.dig('campaign', 'campaign_id')}"
@@ -80,6 +91,9 @@ def render_human(command, result)
   when "stop"
     puts "Campaign stop: budget=#{result.fetch('budget_state')} absence_verified=#{result.fetch('provider_absence_verified')}"
     puts result.fetch("message")
+    unless result.fetch("provider_absence_verified")
+      puts "Recheck campaign status; teardown is incomplete until provider absence is verified and the budget is CLOSED."
+    end
   end
 end
 

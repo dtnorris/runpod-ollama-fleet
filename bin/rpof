@@ -77,6 +77,35 @@ else
 
     Campaigns and workers provide capacity and discovery. Historical workload
     dispatch and execution-pool fulfillment are retired; contracts remain readable.
+
+    Process ownership and Ctrl-C:
+      campaign plan/status, workers, status, capacity, capability-check
+        ONE-SHOT INSPECTION/PUBLICATION. Ctrl-C interrupts only this request;
+        it does not stop WLO execution or paid provider resources.
+      campaign start
+        RESOURCE MUTATION. This initiating CLI is short-lived. Paid resources
+        and the independent budget guardian continue after it returns or its
+        terminal exits; the guardian is a safety enforcer, not a campaign controller.
+      campaign stop
+        TEARDOWN REQUEST. The guardian owns continued teardown. Success is not
+        complete until campaign status reports CLOSED with provider absence verified.
+      create, fulfill, scale, replace
+        RESOURCE MUTATION. Ctrl-C interrupts only the requesting CLI and is not
+        rollback or teardown; provider resources and detached watchdogs may remain.
+      destroy, shutdown
+        TEARDOWN REQUEST. Ctrl-C does not prove provider absence; inspect status
+        and repeat the explicit teardown command when necessary.
+      bootstrap, runtime-alias
+        FOREGROUND WORK OWNER. Ctrl-C interrupts the CLI, not WLO or paid capacity.
+      tunnels start/repair
+        DETACHED WORK LAUNCHER. Healthy SSH tunnel processes outlive this CLI;
+        use `tunnels stop` to stop tunnels. That still does not delete provider capacity.
+      lease watch, cost watch
+        FOREGROUND WORK OWNER when invoked directly. Ctrl-C stops only that
+        watchdog process; it does not delete paid resources.
+
+    WLO pause and RPOF teardown are separate lifecycle actions. Closing a view,
+    interrupting a CLI, or losing a shell/terminal is never a substitute for either.
   USAGE
   exit(command ? 2 : 0)
 end
