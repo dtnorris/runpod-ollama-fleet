@@ -110,14 +110,65 @@ class RpofCampaignCliTest < Minitest::Test
     refute_includes stdout, " ready="
   end
 
+  def test_desired_json_is_read_only_and_provider_neutral
+    expected = {
+      "command" => "campaign desired",
+      "read_only" => true,
+      "provider_mutations" => 0,
+      "actual_capacity_unchanged" => true,
+      "campaign" => { "campaign_id" => "production-batch-039" },
+      "desired_capacity" => { "contract_version" => "rpof-desired-capacity/v0.1", "revision" => 0 }
+    }
+
+    stdout, stderr, status = with_stubbed_campaign(:desired, expected) { run_cli("desired", "--json") }
+
+    assert status.success?, stderr
+    assert_equal expected, JSON.parse(stdout)
+  end
+
+  def test_desired_set_requires_compare_and_set_inputs_and_reports_no_provider_mutation
+    expected = {
+      "command" => "campaign desired-set",
+      "updated" => true,
+      "provider_mutations" => 0,
+      "actual_capacity_unchanged" => true,
+      "campaign" => { "campaign_id" => "production-batch-039" },
+      "desired_capacity" => { "contract_version" => "rpof-desired-capacity/v0.1", "revision" => 1 }
+    }
+    received = nil
+    stdout, stderr, status = with_stubbed_campaign(
+      :set_desired, expected, argument_sink: ->(arguments) { received = arguments }
+    ) do
+      run_cli(
+        "desired-set", "--profile", "qwen35=0", "--expected-revision", "0",
+        "--reason", "hold qwen35", "--json"
+      )
+    end
+
+    assert status.success?, stderr
+    assert_equal expected, JSON.parse(stdout)
+    assert_equal({
+                   profile_counts: { "qwen35" => 0 },
+                   expected_revision: 0,
+                   reason: "hold qwen35"
+                 }, received)
+
+    _stdout, stderr, status = run_cli("desired-set", "--profile", "qwen35=0", "--json")
+    refute status.success?
+    assert_includes stderr, "--expected-revision"
+  end
+
   private
 
-  def with_stubbed_campaign(action, result)
+  def with_stubbed_campaign(action, result, argument_sink: nil)
     hardware = Object.new
     campaign = Object.new
     binding = Object.new
     lifecycle = Object.new
-    lifecycle.define_singleton_method(action) { |**_arguments| result }
+    lifecycle.define_singleton_method(action) do |**arguments|
+      argument_sink&.call(arguments)
+      result
+    end
 
     RunpodOllamaFleet::ExecutionPoolHardware.stub(:new, hardware) do
       RunpodOllamaFleet::CapacityCampaign.stub(:load, campaign) do

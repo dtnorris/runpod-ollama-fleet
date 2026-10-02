@@ -79,9 +79,12 @@ else
     dispatch and execution-pool fulfillment are retired; contracts remain readable.
 
     Process ownership and Ctrl-C:
-      campaign plan/status, workers, status, capacity, capability-check
+      campaign plan/status/desired, workers, status, capacity, capability-check
         ONE-SHOT INSPECTION/PUBLICATION. Ctrl-C interrupts only this request;
         it does not stop WLO execution or paid provider resources.
+      campaign desired-set
+        CONTROL REQUEST. It updates revisioned desired state only; actual
+        provider capacity is unchanged until a separate lifecycle operation.
       campaign start
         RESOURCE MUTATION. This initiating CLI is short-lived. Paid resources
         and the independent budget guardian continue after it returns or its

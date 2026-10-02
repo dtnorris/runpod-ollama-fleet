@@ -57,7 +57,7 @@ only if that checkout contains the exact frozen commit.
 `bin/rpof` exposes the current capacity/registry interface:
 
 ```text
-bin/rpof campaign plan|start|status|stop ...
+bin/rpof campaign plan|start|status|stop|desired|desired-set ...
 bin/rpof workers --json
 bin/rpof create ...
 bin/rpof destroy ...
@@ -128,7 +128,8 @@ separate facts. The classifications below describe the invoking process:
 
 | Command | Classification | What remains after return | Ctrl-C / terminal loss | Correct lifecycle command |
 | --- | --- | --- | --- | --- |
-| `campaign plan`, `campaign status` | ONE-SHOT INSPECTION | Existing guardian, provider resources, tunnels and WLO execution continue. | Interrupts only the request/view. | `wlo pause` pauses work; `campaign stop` requests paid teardown. |
+| `campaign plan`, `campaign status`, `campaign desired` | ONE-SHOT INSPECTION | Existing guardian, provider resources, tunnels and WLO execution continue. | Interrupts only the request/view. | `wlo pause` pauses work; `campaign stop` requests paid teardown. |
+| `campaign desired-set` | CONTROL REQUEST | Revisioned desired state changes; actual provider resources, the original budget/deadline, guardian and WLO execution remain unchanged. | May leave either the prior complete revision or the new complete revision; it never implies provider reconciliation. | Inspect with `campaign desired`; use a separate authorized lifecycle operation for later reconciliation. |
 | `campaign start` | RESOURCE MUTATION | The independent launchd guardian and any created provider resources continue. There is no continuing campaign controller. | May interrupt an in-flight mutation; it is not rollback, WLO pause or teardown. Inspect campaign status before retrying. | `campaign stop`, then status until `CLOSED` with provider absence verified. |
 | `campaign stop` | TEARDOWN REQUEST | The independent guardian continues teardown and retries after the CLI returns. | Interrupts only the requesting CLI; it does not cancel the durable teardown request or prove its completion. | Re-run status/stop until provider absence is verified and the budget is `CLOSED`. |
 | `workers --json`, `status`, `capacity`, `capability-check` | ONE-SHOT INSPECTION/PUBLICATION | Workloads, guardians, tunnels and provider resources continue. Registry publication may advance its durable revision but owns no work or capacity. | Interrupts only the request. | Use WLO and RPOF lifecycle commands explicitly. |
@@ -162,6 +163,24 @@ cap covers recorded RunPod pod compute only—not storage, Global Volume,
 network/egress, or other provider charges—and the report states the host/network/provider
 failure domain instead of claiming a provider-side hard total-spend cap. See
 [`docs/PAID_START_SAFETY.md`](docs/PAID_START_SAFETY.md).
+
+## Versioned desired capacity
+
+`rpof-capacity-campaign/v0.1` remains frozen: its positive `min_workers`,
+`desired_workers` and `max_workers` validation and identity hashing are
+unchanged. RPOF overlays explicit mutable intent with
+`rpof-desired-capacity/v0.1`, bound to the immutable campaign identity, budget
+binding SHA and budget ID. The compatibility baseline is revision 0 and uses
+the v0.1 declaration's desired counts. The first accepted update is revision 1.
+
+`campaign desired-set` requires an expected revision, records a reason, rejects
+unknown profiles and counts above each immutable profile maximum, and retains a
+hash-linked revision history. A desired count of zero keeps the profile and its
+model, digest, context, residency, hardware and maximum-worker authority. The
+update performs no provider calls and does not reserve spend, reset the parent
+budget or deadline, discard pending liability, or turn the guardian into a
+desired-capacity controller. Provider add/drain/remove reconciliation remains a
+separate lifecycle concern.
 
 ## Plan-derived model requirements
 

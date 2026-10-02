@@ -2,6 +2,7 @@
 
 require "time"
 require_relative "campaign_capacity_admission"
+require_relative "desired_capacity"
 
 module RunpodOllamaFleet
   # Human-facing orchestration for one immutable capacity campaign. Provider
@@ -10,19 +11,23 @@ module RunpodOllamaFleet
   class CampaignLifecycle
     class Error < StandardError; end
 
-    def initialize(campaign:, binding:, runtime_factory:, price_resolver: nil, wall_clock: nil)
+    def initialize(campaign:, binding:, runtime_factory:, price_resolver: nil, wall_clock: nil,
+                   desired_capacity: nil)
       @campaign = campaign
       @binding = binding
       @runtime_factory = runtime_factory
       @price_resolver = price_resolver
       @wall_clock = wall_clock || -> { Time.now.utc }
+      @desired_capacity = desired_capacity || DesiredCapacity.new(binding:, wall_clock: @wall_clock)
       unless binding.campaign.identity_sha256 == campaign.identity_sha256
         raise Error, "campaign binding does not match the requested campaign"
       end
     end
 
     def plan
-      projections = @campaign.profiles.map do |profile|
+      desired_state = @desired_capacity.current
+      profiles = profiles_for(desired_state)
+      projections = profiles.map do |profile|
         hardware = hardware_for(profile)
         rate = @price_resolver&.call(profile, hardware)
         profile_intent(profile, hardware).merge(
@@ -37,9 +42,10 @@ module RunpodOllamaFleet
         "paid_resources_created" => false,
         "campaign" => campaign_identity,
         "binding_sha256" => @binding.binding_sha256,
+        "desired_capacity" => desired_state,
         "budget" => budget_intent,
         "profiles" => projections,
-        "expected_desired_workers" => @campaign.profiles.sum { |p| p.fetch("desired_workers") },
+        "expected_desired_workers" => profiles.sum { |p| p.fetch("desired_workers") },
         "projected_desired_hourly_rate_usd" => projected.length == projections.length ? projected.sum : nil
       }
     rescue StandardError => e
@@ -55,6 +61,8 @@ module RunpodOllamaFleet
         )
       end
 
+      desired_state = @desired_capacity.current
+      profiles = profiles_for(desired_state)
       existing = existing_authority
       if existing && existing.dig("parent_budget", "state") == "CLOSED"
         raise Error, "campaign is closed and cannot be restarted under the same binding"
@@ -63,7 +71,7 @@ module RunpodOllamaFleet
       @binding.bind!
       authority = @binding.arm!
       verify_started_authority!(authority)
-      prepared = prepare_start(authority)
+      prepared = prepare_start(authority, profiles:)
       safety_report = @binding.assert_safety_gate!(
         projected_workers: prepared.fetch("projected_workers"),
         projected_hourly_rate_usd: prepared.fetch("projected_hourly_rate_usd")
@@ -95,17 +103,19 @@ module RunpodOllamaFleet
         raise Error, "partial campaign startup at #{profile.fetch('profile_id')}: #{e.message}"
       end
 
-      status.merge(
+      status(desired_state:).merge(
         "command" => "campaign start",
         "paid_authorized" => true,
         "safety_report" => safety_report,
         "profiles" => results
       )
-    rescue CampaignBudgetBinding::Error, CampaignCapacityAdmission::Error => e
+    rescue CampaignBudgetBinding::Error, CampaignCapacityAdmission::Error, DesiredCapacity::Error => e
       raise Error, e.message
     end
 
-    def status
+    def status(desired_state: nil)
+      desired_state ||= @desired_capacity.current
+      profiles = profiles_for(desired_state)
       authority = existing_authority
       raise Error, "campaign has not been bound; run campaign plan or campaign start" unless authority
 
@@ -117,7 +127,7 @@ module RunpodOllamaFleet
       resources = ledger.fetch("owned_resources", {}).values
       pending = reservations.select { |row| row["status"] == "pending" }
       active = resources.select { |row| row["status"] == "active" }
-      profile_rows = @campaign.profiles.map do |profile|
+      profile_rows = profiles.map do |profile|
         runtime = @runtime_factory.call(profile, hardware_for(profile), nil)
         runtime.status.merge(
           "profile_id" => profile.fetch("profile_id"),
@@ -131,6 +141,7 @@ module RunpodOllamaFleet
         "read_only" => true,
         "campaign" => campaign_identity,
         "binding_sha256" => @binding.binding_sha256,
+        "desired_capacity" => desired_state,
         "binding_phase" => authority["phase"],
         "budget_state" => ledger["state"],
         "guardian_healthy" => authority.fetch("guardian_healthy", false),
@@ -157,7 +168,43 @@ module RunpodOllamaFleet
         "provider_absence_verified_at_utc" => ledger["provider_absence_verified_at_utc"],
         "profiles" => profile_rows
       }
-    rescue CampaignBudgetBinding::Error, KeyError, ArgumentError, TypeError => e
+    rescue CampaignBudgetBinding::Error, DesiredCapacity::Error, KeyError, ArgumentError, TypeError => e
+      raise Error, e.message
+    end
+
+    def desired
+      state = @desired_capacity.current
+      {
+        "command" => "campaign desired",
+        "read_only" => true,
+        "provider_mutations" => 0,
+        "actual_capacity_unchanged" => true,
+        "campaign" => campaign_identity,
+        "binding_sha256" => @binding.binding_sha256,
+        "desired_capacity" => state,
+        "profiles" => profiles_for(state).map do |profile|
+          profile.slice("profile_id", "desired_workers", "max_workers")
+        end
+      }
+    rescue DesiredCapacity::Error => e
+      raise Error, e.message
+    end
+
+    def set_desired(profile_counts:, expected_revision:, reason:)
+      state = @desired_capacity.update!(profile_counts:, expected_revision:, reason:)
+      {
+        "command" => "campaign desired-set",
+        "updated" => state.fetch("changed"),
+        "provider_mutations" => 0,
+        "actual_capacity_unchanged" => true,
+        "campaign" => campaign_identity,
+        "binding_sha256" => @binding.binding_sha256,
+        "desired_capacity" => state.except("changed"),
+        "profiles" => profiles_for(state).map do |profile|
+          profile.slice("profile_id", "desired_workers", "max_workers")
+        end
+      }
+    rescue DesiredCapacity::Error => e
       raise Error, e.message
     end
 
@@ -203,14 +250,14 @@ module RunpodOllamaFleet
       raise Error, "campaign original deadline has expired" unless deadline > utc_now
     end
 
-    def prepare_start(authority)
+    def prepare_start(authority, profiles:)
       committed_by_profile = authority.dig("authority", "committed_workers_by_profile") || {}
       committed_workers = Integer(authority.dig("authority", "committed_workers"))
       committed_rate = Float(authority.dig("authority", "committed_hourly_rate_usd"))
       additions = 0
       additional_rate = 0.0
       rate_available = true
-      rows = @campaign.profiles.map do |profile|
+      rows = profiles.map do |profile|
         hardware = hardware_for(profile)
         admission = CampaignCapacityAdmission.new(binding: @binding, profile_id: profile.fetch("profile_id"))
         runtime = @runtime_factory.call(profile, hardware, admission)
@@ -248,6 +295,15 @@ module RunpodOllamaFleet
       }
     rescue KeyError, ArgumentError, TypeError => e
       raise Error, "could not calculate paid-start projection: #{e.message}"
+    end
+
+    def profiles_for(desired_state)
+      counts = desired_state.fetch("profiles").to_h do |row|
+        [row.fetch("profile_id"), row.fetch("desired_workers")]
+      end
+      @campaign.profiles.map do |profile|
+        profile.merge("desired_workers" => counts.fetch(profile.fetch("profile_id")))
+      end
     end
 
     def hardware_for(profile)

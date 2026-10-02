@@ -18,22 +18,33 @@ options = {
   ssh_public_key: ENV.fetch("RUNPOD_SSH_PUBLIC_KEY_PATH", "~/.ssh/id_ed25519.pub"),
   authorize_paid: false,
   json: false,
-  reason: "operator requested campaign stop"
+  reason: nil,
+  desired_profiles: [],
+  expected_revision: nil
 }
 
 parser = OptionParser.new do |o|
-  o.banner = "Usage: bin/rpof campaign plan|start|status|stop --campaign FILE --budget FILE [options]"
+  o.banner = "Usage: bin/rpof campaign plan|start|status|stop|desired|desired-set " \
+             "--campaign FILE --budget FILE [options]"
   o.on("--campaign FILE", "DW-04 campaign declaration") { |v| options[:campaign] = v }
   o.on("--budget FILE", "DW-05 campaign budget declaration") { |v| options[:budget] = v }
   o.on("--hardware FILE", "Hardware qualification registry") { |v| options[:hardware] = v }
   o.on("--state-root DIR", "Durable RPOF state root") { |v| options[:state_root] = v }
   o.on("--ssh-public-key FILE", "OpenSSH public key for authorized start") { |v| options[:ssh_public_key] = v }
   o.on("--authorize-paid", "Explicitly authorize provider creation (start only)") { options[:authorize_paid] = true }
-  o.on("--reason TEXT", "Teardown reason (stop only)") { |v| options[:reason] = v }
+  o.on("--profile ID=COUNT", "Desired profile count (desired-set; repeatable)") do |v|
+    options[:desired_profiles] << v
+  end
+  o.on("--expected-revision N", Integer, "Compare-and-set desired revision") do |v|
+    options[:expected_revision] = v
+  end
+  o.on("--reason TEXT", "Mutation reason (desired-set) or teardown reason (stop)") { |v| options[:reason] = v }
   o.on("--json", "Emit machine-readable JSON") { options[:json] = true }
   o.separator ""
   o.separator "Process ownership:"
   o.separator "  plan/status  ONE-SHOT INSPECTION; Ctrl-C interrupts only this request."
+  o.separator "  desired     ONE-SHOT INSPECTION; reads desired state without provider activity."
+  o.separator "  desired-set CONTROL REQUEST; updates desired state only and does not reconcile providers."
   o.separator "  start        RESOURCE MUTATION; the CLI returns, while paid resources and the"
   o.separator "               independent guardian continue. The guardian is not a campaign controller."
   o.separator "  stop         TEARDOWN REQUEST; Ctrl-C only interrupts the request, and teardown"
@@ -94,6 +105,17 @@ def render_human(command, result)
            "registry-unpublished=#{row['registry_unpublished_workers'] || '-'}"
       puts "    registry unavailable: #{row['registry_error']}" if row["registry_status"] == "unavailable"
     end
+  when "desired", "desired-set"
+    state = result.fetch("desired_capacity")
+    action = command == "desired" ? "READ-ONLY desired capacity" : "Desired capacity update"
+    puts "#{action}: #{result.dig('campaign', 'campaign_id')}"
+    puts "Contract=#{state.fetch('contract_version')} revision=#{state.fetch('revision')} " \
+         "persisted=#{state.fetch('persisted')}"
+    result.fetch("profiles").each do |row|
+      puts "  #{row.fetch('profile_id')}: desired=#{row.fetch('desired_workers')} max=#{row.fetch('max_workers')}"
+    end
+    puts "Updated=#{result.fetch('updated')}" if command == "desired-set"
+    puts "ACTUAL CAPACITY UNCHANGED; PROVIDER MUTATIONS=0"
   when "stop"
     puts "Campaign stop: budget=#{result.fetch('budget_state')} absence_verified=#{result.fetch('provider_absence_verified')}"
     puts result.fetch("message")
@@ -137,11 +159,29 @@ end
 begin
   parser.parse!(ARGV)
   raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
-  raise OptionParser::InvalidArgument, "command must be plan, start, status, or stop" unless %w[plan start status stop].include?(command)
+  commands = %w[plan start status stop desired desired-set]
+  raise OptionParser::InvalidArgument, "command must be #{commands.join(', ')}" unless commands.include?(command)
   raise OptionParser::MissingArgument, "--campaign" unless options[:campaign]
   raise OptionParser::MissingArgument, "--budget" unless options[:budget]
   if options[:authorize_paid] && command != "start"
     raise OptionParser::InvalidArgument, "--authorize-paid is valid only for campaign start"
+  end
+  if command == "desired-set"
+    raise OptionParser::MissingArgument, "--expected-revision" if options[:expected_revision].nil?
+    raise OptionParser::MissingArgument, "--profile" if options[:desired_profiles].empty?
+    raise OptionParser::MissingArgument, "--reason" unless options[:reason]
+  elsif !options[:desired_profiles].empty? || !options[:expected_revision].nil?
+    raise OptionParser::InvalidArgument, "--profile and --expected-revision are valid only for desired-set"
+  end
+
+  desired_profiles = options[:desired_profiles].each_with_object({}) do |value, counts|
+    profile_id, separator, count = value.rpartition("=")
+    unless separator == "=" && !profile_id.empty? && count.match?(/\A\d+\z/)
+      raise OptionParser::InvalidArgument, "--profile must be ID=COUNT with a non-negative integer count"
+    end
+    raise OptionParser::InvalidArgument, "duplicate --profile #{profile_id.inspect}" if counts.key?(profile_id)
+
+    counts[profile_id] = Integer(count, 10)
   end
 
   hardware = RunpodOllamaFleet::ExecutionPoolHardware.new(path: options[:hardware])
@@ -197,7 +237,14 @@ begin
                safety_reporter: reporter
              )
            when "status" then lifecycle.status
-           when "stop" then lifecycle.stop(reason: options[:reason])
+           when "stop" then lifecycle.stop(reason: options[:reason] || "operator requested campaign stop")
+           when "desired" then lifecycle.desired
+           when "desired-set"
+             lifecycle.set_desired(
+               profile_counts: desired_profiles,
+               expected_revision: options[:expected_revision],
+               reason: options[:reason]
+             )
            end
   options[:json] ? puts(JSON.pretty_generate(result)) : render_human(command, result)
   exit 2 if command == "start" && !options[:authorize_paid]

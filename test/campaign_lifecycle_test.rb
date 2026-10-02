@@ -277,6 +277,111 @@ class CampaignLifecycleTest < Minitest::Test
     assert_equal 4, result.fetch("profiles").length
   end
 
+  def test_desired_update_to_zero_is_control_plane_only
+    campaign_identity = @campaign.identity_sha256
+    binding_sha = @binding.binding_sha256
+
+    result = @lifecycle.set_desired(
+      profile_counts: { "qwen35" => 0 }, expected_revision: 0, reason: "hold qwen35"
+    )
+
+    assert result.fetch("updated")
+    assert_equal 0, result.fetch("provider_mutations")
+    assert result.fetch("actual_capacity_unchanged")
+    assert_equal campaign_identity, result.dig("campaign", "identity_sha256")
+    assert_equal binding_sha, result.fetch("binding_sha256")
+    assert_equal 0, result.fetch("profiles").find { |row| row["profile_id"] == "qwen35" }
+                                               .fetch("desired_workers")
+    refute File.exist?(@binding.state_path)
+    assert_empty @events
+    assert_empty @runtimes
+  end
+
+  def test_zero_to_positive_reuses_original_budget_and_deadline
+    @lifecycle.set_desired(
+      profile_counts: { "qwen35" => 0, "qwen27" => 0, "gemma" => 0, "gptoss" => 0 },
+      expected_revision: 0,
+      reason: "arm without capacity"
+    )
+    first = @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
+    identity = first.dig("campaign", "identity_sha256")
+    binding_sha = first.fetch("binding_sha256")
+    budget_id = @binding.declaration.fetch("budget_id")
+    armed_at = first.fetch("armed_at_utc")
+    deadline = first.fetch("deadline_at_utc")
+    assert_equal 0, @events.count("provider_create")
+
+    @now += 60
+    update = @lifecycle.set_desired(
+      profile_counts: { "qwen35" => 1 }, expected_revision: 1, reason: "add qwen35"
+    )
+    assert_equal 0, update.fetch("provider_mutations")
+    assert_equal 0, @events.count("provider_create")
+    second = @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
+
+    assert_equal 1, @events.count("provider_create")
+    assert_equal identity, second.dig("campaign", "identity_sha256")
+    assert_equal binding_sha, second.fetch("binding_sha256")
+    assert_equal budget_id, @binding.declaration.fetch("budget_id")
+    assert_equal armed_at, second.fetch("armed_at_utc")
+    assert_equal deadline, second.fetch("deadline_at_utc")
+  end
+
+  def test_positive_to_zero_does_not_remove_existing_provider_capacity
+    first = @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
+    provider_calls = @events.count("provider_create")
+    deadline = first.fetch("deadline_at_utc")
+
+    @lifecycle.set_desired(
+      profile_counts: { "qwen35" => 0 }, expected_revision: 0, reason: "drain later"
+    )
+    second = @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
+
+    assert_equal provider_calls, @events.count("provider_create")
+    assert_equal 3, @runtimes.fetch("qwen35").count
+    assert_equal 0, second.fetch("profiles").find { |row| row["profile_id"] == "qwen35" }
+                                      .fetch("desired_workers")
+    assert_equal deadline, second.fetch("deadline_at_utc")
+  end
+
+  def test_desired_update_preserves_pending_liability_and_accrued_compute
+    @binding.arm!
+    admission = RunpodOllamaFleet::CampaignCapacityAdmission.new(binding: @binding, profile_id: "qwen35")
+    admission.reserve!(operation_type: "replace", logical_resource_id: "burst_1",
+                       max_hourly_rate_delta_usd: 0.75, gpu_id: "NVIDIA A40", cloud: "SECURE")
+    before = @binding.parent_budget.status
+
+    @lifecycle.set_desired(
+      profile_counts: { "qwen35" => 0 }, expected_revision: 0, reason: "do not add"
+    )
+    after = @binding.parent_budget.status
+
+    assert_equal before.fetch("reservations"), after.fetch("reservations")
+    assert_equal before.fetch("accrued_compute_usd"), after.fetch("accrued_compute_usd")
+    assert_equal before.fetch("committed_maximum_liability_usd"),
+                 after.fetch("committed_maximum_liability_usd")
+  end
+
+  def test_expired_deadline_allows_desired_state_but_blocks_paid_increase
+    @binding.arm!
+    original = @binding.inspect_authority
+    @now = Time.parse(original.fetch("deadline_at_utc")) + 1
+
+    update = @lifecycle.set_desired(
+      profile_counts: { "qwen35" => 1 }, expected_revision: 0, reason: "record intent only"
+    )
+    assert_equal 1, update.dig("desired_capacity", "revision")
+    assert_equal 0, update.fetch("provider_mutations")
+    error = assert_raises(RunpodOllamaFleet::CampaignLifecycle::Error) do
+      @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
+    end
+
+    assert_match(/deadline|TEARDOWN_REQUIRED/, error.message)
+    assert_equal original.fetch("armed_at_utc"), @binding.inspect_authority.fetch("armed_at_utc")
+    assert_equal original.fetch("deadline_at_utc"), @binding.inspect_authority.fetch("deadline_at_utc")
+    assert_empty @events.grep("provider_create")
+  end
+
   def test_stop_is_idempotent_and_does_not_claim_absence
     @binding.arm!
     first = @lifecycle.stop

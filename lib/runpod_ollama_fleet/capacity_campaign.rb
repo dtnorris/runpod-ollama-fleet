@@ -5,9 +5,9 @@ require "json"
 require_relative "execution_pool_hardware"
 
 module RunpodOllamaFleet
-  # Validated, provider-neutral desired-capacity declaration. This class only
-  # parses and binds intent to RPOF's hardware qualification registry; it does
-  # not inspect or mutate provider resources.
+  # Validated, provider-neutral v0.1 campaign authority and initial desired
+  # declaration. Frozen v0.1 identity includes its positive desired counts;
+  # later mutable intent belongs to DesiredCapacity.
   class CapacityCampaign
     CONTRACT_VERSION = "rpof-capacity-campaign/v0.1"
     QUALIFICATION_BINDING_VERSION = "rpof-capacity-campaign-hardware-binding/v0.1"
