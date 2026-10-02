@@ -31,7 +31,8 @@ class CapacityOnlyLoadTest < Minitest::Test
 
     required = %i[
       CapacityCampaign CampaignBudgetBinding CampaignCapacityAdmission
-      CampaignLifecycle CampaignRunpodRuntime DynamicWorkerRegistry
+      CampaignController CampaignControllerSupervisor CampaignLifecycle
+      CampaignRunpodRuntime DynamicWorkerRegistry
     ]
     missing = required.reject { |name| RunpodOllamaFleet.const_defined?(name, false) }
     assert_empty missing, "missing capacity constants: #{missing.join(', ')}"

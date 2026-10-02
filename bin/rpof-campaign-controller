@@ -1,0 +1,85 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "digest"
+require "json"
+require "optparse"
+require "dotenv"
+
+options = {}
+OptionParser.new do |parser|
+  parser.on("--request FILE") { |value| options[:request] = File.expand_path(value) }
+  parser.on("--enabled FILE") { |value| options[:enabled] = File.expand_path(value) }
+  parser.on("--runtime FILE") { |value| options[:runtime] = File.expand_path(value) }
+  parser.on("--log FILE") { |value| options[:log] = File.expand_path(value) }
+end.parse!(ARGV)
+%i[request enabled runtime log].each do |key|
+  raise OptionParser::MissingArgument, "--#{key}" unless options[key]
+end
+raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+
+request = JSON.parse(File.read(options.fetch(:request)))
+expected_keys = %w[
+  contract_version campaign_identity_sha256 binding_sha256 budget_id generation_id
+  campaign_path campaign_sha256 budget_path budget_sha256 hardware_path hardware_sha256
+  controller_executable_sha256 state_root repo_root ssh_public_key_path heartbeat_seconds
+]
+raise "campaign controller request fields are invalid" unless request.keys.sort == expected_keys.sort
+
+repo_root = File.expand_path(request.fetch("repo_root"))
+Dotenv.load(File.join(repo_root, ".env"))
+$LOAD_PATH.unshift File.join(repo_root, "lib")
+require "runpod_ollama_fleet"
+
+controller_executable = File.join(repo_root, "bin", "rpof-campaign-controller")
+unless Digest::SHA256.file(controller_executable).hexdigest == request.fetch("controller_executable_sha256")
+  raise "campaign controller executable changed"
+end
+
+unless request.fetch("contract_version") == RunpodOllamaFleet::CampaignControllerSupervisor::REQUEST_CONTRACT_VERSION
+  raise "unsupported campaign controller request contract"
+end
+%w[campaign budget hardware].each do |name|
+  path = File.expand_path(request.fetch("#{name}_path"))
+  actual = Digest::SHA256.file(path).hexdigest
+  raise "campaign controller #{name} artifact changed" unless actual == request.fetch("#{name}_sha256")
+end
+
+hardware = RunpodOllamaFleet::ExecutionPoolHardware.new(path: request.fetch("hardware_path"))
+campaign = RunpodOllamaFleet::CapacityCampaign.load(path: request.fetch("campaign_path"), hardware:)
+declaration = JSON.parse(File.read(request.fetch("budget_path")))
+binding = RunpodOllamaFleet::CampaignBudgetBinding.new(
+  root: request.fetch("state_root"), repo_root:, campaign:, declaration:
+)
+unless campaign.identity_sha256 == request.fetch("campaign_identity_sha256") &&
+       binding.binding_sha256 == request.fetch("binding_sha256") &&
+       binding.declaration.fetch("budget_id") == request.fetch("budget_id")
+  raise "campaign controller request does not match durable campaign authority"
+end
+
+api_key = ENV.fetch("RUNPOD_API_KEY")
+client = LocalModelEvaluation::RunpodClient.new(
+  api_key:,
+  base_url: ENV.fetch("RUNPOD_API_BASE_URL", LocalModelEvaluation::RunpodClient::DEFAULT_BASE_URL)
+)
+price_resolver = lambda do |profile, qualification|
+  rows = client.list_gpu_types(cloud: qualification.fetch("cloud"), count: profile.fetch("desired_workers"))
+  qualified = rows.select { |row| qualification.fetch("qualified_gpu_ids").include?(row["id"]) }
+  qualified.filter_map { |row| row.dig("price", qualification.fetch("cloud").downcase) }.map(&:to_f).min
+end
+runtime_factory = lambda do |profile, qualification, admission|
+  RunpodOllamaFleet::CampaignRunpodRuntime.new(
+    root: request.fetch("state_root"), repo_root:, profile:, hardware: qualification,
+    client:, admission:
+  )
+end
+lifecycle = RunpodOllamaFleet::CampaignLifecycle.new(
+  campaign:, binding:, runtime_factory:, price_resolver:
+)
+controller = RunpodOllamaFleet::CampaignController.new(
+  binding:, lifecycle:, state_path: options.fetch(:runtime), enabled_path: options.fetch(:enabled),
+  log_path: options.fetch(:log), generation_id: request.fetch("generation_id"),
+  heartbeat_seconds: request.fetch("heartbeat_seconds"),
+  ssh_public_key_path: request.fetch("ssh_public_key_path")
+)
+exit controller.run

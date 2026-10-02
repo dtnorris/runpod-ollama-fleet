@@ -93,6 +93,24 @@ class CampaignSafetyGateTest < Minitest::Test
     end
   end
 
+  class Controller
+    attr_accessor :lifecycle
+
+    def ensure_running!(binding:, ssh_public_key_path:, **)
+      binding.parent_budget.heartbeat!(source: "orchestrator")
+      lifecycle.reconcile_once(ssh_public_key_path:)
+      status(binding:)
+    end
+
+    def status(binding:)
+      { "state" => "RUNNING", "pid" => Process.pid + 1, "binding_sha256" => binding.binding_sha256 }
+    end
+
+    def disable!(binding:)
+      status(binding:).merge("state" => "STOPPED")
+    end
+  end
+
   def setup
     @tmp = Dir.mktmpdir("campaign-safety-gate-")
     @now = Time.utc(2026, 10, 2, 12, 0, 0)
@@ -257,13 +275,16 @@ class CampaignSafetyGateTest < Minitest::Test
       runtime.admission = admission if admission
       runtime
     end
+    controller = Controller.new
     lifecycle = RunpodOllamaFleet::CampaignLifecycle.new(
       campaign: @campaign,
       binding:,
       runtime_factory: factory,
       price_resolver: ->(_profile, _hardware) { 0.5 },
-      wall_clock: -> { @now }
+      wall_clock: -> { @now },
+      controller_supervisor: controller
     )
+    controller.lifecycle = lifecycle
     [lifecycle, binding]
   end
 

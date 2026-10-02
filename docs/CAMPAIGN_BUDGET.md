@@ -61,9 +61,13 @@ The conservative post-controller-crash horizon is:
 Maximum additional compute liability is the current active-plus-pending rate
 times that horizon divided by 3600. The existing parent ledger adds that value
 to accrued compute and rejects durable reservations above the cumulative cap.
-The independent guardian continues heartbeat evaluation and teardown after the
-campaign-starting process exits. Guardian teardown errors are retained in the
-parent ledger until a later retry verifies provider absence and closes it.
+The supervised campaign controller owns the orchestrator heartbeat and ordinary
+reconciliation after the campaign-starting process exits. The independent
+guardian continues heartbeat evaluation and teardown. If the controller dies,
+no new capacity is created; launchd may restart the same identity while its user
+service remains available, otherwise the heartbeat becomes stale and guardian
+safety takes over. Guardian teardown errors remain until provider absence is
+verified and the ledger closes.
 
 Before the first paid mutation, campaign start now evaluates the authoritative
 [`rpof-capacity-campaign-safety-report/v0.1`](PAID_START_SAFETY.md). The report

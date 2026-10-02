@@ -130,16 +130,16 @@ separate facts. The classifications below describe the invoking process:
 - **ONE-SHOT INSPECTION/PUBLICATION**: the CLI reads or publishes current state
   without owning workload or paid-capacity lifecycle;
 - **CONTROL REQUEST** / **RESOURCE MUTATION**: the CLI changes durable local or
-  provider state but is not a continuing controller; and
+  provider state but is not itself a continuing owner; and
 - **TEARDOWN REQUEST**: the CLI requests deletion/retirement, whose success
   requires the command-specific provider-absence condition.
 
 | Command | Classification | What remains after return | Ctrl-C / terminal loss | Correct lifecycle command |
 | --- | --- | --- | --- | --- |
 | `campaign plan`, `campaign status`, `campaign desired` | ONE-SHOT INSPECTION | Existing guardian, provider resources, tunnels and WLO execution continue. | Interrupts only the request/view. | `wlo pause` pauses work; `campaign stop` requests paid teardown. |
-| `campaign desired-set` | CONTROL REQUEST | Revisioned desired state changes; actual provider resources, the original budget/deadline, guardian and WLO execution remain unchanged. | May leave either the prior complete revision or the new complete revision; it never implies provider reconciliation. | Inspect with `campaign desired`; use a separate authorized lifecycle operation for later reconciliation. |
-| `campaign start` | RESOURCE MUTATION | The independent launchd guardian and any created provider resources continue. There is no continuing campaign controller. | May interrupt an in-flight mutation; it is not rollback, WLO pause or teardown. Inspect campaign status before retrying. | `campaign stop`, then status until `CLOSED` with provider absence verified. |
-| `campaign stop` | TEARDOWN REQUEST | The independent guardian continues teardown and retries after the CLI returns. | Interrupts only the requesting CLI; it does not cancel the durable teardown request or prove its completion. | Re-run status/stop until provider absence is verified and the budget is `CLOSED`. |
+| `campaign desired-set` | CONTROL REQUEST | Revisioned desired state changes; the request itself makes no provider call. A running matching controller reads the accepted revision on its next pass. The original budget/deadline, guardian and WLO execution remain unchanged. | May leave either the prior complete revision or the new complete revision; interrupting it never implies provider rollback or teardown. | Inspect with `campaign desired`; use `campaign start` to ensure continuing reconciliation is supervised. |
+| `campaign start` | DETACHED/SUPERVISED CONTROLLER LAUNCHER | One identity-bound launchd controller owns ordinary heartbeat and desired-capacity reconciliation after the CLI, WLO, shell, or terminal exits. The independent guardian remains the safety enforcer. | After launch, Ctrl-C affects only the initiating output/view; it does not stop the controller or capacity. | `campaign stop`, then status until `CLOSED` with provider absence verified. |
+| `campaign stop` | TEARDOWN REQUEST | The budget first blocks mutation, controller supervision is disabled, and the independent guardian continues teardown after the CLI returns. | Interrupts only the requesting CLI; it does not cancel the durable teardown request or prove completion. | Re-run status/stop until provider absence is verified and the budget is `CLOSED`. |
 | `workers --json`, `status`, `doctor`, `capacity`, `capability-check` | ONE-SHOT INSPECTION/PUBLICATION | Workloads, guardians, tunnels and provider resources continue. Registry publication may advance its durable revision; doctor only consumes retained evidence. Neither owns work or capacity. | Interrupts only the request. | Use WLO and RPOF lifecycle commands explicitly. |
 | `create`, `fulfill`, `scale`, `replace` | MANUAL RESOURCE MUTATION | Provider resources remain; a configured lease watchdog is detached but is not campaign-grade independent enforcement. Automated `--yes` paid forms are blocked; positive manual mutations require finite runtime and spend leases. | May leave a partial or completed mutation; it is not rollback or teardown. Inspect state/provider evidence before retrying. | Use authorized `campaign start` for production automation; otherwise use `destroy` or `shutdown` as applicable. |
 | `destroy` | TEARDOWN REQUEST | No selected paid worker should remain only after synchronous provider-absence verification succeeds; unrelated resources/watchdogs may remain. | Interrupting the CLI does not prove deletion. | Inspect `status`; repeat explicit teardown if required. |
@@ -187,8 +187,16 @@ hash-linked revision history. A desired count of zero keeps the profile and its
 model, digest, context, residency, hardware and maximum-worker authority. The
 update performs no provider calls and does not reserve spend, reset the parent
 budget or deadline, discard pending liability, or turn the guardian into a
-desired-capacity controller. Provider add/drain/remove reconciliation remains a
-separate lifecycle concern.
+desired-capacity controller. A running identity-bound controller reads the
+accepted revision on every reconciliation pass and may add missing capacity
+through normal admission. Lower desired counts do not delete or drain existing
+capacity; those lifecycle operations remain outside this controller.
+
+The controller is supervised by the current macOS per-user launchd session. It
+survives launcher, WLO, shell, terminal, and controller-process exit while that
+service is available, but does not claim host-power, reboot, sleep, network, or
+provider availability. Its heartbeat cadence is the smaller of 10 seconds and
+one third of the frozen orchestrator-heartbeat timeout (never below one second).
 
 ## Plan-derived model requirements
 

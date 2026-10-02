@@ -86,12 +86,12 @@ else
         ONE-SHOT INSPECTION/PUBLICATION. Ctrl-C interrupts only this request;
         it does not stop WLO execution or paid provider resources.
       campaign desired-set
-        CONTROL REQUEST. It updates revisioned desired state only; actual
-        provider capacity is unchanged until a separate lifecycle operation.
+        CONTROL REQUEST. It updates revisioned desired state without contacting
+        the provider. A running matching controller consumes the accepted revision.
       campaign start
-        RESOURCE MUTATION. This initiating CLI is short-lived. Paid resources
-        and the independent budget guardian continue after it returns or its
-        terminal exits; the guardian is a safety enforcer, not a campaign controller.
+        DETACHED/SUPERVISED CONTROLLER LAUNCHER. This initiating CLI is short-lived.
+        One launchd controller continues reconciliation after CLI, WLO, shell, or
+        terminal exit. The independent guardian remains the safety/teardown owner.
       campaign stop
         TEARDOWN REQUEST. The guardian owns continued teardown. Success is not
         complete until campaign status reports CLOSED with provider absence verified.

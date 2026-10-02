@@ -148,6 +148,47 @@ class CampaignLifecycleTest < Minitest::Test
     end
   end
 
+  class ControllerSupervisor
+    attr_accessor :lifecycle
+    attr_reader :events, :generation
+
+    def initialize(events)
+      @events = events
+      @generation = "controller-generation-1"
+      @running = false
+    end
+
+    def ensure_running!(binding:, ssh_public_key_path:, heartbeat_timeout_seconds:)
+      launched = !@running
+      events << "controller_start" if launched
+      @running = true
+      reconcile!(binding:, ssh_public_key_path:) if launched
+      status(binding:).merge("heartbeat_timeout_seconds" => heartbeat_timeout_seconds)
+    rescue RunpodOllamaFleet::CampaignLifecycle::Error => e
+      raise RunpodOllamaFleet::CampaignControllerSupervisor::Error, e.message
+    end
+
+    def reconcile!(binding:, ssh_public_key_path:)
+      binding.parent_budget.heartbeat!(source: "orchestrator")
+      lifecycle.reconcile_once(ssh_public_key_path:)
+    end
+
+    def status(binding:)
+      {
+        "state" => (@running ? "RUNNING" : "STOPPED"),
+        "generation_id" => generation,
+        "pid" => Process.pid + 1,
+        "binding_sha256" => binding.binding_sha256
+      }
+    end
+
+    def disable!(binding:)
+      events << "controller_stop"
+      @running = false
+      status(binding:)
+    end
+  end
+
   def setup
     @tmp = Dir.mktmpdir("campaign-lifecycle-")
     @now = Time.utc(2026, 9, 29, 12, 0, 0)
@@ -167,10 +208,13 @@ class CampaignLifecycleTest < Minitest::Test
       runtime.instance_variable_set(:@admission, admission) if admission
       runtime
     end
+    @controller = ControllerSupervisor.new(@events)
     @lifecycle = RunpodOllamaFleet::CampaignLifecycle.new(
       campaign: @campaign, binding: @binding, runtime_factory: factory,
-      price_resolver: ->(_profile, _hardware) { 0.5 }, wall_clock: -> { @now }
+      price_resolver: ->(_profile, _hardware) { 0.5 }, wall_clock: -> { @now },
+      controller_supervisor: @controller
     )
+    @controller.lifecycle = @lifecycle
   end
 
   def teardown
@@ -212,6 +256,7 @@ class CampaignLifecycleTest < Minitest::Test
     assert_equal "ARMED", result.fetch("budget_state")
     assert_equal 6, result.fetch("active_workers")
     assert_equal 1, @events.count("guardian_arm")
+    assert_equal 1, @events.count("controller_start")
     first_start = @events.index("start_profile_gemma")
     assert_operator @events.index("guardian_arm"), :<, first_start
     assert_operator @events.index("reservation_persisted"), :<, @events.index("provider_create")
@@ -225,12 +270,13 @@ class CampaignLifecycleTest < Minitest::Test
     @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
     deadline = @binding.status.fetch("deadline_at_utc")
     provider_calls = @events.count("provider_create")
-    @now += 60
+    @now += 10
 
     @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
 
     assert_equal deadline, @binding.status.fetch("deadline_at_utc")
     assert_equal provider_calls, @events.count("provider_create")
+    assert_equal 1, @events.count("controller_start")
   end
 
   def test_partial_start_retains_same_durable_authority
@@ -241,7 +287,7 @@ class CampaignLifecycleTest < Minitest::Test
     error = assert_raises(RunpodOllamaFleet::CampaignLifecycle::Error) do
       @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
     end
-    assert_includes error.message, "partial campaign startup"
+    assert_includes error.message, "campaign reconciliation failed"
     assert_equal "ARMED", @binding.status.fetch("phase")
     assert_equal 1, @binding.status.dig("authority", "committed_workers")
   end
@@ -257,6 +303,11 @@ class CampaignLifecycleTest < Minitest::Test
     pending = @binding.parent_budget.status.fetch("reservations").values.select { |r| r["status"] == "pending" }
     assert_equal 1, pending.length
     assert_equal "gemma", pending.first.fetch("fleet_key")
+
+    @runtimes.fetch("gemma").fail_mode = nil
+    @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
+    assert_equal 1, @events.count("start_profile_gemma"),
+                 "retained pending liability must prevent a duplicate create"
   end
 
   def test_status_exposes_guardian_limits_capacity_and_pending_liability
@@ -311,12 +362,15 @@ class CampaignLifecycleTest < Minitest::Test
     deadline = first.fetch("deadline_at_utc")
     assert_equal 0, @events.count("provider_create")
 
-    @now += 60
+    @now += 10
     update = @lifecycle.set_desired(
       profile_counts: { "qwen35" => 1 }, expected_revision: 1, reason: "add qwen35"
     )
     assert_equal 0, update.fetch("provider_mutations")
     assert_equal 0, @events.count("provider_create")
+    reconciliation = @controller.reconcile!(binding: @binding, ssh_public_key_path: "unused")
+    assert_equal 2, reconciliation.dig("desired_capacity", "revision")
+    assert_equal 1, @events.count("provider_create")
     second = @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
 
     assert_equal 1, @events.count("provider_create")
@@ -391,6 +445,18 @@ class CampaignLifecycleTest < Minitest::Test
     refute first.fetch("provider_absence_verified")
     assert_equal first.fetch("budget_state"), second.fetch("budget_state")
     assert_includes first.fetch("message"), "not complete"
+    assert_equal "STOPPED", first.dig("controller", "state")
+  end
+
+  def test_teardown_request_blocks_late_controller_reconciliation
+    @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
+    creates = @events.count("provider_create")
+    @lifecycle.stop
+
+    assert_raises(RunpodOllamaFleet::CampaignLifecycle::Error) do
+      @lifecycle.reconcile_once(ssh_public_key_path: "unused")
+    end
+    assert_equal creates, @events.count("provider_create")
   end
 
   def test_closed_campaign_cannot_restart

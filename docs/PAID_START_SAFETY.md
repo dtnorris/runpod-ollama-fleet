@@ -8,6 +8,12 @@ start. It is returned in start JSON and emitted before the first provider
 mutation (human output on stdout; a compact `paid_start_safety_gate` JSON event
 on stderr when `--json` is selected).
 
+After that proof, the launcher installs or reuses one identity-bound campaign
+controller. The controller owns subsequent orchestrator heartbeats and calls
+the same admission/runtime seam for reconciliation. It cannot arm, widen, close,
+or tear down the budget. The guardian remains an independent safety process and
+does not implement desired-capacity behavior.
+
 The gate refuses paid start when it cannot prove positive finite worker, hourly,
 cumulative-compute, runtime, guardian-poll, heartbeat-timeout, and teardown
 limits; the original unexpired absolute deadline; an ARMED mutation-ready
@@ -78,7 +84,9 @@ ledger and may continue outside its compute cap.
 
 | Event | Enforcement result |
 | --- | --- |
-| Campaign CLI, WLO, initiating agent, shell, or terminal exits | Guardian and original authority continue. |
+| Campaign CLI, WLO, initiating agent, shell, or terminal exits | Controller, guardian, and original authority continue. |
+| Campaign controller exits while launchd/user service remains available | Launchd restarts the identity-bound controller; the original deadline is unchanged. |
+| Controller is absent or cannot restart | No new capacity is created; stale orchestrator heartbeat allows guardian teardown. |
 | Guardian process exits while launchd/user service remains available | Launchd is configured to restart it; restart latency is not included as an independently proven bound. |
 | launchd/user service unavailable | No compute-loss guarantee. |
 | Host sleeps, loses power, or reboots before service restoration | No compute-loss guarantee. |

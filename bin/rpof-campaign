@@ -44,9 +44,9 @@ parser = OptionParser.new do |o|
   o.separator "Process ownership:"
   o.separator "  plan/status  ONE-SHOT INSPECTION; Ctrl-C interrupts only this request."
   o.separator "  desired     ONE-SHOT INSPECTION; reads desired state without provider activity."
-  o.separator "  desired-set CONTROL REQUEST; updates desired state only and does not reconcile providers."
-  o.separator "  start        RESOURCE MUTATION; the CLI returns, while paid resources and the"
-  o.separator "               independent guardian continue. The guardian is not a campaign controller."
+  o.separator "  desired-set CONTROL REQUEST; updates desired state without directly contacting providers."
+  o.separator "  start        DETACHED/SUPERVISED CONTROLLER LAUNCHER; the CLI returns while one"
+  o.separator "               launchd controller reconciles. The guardian remains independent safety enforcement."
   o.separator "  stop         TEARDOWN REQUEST; Ctrl-C only interrupts the request, and teardown"
   o.separator "               is not complete until status reports provider absence and CLOSED."
   o.separator "WLO execution is separate: use `wlo pause` to pause work. Shell loss is neither pause nor teardown."
@@ -85,8 +85,10 @@ def render_human(command, result)
     else
       puts "PAID campaign start authorized: #{result.dig('campaign', 'campaign_id')}"
       puts "Budget=#{result['budget_state']} active+pending=#{result['active_plus_pending_workers']}/#{result['max_workers']}"
-      puts "The initiating CLI is finished; paid resources and the independent guardian continue."
-      puts "The guardian enforces safety but is not a continuing campaign controller."
+      controller = result.fetch("controller")
+      puts "Controller=#{controller.fetch('state')} pid=#{controller['pid']} generation=#{controller['generation_id']}"
+      puts "The initiating CLI is finished; the supervised controller continues reconciliation."
+      puts "The independent guardian enforces safety and teardown; it is not the capacity controller."
     end
   when "status"
     puts "READ-ONLY campaign status: #{result.dig('campaign', 'campaign_id')}"
@@ -95,6 +97,12 @@ def render_human(command, result)
     puts "Rate active+pending=$#{result['active_plus_pending_hourly_rate_usd']}/hr max=$#{result['max_aggregate_hourly_rate_usd']}/hr"
     puts "Liability=$#{result['reserved_maximum_liability_usd']} cap=$#{result['max_cumulative_compute_usd']}"
     puts "Pending ambiguous reservations=#{result.fetch('pending_ambiguous_reservations').length}"
+    if result["controller"]
+      controller = result.fetch("controller")
+      puts "Controller=#{controller.fetch('state')} pid=#{controller['pid'] || '-'} " \
+           "heartbeat=#{controller['last_heartbeat_at_utc'] || '-'}"
+      puts "  last_action=#{controller['last_action'] || '-'} error=#{controller['last_error'] || '-'}"
+    end
     result.fetch("profiles").each do |row|
       registry_ready = row["registry_ready_workers"].nil? ? "UNAVAILABLE" : row.fetch("registry_ready_workers")
       puts "  #{row.fetch('profile_id')}: provider-active=#{row.fetch('provider_active_workers')} " \
@@ -115,7 +123,7 @@ def render_human(command, result)
       puts "  #{row.fetch('profile_id')}: desired=#{row.fetch('desired_workers')} max=#{row.fetch('max_workers')}"
     end
     puts "Updated=#{result.fetch('updated')}" if command == "desired-set"
-    puts "ACTUAL CAPACITY UNCHANGED; PROVIDER MUTATIONS=0"
+    puts "THIS REQUEST CONTACTED NO PROVIDER; A RUNNING CONTROLLER MAY RECONCILE THE REVISION"
   when "stop"
     puts "Campaign stop: budget=#{result.fetch('budget_state')} absence_verified=#{result.fetch('provider_absence_verified')}"
     puts result.fetch("message")
@@ -218,8 +226,13 @@ begin
       client:, admission:
     )
   end
+  controller_supervisor = RunpodOllamaFleet::CampaignControllerSupervisor.new(
+    root: options[:state_root], repo_root: ROOT,
+    campaign_path: options.fetch(:campaign), budget_path: options.fetch(:budget),
+    hardware_path: options.fetch(:hardware)
+  )
   lifecycle = RunpodOllamaFleet::CampaignLifecycle.new(
-    campaign:, binding:, runtime_factory:, price_resolver:
+    campaign:, binding:, runtime_factory:, price_resolver:, controller_supervisor:
   )
   result = case command
            when "plan" then lifecycle.plan
@@ -251,6 +264,7 @@ begin
 rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError, OptionParser::ParseError,
        RunpodOllamaFleet::CapacityCampaign::Error,
        RunpodOllamaFleet::CampaignBudgetBinding::Error,
+       RunpodOllamaFleet::CampaignControllerSupervisor::Error,
        RunpodOllamaFleet::CampaignLifecycle::Error,
        LocalModelEvaluation::RunpodClient::Error => e
   warn "ERROR: #{e.message}"

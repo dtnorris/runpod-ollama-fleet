@@ -10,15 +10,17 @@ module RunpodOllamaFleet
   # through CampaignCapacityAdmission.
   class CampaignLifecycle
     class Error < StandardError; end
+    class TransientReconciliationError < Error; end
 
     def initialize(campaign:, binding:, runtime_factory:, price_resolver: nil, wall_clock: nil,
-                   desired_capacity: nil)
+                   desired_capacity: nil, controller_supervisor: nil)
       @campaign = campaign
       @binding = binding
       @runtime_factory = runtime_factory
       @price_resolver = price_resolver
       @wall_clock = wall_clock || -> { Time.now.utc }
       @desired_capacity = desired_capacity || DesiredCapacity.new(binding:, wall_clock: @wall_clock)
+      @controller_supervisor = controller_supervisor
       unless binding.campaign.identity_sha256 == campaign.identity_sha256
         raise Error, "campaign binding does not match the requested campaign"
       end
@@ -69,7 +71,7 @@ module RunpodOllamaFleet
       end
 
       @binding.bind!
-      authority = @binding.arm!
+      authority = reusable_authority(existing) || @binding.arm!
       verify_started_authority!(authority)
       prepared = prepare_start(authority, profiles:)
       safety_report = @binding.assert_safety_gate!(
@@ -77,39 +79,23 @@ module RunpodOllamaFleet
         projected_hourly_rate_usd: prepared.fetch("projected_hourly_rate_usd")
       )
       safety_reporter&.call(safety_report)
-      results = []
-      prepared.fetch("profiles").each do |row|
-        profile = row.fetch("profile")
-        runtime = row.fetch("runtime")
-        current = row.fetch("current_workers")
-        desired = profile.fetch("desired_workers")
-        maximum = profile.fetch("max_workers")
-        raise Error, "profile #{profile.fetch('profile_id').inspect} has #{current} workers above max #{maximum}" if current > maximum
-
-        if current < desired
-          runtime.ensure_workers!(
-            desired_workers: desired,
-            ssh_public_key_path:,
-            original_deadline_at_utc: authority.fetch("deadline_at_utc"),
-            max_hourly_rate_usd: @campaign.max_hourly_rate_usd
-          )
-        end
-        results << runtime.status.merge(
-          "profile_id" => profile.fetch("profile_id"),
-          "desired_workers" => desired,
-          "max_workers" => maximum
-        )
-      rescue StandardError => e
-        raise Error, "partial campaign startup at #{profile.fetch('profile_id')}: #{e.message}"
+      unless @controller_supervisor
+        raise Error, "authorized campaign start requires a continuing controller supervisor"
       end
+      controller = @controller_supervisor.ensure_running!(
+        binding: @binding,
+        ssh_public_key_path: ssh_public_key_path,
+        heartbeat_timeout_seconds: @binding.declaration.fetch("orchestrator_heartbeat_timeout_seconds")
+      )
 
       status(desired_state:).merge(
         "command" => "campaign start",
         "paid_authorized" => true,
         "safety_report" => safety_report,
-        "profiles" => results
+        "controller" => controller
       )
-    rescue CampaignBudgetBinding::Error, CampaignCapacityAdmission::Error, DesiredCapacity::Error => e
+    rescue CampaignBudgetBinding::Error, CampaignCapacityAdmission::Error,
+           CampaignControllerSupervisor::Error, DesiredCapacity::Error => e
       raise Error, e.message
     end
 
@@ -136,7 +122,7 @@ module RunpodOllamaFleet
           "pending_reservations" => pending.count { |row| row["fleet_key"] == profile.fetch("profile_id") }
         )
       end
-      {
+      result = {
         "command" => "campaign status",
         "read_only" => true,
         "campaign" => campaign_identity,
@@ -168,6 +154,8 @@ module RunpodOllamaFleet
         "provider_absence_verified_at_utc" => ledger["provider_absence_verified_at_utc"],
         "profiles" => profile_rows
       }
+      result["controller"] = @controller_supervisor.status(binding: @binding) if @controller_supervisor
+      result
     rescue CampaignBudgetBinding::Error, DesiredCapacity::Error, KeyError, ArgumentError, TypeError => e
       raise Error, e.message
     end
@@ -219,6 +207,7 @@ module RunpodOllamaFleet
                else
                  @binding.parent_budget.begin_teardown!(reason:)
                end
+      controller = @controller_supervisor&.disable!(binding: @binding)
       {
         "command" => "campaign stop",
         "teardown_requested" => result.fetch("state") != "CLOSED",
@@ -226,15 +215,83 @@ module RunpodOllamaFleet
         "provider_absence_verified" => !result["provider_absence_verified_at_utc"].nil?,
         "provider_absence_verified_at_utc" => result["provider_absence_verified_at_utc"],
         "teardown_failures" => result.fetch("teardown_failures", []),
+        "controller" => controller,
         "message" => result.fetch("state") == "CLOSED" ?
           "campaign is closed with provider absence verified" :
           "teardown is guardian-owned and is not complete until provider absence is verified"
       }
-    rescue CampaignBudgetBinding::Error, LocalModelEvaluation::RunpodBudget::Error, KeyError => e
+    rescue CampaignBudgetBinding::Error, CampaignControllerSupervisor::Error,
+           LocalModelEvaluation::RunpodBudget::Error, KeyError => e
+      raise Error, e.message
+    end
+
+    # One controller-owned reconciliation pass. Each pass reads FO-13's current
+    # identity-bound desired-capacity revision before calculating admission.
+    def reconcile_once(ssh_public_key_path:)
+      authority = @binding.status
+      verify_started_authority!(authority)
+      desired_state = @desired_capacity.current
+      profiles = profiles_for(desired_state)
+      prepared = prepare_start(authority, profiles:)
+      safety_report = @binding.assert_safety_gate!(
+        projected_workers: prepared.fetch("projected_workers"),
+        projected_hourly_rate_usd: prepared.fetch("projected_hourly_rate_usd")
+      )
+      results = prepared.fetch("profiles").map do |row|
+        reconcile_profile(row, authority, ssh_public_key_path)
+      end
+      { "desired_capacity" => desired_state, "safety_report" => safety_report, "profiles" => results }
+    rescue CampaignBudgetBinding::Error, CampaignCapacityAdmission::Error, DesiredCapacity::Error => e
       raise Error, e.message
     end
 
     private
+
+    def reconcile_profile(row, authority, ssh_public_key_path)
+      profile = row.fetch("profile")
+      runtime = row.fetch("runtime")
+      current = row.fetch("current_workers")
+      desired = desired_workers_for(profile)
+      maximum = profile.fetch("max_workers")
+      raise Error, "profile #{profile.fetch('profile_id').inspect} has #{current} workers above max #{maximum}" if current > maximum
+
+      committed = Integer(
+        authority.dig("authority", "committed_workers_by_profile", profile.fetch("profile_id")) || 0
+      )
+      # A pending/ambiguous reservation is already conservative capacity. Never
+      # create around it; the guardian/provider-absence path must resolve it.
+      if current < desired && committed <= current
+        runtime.ensure_workers!(
+          desired_workers: desired,
+          ssh_public_key_path:,
+          original_deadline_at_utc: authority.fetch("deadline_at_utc"),
+          max_hourly_rate_usd: @campaign.max_hourly_rate_usd
+        )
+      end
+      runtime.status.merge(
+        "profile_id" => profile.fetch("profile_id"),
+        "desired_workers" => desired,
+        "max_workers" => maximum,
+        "action" => current < desired && committed <= current ? "ensure_desired_capacity" : "none"
+      )
+    rescue CampaignRunpodRuntime::Error => e
+      raise TransientReconciliationError,
+            "campaign reconciliation failed at #{profile.fetch('profile_id')}: #{e.message}"
+    rescue StandardError => e
+      raise Error, "campaign reconciliation failed at #{profile.fetch('profile_id')}: #{e.message}"
+    end
+
+    def desired_workers_for(profile)
+      profile.fetch("desired_workers")
+    end
+
+    def reusable_authority(existing)
+      return unless existing
+      return unless existing["phase"] == "ARMED" && existing["guardian_healthy"] == true
+      return unless existing.dig("parent_budget", "state") == "ARMED"
+
+      @binding.status
+    end
 
     def existing_authority
       return nil unless File.file?(@binding.state_path)

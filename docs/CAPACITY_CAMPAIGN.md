@@ -32,11 +32,20 @@ enforces the declared aggregate worker and hourly-rate ceilings. These limits
 remain bound to the original campaign after the WLO consumer pauses, stops or
 crashes.
 
-`campaign start` is a short-lived mutation client, not a continuing campaign
-controller. After it returns, provider resources remain and the independent
-guardian continues enforcing the original authority. The guardian is a safety
-enforcer: it does not schedule WLO jobs, maintain desired capacity continuously,
-or replace a future FO-09 controller.
+`campaign start` is a short-lived authorization and supervised-controller
+launcher. After it returns, one identity-bound launchd controller owns ordinary
+campaign heartbeat and desired-capacity reconciliation through the existing
+admission path. The independent guardian continues enforcing the original
+authority and owns teardown; it never creates replacement capacity. WLO remains
+only a consumer of published READY workers.
+
+The controller reads the current identity-bound `rpof-desired-capacity/v0.1`
+revision on every reconciliation pass. Revision zero preserves the immutable
+campaign declaration's desired counts. `campaign desired-set` changes only that
+durable intent and makes no provider call itself; a running controller may add
+missing capacity on its next pass. Lower counts do not delete or drain existing
+capacity. Every positive mutation still uses the original campaign admission,
+budget, binding, and absolute deadline.
 
 An authorized start must emit a PASSing paid-start safety report before its
 first provider mutation. The report proves finite projected compute authority,
@@ -45,15 +54,17 @@ billing scope, and the enforcement failure domain. See
 [`PAID_START_SAFETY.md`](PAID_START_SAFETY.md).
 
 `campaign status` is a one-shot read-only observer. Interrupting or closing it
-changes no workload or provider lifecycle. `campaign stop` durably requests
-guardian-owned teardown; the request returning is not proof of completion.
+changes no workload or provider lifecycle. `campaign stop` durably blocks new
+mutation before disabling controller supervision, then leaves guardian-owned
+teardown running; the request returning is not proof of completion.
 Teardown is complete only when subsequent status reports the budget `CLOSED`
 and records provider-absence verification. Ctrl-C or terminal loss during any
 campaign command is never a substitute for `wlo pause` or `campaign stop`.
 
 ## Ownership boundary
 
-Campaign `plan`, `start`, `status`, and `stop` manage provider capacity only.
+Campaign `plan`, `start`, `status`, `stop`, `desired`, and `desired-set` manage
+provider-capacity intent and lifecycle only.
 They do not accept jobs, job IDs, commands, environment payloads, affinity,
 attempts, or result paths, and they do not load RPOF's historical dispatch
 implementation. Worker discovery is published separately through
