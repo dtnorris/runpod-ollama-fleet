@@ -181,6 +181,21 @@ class RunpodStatusAllTest < Minitest::Test
     assert_equal "/state/bootstrap/run-1/burst_2.log", worker_row.fetch("bootstrap_log")
   end
 
+  def test_aggregate_ignores_malformed_bootstrap_log_identity
+    fleet = entry(
+      "malformed-bootstrap",
+      rate: 0.49,
+      accrued: 0.10,
+      workers: [worker(2, "pod_b", "NVIDIA A40", 0.49)],
+      bootstrap_workers: [{ "index" => "invalid", "pod_id" => "pod_b" }]
+    )
+    fleet.dig("snapshot", "bootstrap")["evidence_dir"] = "/state/bootstrap/run-2"
+
+    worker_row = @overview.snapshot([fleet]).fetch("workers").first
+
+    assert_nil worker_row.fetch("bootstrap_log")
+  end
+
   def test_copying_without_progress_and_terminal_labels_remain_unchanged
     copying = bootstrap_worker(1, "pod_a")
     copying["status"] = "running"
