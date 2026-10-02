@@ -5,6 +5,7 @@ require_relative "../local_model_evaluation/runpod_fleet_lifecycle"
 require_relative "../local_model_evaluation/runpod_fleet_namespace"
 require_relative "../local_model_evaluation/runpod_capacity_policy"
 require_relative "dynamic_worker_registry"
+require_relative "model_requirement"
 
 module RunpodOllamaFleet
   # Adapter from campaign intent to the existing fleet mutation paths. It has
@@ -13,7 +14,7 @@ module RunpodOllamaFleet
     class Error < StandardError; end
 
     def initialize(root:, repo_root:, profile:, hardware:, client:, admission: nil, out: $stdout,
-                   wall_clock: nil, readiness_observer: nil)
+                   wall_clock: nil, readiness_observer: nil, model_requirement: nil)
       @root = File.expand_path(root)
       @repo_root = File.expand_path(repo_root)
       @profile = profile
@@ -23,6 +24,8 @@ module RunpodOllamaFleet
       @out = out
       @wall_clock = wall_clock
       @readiness_observer = readiness_observer
+      @model_requirement = model_requirement
+      @model_requirement&.validate_profile!(profile: @profile, hardware: @hardware)
     end
 
     def current_worker_count
@@ -131,7 +134,7 @@ module RunpodOllamaFleet
 
       per_worker_cap = Float(max_hourly_rate_usd) / worker_count
       ranking = LocalModelEvaluation::RunpodCapacityPolicy.new(client: @client).rank(
-        gpu_ids: @hardware.fetch("qualified_gpu_ids"),
+        gpu_ids: required_gpu_ids,
         cloud: @hardware.fetch("cloud"),
         max_hourly_per_worker_usd: per_worker_cap
       )
@@ -146,6 +149,11 @@ module RunpodOllamaFleet
       raise Error, "no currently available qualified GPU#{suffix}"
     rescue LocalModelEvaluation::RunpodCapacityPolicy::Error, ArgumentError, TypeError => e
       raise Error, e.message
+    end
+
+    def required_gpu_ids
+      required = @model_requirement&.required_gpu_id
+      required ? [required] : @hardware.fetch("qualified_gpu_ids")
     end
 
     def profile_id

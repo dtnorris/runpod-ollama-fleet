@@ -2,6 +2,7 @@
 
 require_relative "runpod_ollama_fleet/version"
 require_relative "runpod_ollama_fleet/execution_pool_hardware"
+require_relative "runpod_ollama_fleet/model_requirement"
 require_relative "runpod_ollama_fleet/capacity_campaign"
 require_relative "runpod_ollama_fleet/campaign_budget_binding"
 require_relative "runpod_ollama_fleet/campaign_capacity_admission"

@@ -154,6 +154,14 @@ network/egress, or other provider charges—and the report states the host/netwo
 failure domain instead of claiming a provider-side hard total-spend cap. See
 [`docs/PAID_START_SAFETY.md`](docs/PAID_START_SAFETY.md).
 
+## Plan-derived model requirements
+
+`RunpodOllamaFleet::ModelRequirement` consumes the exact JSON artifact emitted by
+AdventureFinder model preflight. `CampaignRunpodRuntime` can validate it against a
+campaign profile and hardware binding before any provider lookup or mutation. Model,
+full digest, context, residency, and optional GPU identity must match exactly; the
+human alias is retained only as provenance and is never translated by RPOF.
+
 ## Safety
 
 No command in `script/import-frozen-lme` or `script/verify-frozen-import` contacts RunPod or creates paid infrastructure. The imported provider helper commands retain their existing confirmations, dry-run behavior, cost caps, managed-pod deletion checks, leases, and fail-closed behavior from the frozen source.
