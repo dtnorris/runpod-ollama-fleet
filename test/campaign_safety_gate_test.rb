@@ -224,6 +224,22 @@ class CampaignSafetyGateTest < Minitest::Test
                     0.000001
   end
 
+  def test_failed_gate_is_retained_before_assertion_raises
+    _lifecycle, binding = build_lifecycle
+    binding.arm!
+
+    error = assert_raises(RunpodOllamaFleet::CampaignBudgetBinding::Error) do
+      binding.assert_safety_gate!(projected_workers: 99, projected_hourly_rate_usd: 49.5)
+    end
+
+    assert_includes error.message, "projected_worker_ceiling_exceeded"
+    artifact = binding.retained_safety_report
+    assert_equal "rpof-retained-capacity-campaign-safety-report/v0.1", artifact.fetch("contract_version")
+    assert_equal binding.binding_sha256, artifact.fetch("binding_sha256")
+    assert_equal "FAIL", artifact.dig("report", "safety_gate")
+    assert_includes artifact.dig("report", "refusal_reasons"), "projected_worker_ceiling_exceeded"
+  end
+
   private
 
   def build_lifecycle(root: @tmp, budget_overrides: {})

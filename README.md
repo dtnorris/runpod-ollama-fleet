@@ -112,6 +112,14 @@ provider `RUNNING`; it does not imply `REG=READY`. Long GPU/model values end in
 for wider panes; `--verbose` retains the detailed lifecycle, bootstrap, tunnel,
 inference, lease, shutdown, and cost views.
 
+For a short retained-evidence diagnosis, use `bin/rpof doctor pod A2`,
+`bin/rpof doctor fleet A`, or `bin/rpof doctor campaign --campaign FILE
+--budget FILE`. Add `--json` for stable structured output. Pod bootstrap evidence
+is available with `--logs --lines N`; output is bounded to 200 lines and known
+credential forms are redacted. Doctor is read-only: it consumes retained fleet,
+registry, campaign, guardian, and teardown evidence and never contacts RunPod,
+publishes a new registry revision, or changes paid capacity.
+
 ## Operator process ownership
 
 RPOF command completion, process lifetime and provider-resource lifetime are
@@ -132,7 +140,7 @@ separate facts. The classifications below describe the invoking process:
 | `campaign desired-set` | CONTROL REQUEST | Revisioned desired state changes; actual provider resources, the original budget/deadline, guardian and WLO execution remain unchanged. | May leave either the prior complete revision or the new complete revision; it never implies provider reconciliation. | Inspect with `campaign desired`; use a separate authorized lifecycle operation for later reconciliation. |
 | `campaign start` | RESOURCE MUTATION | The independent launchd guardian and any created provider resources continue. There is no continuing campaign controller. | May interrupt an in-flight mutation; it is not rollback, WLO pause or teardown. Inspect campaign status before retrying. | `campaign stop`, then status until `CLOSED` with provider absence verified. |
 | `campaign stop` | TEARDOWN REQUEST | The independent guardian continues teardown and retries after the CLI returns. | Interrupts only the requesting CLI; it does not cancel the durable teardown request or prove its completion. | Re-run status/stop until provider absence is verified and the budget is `CLOSED`. |
-| `workers --json`, `status`, `capacity`, `capability-check` | ONE-SHOT INSPECTION/PUBLICATION | Workloads, guardians, tunnels and provider resources continue. Registry publication may advance its durable revision but owns no work or capacity. | Interrupts only the request. | Use WLO and RPOF lifecycle commands explicitly. |
+| `workers --json`, `status`, `doctor`, `capacity`, `capability-check` | ONE-SHOT INSPECTION/PUBLICATION | Workloads, guardians, tunnels and provider resources continue. Registry publication may advance its durable revision; doctor only consumes retained evidence. Neither owns work or capacity. | Interrupts only the request. | Use WLO and RPOF lifecycle commands explicitly. |
 | `create`, `fulfill`, `scale`, `replace` | MANUAL RESOURCE MUTATION | Provider resources remain; a configured lease watchdog is detached but is not campaign-grade independent enforcement. Automated `--yes` paid forms are blocked; positive manual mutations require finite runtime and spend leases. | May leave a partial or completed mutation; it is not rollback or teardown. Inspect state/provider evidence before retrying. | Use authorized `campaign start` for production automation; otherwise use `destroy` or `shutdown` as applicable. |
 | `destroy` | TEARDOWN REQUEST | No selected paid worker should remain only after synchronous provider-absence verification succeeds; unrelated resources/watchdogs may remain. | Interrupting the CLI does not prove deletion. | Inspect `status`; repeat explicit teardown if required. |
 | `shutdown` | TEARDOWN REQUEST | Immediate graceful/force modes own the request until verified completion; `--terminal` launches a detached shutdown watchdog. | Ctrl-C of an immediate request is not completion. After `--terminal` returns, shell Ctrl-C has no effect on its watchdog. | Inspect `status`; use `keep` only to cancel a pending lifecycle gate, not a hard lease. |

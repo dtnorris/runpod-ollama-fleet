@@ -223,6 +223,8 @@ module LocalModelEvaluation
       {
         "index" => Integer(worker.fetch("index")),
         "pod_id" => worker.fetch("pod_id").to_s,
+        "worker_id" => worker["worker_id"],
+        "generation_id" => worker["generation_id"],
         "gpu_id" => worker_gpu_id(fleet, worker),
         "lme_status" => status,
         "provider_status" => provider.fetch("status"),

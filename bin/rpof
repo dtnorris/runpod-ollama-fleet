@@ -46,6 +46,8 @@ when "replace"
   exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-lifecycle"), "replace", *ARGV
 when "status"
   exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-status"), *ARGV
+when "doctor"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-doctor"), *ARGV
 when "tunnels"
   exec RbConfig.ruby, File.join(ROOT, "bin", "lme-runpod-tunnels"), *ARGV
 else
@@ -70,6 +72,7 @@ else
       scale
       replace
       status
+      doctor
       tunnels
 
     Read-only capability checks:
@@ -79,7 +82,7 @@ else
     dispatch and execution-pool fulfillment are retired; contracts remain readable.
 
     Process ownership and Ctrl-C:
-      campaign plan/status/desired, workers, status, capacity, capability-check
+      campaign plan/status/desired, workers, status, doctor, capacity, capability-check
         ONE-SHOT INSPECTION/PUBLICATION. Ctrl-C interrupts only this request;
         it does not stop WLO execution or paid provider resources.
       campaign desired-set

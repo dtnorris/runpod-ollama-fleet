@@ -17,6 +17,7 @@ module RunpodOllamaFleet
     STATE_CONTRACT_VERSION = "rpof-capacity-campaign-budget-state/v0.1"
     MUTATION_AUTHORITY_VERSION = "rpof-capacity-campaign-mutation-authority/v0.1"
     SAFETY_REPORT_VERSION = "rpof-capacity-campaign-safety-report/v0.1"
+    RETAINED_SAFETY_REPORT_VERSION = "rpof-retained-capacity-campaign-safety-report/v0.1"
     PHASES = %w[BOUND ARMING ARMED].freeze
     DIGEST = /\A[0-9a-f]{64}\z/i
     DECLARATION_KEYS = %w[
@@ -37,7 +38,7 @@ module RunpodOllamaFleet
     class Error < StandardError; end
 
     attr_reader :campaign, :declaration, :normalized_bytes, :binding_sha256,
-                :state_path, :parent_budget
+                :state_path, :safety_report_path, :parent_budget
 
     def initialize(root:, repo_root:, campaign:, declaration:, wall_clock: nil,
                    budget_factory: nil, guardian_supervisor: nil)
@@ -56,6 +57,7 @@ module RunpodOllamaFleet
       campaign_key = Digest::SHA256.hexdigest(campaign.campaign_id)
       @binding_dir = File.join(@root, "campaign-budgets", campaign_key)
       @state_path = File.join(@binding_dir, "binding.json")
+      @safety_report_path = File.join(@binding_dir, "latest-safety-report.json")
       @lock_path = File.join(@binding_dir, ".lock")
       factory = budget_factory || lambda do |**keywords|
         LocalModelEvaluation::RunpodBudget.new(**keywords)
@@ -299,9 +301,30 @@ module RunpodOllamaFleet
 
     def assert_safety_gate!(projected_workers:, projected_hourly_rate_usd:)
       report = safety_report(projected_workers:, projected_hourly_rate_usd:)
+      retain_safety_report!(report)
       return report if report.fetch("safety_gate") == "PASS"
 
       raise Error, "paid campaign start safety gate failed: #{report.fetch('refusal_reasons').join(', ')}"
+    end
+
+    # Returns the last report evaluated by paid-start admission. Reading this
+    # artifact never refreshes guardian/provider state and never recomputes the
+    # FO-08 liability proof.
+    def retained_safety_report
+      return nil unless File.file?(safety_report_path)
+
+      artifact = JSON.parse(File.read(safety_report_path))
+      unless artifact.keys.sort == %w[binding_sha256 campaign_identity_sha256 contract_version recorded_at_utc report].sort &&
+             artifact.fetch("contract_version") == RETAINED_SAFETY_REPORT_VERSION &&
+             artifact.fetch("binding_sha256") == binding_sha256 &&
+             artifact.fetch("campaign_identity_sha256") == campaign.identity_sha256 &&
+             artifact.fetch("report").fetch("contract_version") == SAFETY_REPORT_VERSION
+        raise Error, "retained paid-start safety report identity is invalid"
+      end
+      parse_time(artifact.fetch("recorded_at_utc"), "retained safety report timestamp")
+      artifact
+    rescue JSON::ParserError, KeyError, TypeError => e
+      raise Error, "retained paid-start safety report is invalid: #{e.message}"
     end
 
     # Produces an immutable proof that a proposed capacity mutation is within
@@ -414,6 +437,18 @@ module RunpodOllamaFleet
     end
 
     private
+
+    def retain_safety_report!(report)
+      artifact = {
+        "contract_version" => RETAINED_SAFETY_REPORT_VERSION,
+        "campaign_identity_sha256" => campaign.identity_sha256,
+        "binding_sha256" => binding_sha256,
+        "recorded_at_utc" => utc_now.iso8601,
+        "report" => report
+      }
+      with_lock { write_json_atomic(safety_report_path, artifact) }
+      artifact
+    end
 
     def normalize_declaration(value)
       document = value.respond_to?(:transform_keys) ? value.transform_keys(&:to_s) : nil
@@ -831,11 +866,15 @@ module RunpodOllamaFleet
     end
 
     def persist!(document)
-      FileUtils.mkdir_p(File.dirname(@state_path))
-      tmp = "#{@state_path}.tmp.#{$$}.#{Thread.current.object_id}"
+      write_json_atomic(@state_path, document)
+    end
+
+    def write_json_atomic(path, document)
+      FileUtils.mkdir_p(File.dirname(path))
+      tmp = "#{path}.tmp.#{$$}.#{Thread.current.object_id}"
       File.write(tmp, JSON.pretty_generate(document) + "\n")
       File.chmod(0o600, tmp)
-      File.rename(tmp, @state_path)
+      File.rename(tmp, path)
     ensure
       File.delete(tmp) if defined?(tmp) && tmp && File.exist?(tmp)
     end

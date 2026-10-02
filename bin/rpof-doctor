@@ -1,0 +1,132 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "optparse"
+require "dotenv"
+
+ROOT = File.expand_path("..", __dir__)
+Dotenv.load(File.join(ROOT, ".env"))
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+
+require "local_model_evaluation/runpod_fleet_namespace"
+require "local_model_evaluation/runpod_fleet_state"
+require "local_model_evaluation/runpod_status"
+require "local_model_evaluation/runpod_status_all"
+require "runpod_ollama_fleet"
+
+type = ARGV.shift
+handle = ARGV.shift unless type == "campaign"
+options = {
+  state_root: ENV.fetch("RPOF_STATE_ROOT", File.join(ROOT, "output", "runpod-fleets")),
+  repo_root: ENV.fetch("RPOF_STATE_REPO_ROOT", ROOT),
+  campaign: nil, budget: nil,
+  hardware: File.join(ROOT, "config", "execution_pool_hardware.yml"),
+  json: false, logs: false, lines: RunpodOllamaFleet::OperatorDoctor::DEFAULT_LOG_LINES
+}
+parser = OptionParser.new do |opts|
+  opts.banner = "Usage: bin/rpof doctor pod HANDLE|fleet HANDLE|campaign [options]"
+  opts.on("--state-root DIR") { |value| options[:state_root] = value }
+  opts.on("--repo-root DIR") { |value| options[:repo_root] = value }
+  opts.on("--campaign FILE") { |value| options[:campaign] = value }
+  opts.on("--budget FILE") { |value| options[:budget] = value }
+  opts.on("--hardware FILE") { |value| options[:hardware] = value }
+  opts.on("--logs") { options[:logs] = true }
+  opts.on("--lines N", Integer) { |value| options[:lines] = value }
+  opts.on("--json") { options[:json] = true }
+end
+
+def aggregate_snapshot(state_root, repo_root)
+  root_namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
+    root: state_root, repo_root:, fleet_key: LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY
+  )
+  keys = [LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY, *root_namespace.registered_fleet_keys].uniq
+  entries = keys.filter_map do |key|
+    namespace = LocalModelEvaluation::RunpodFleetNamespace.new(root: state_root, repo_root:, fleet_key: key)
+    state = LocalModelEvaluation::RunpodFleetState.new(
+      root: namespace.state_root, local_port_base: namespace.local_port_base
+    )
+    readiness = RunpodOllamaFleet::RetainedReadiness.new(
+      state_root:, repo_root:, fleet_key: key, fleet_state: state
+    )
+    snapshot = LocalModelEvaluation::RunpodStatus.new(
+      fleet_state: state, client: nil, activity_monitor: nil, readiness_observer: readiness
+    ).snapshot
+    snapshot && { "fleet_key" => key, "snapshot" => snapshot }
+  end
+  LocalModelEvaluation::RunpodStatusAll.new.snapshot(entries)
+end
+
+def campaign_binding(options)
+  hardware = RunpodOllamaFleet::ExecutionPoolHardware.new(path: options.fetch(:hardware))
+  campaign = RunpodOllamaFleet::CapacityCampaign.load(path: options.fetch(:campaign), hardware:)
+  declaration = JSON.parse(File.binread(File.expand_path(options.fetch(:budget))))
+  RunpodOllamaFleet::CampaignBudgetBinding.new(
+    root: options.fetch(:state_root), repo_root: options.fetch(:repo_root), campaign:, declaration:
+  )
+end
+
+def render(result)
+  subject = result.fetch("subject")
+  label = subject.fetch("type").capitalize
+  name = subject["handle"] || subject["id"]
+  puts "#{label}: #{name}"
+  puts "Stage: #{result.fetch('stage').tr('_', ' ')}"
+  puts "State: #{result.fetch('status')}"
+  puts "Problem: #{result.fetch('summary')}"
+  evidence = result.fetch("evidence").first
+  if evidence
+    facts = evidence.reject { |key, _| key == "kind" }.map { |key, value| "#{key}=#{value}" }.join("; ")
+    puts "Evidence: #{facts}"
+  end
+  action = result["next_action"]
+  puts "Next: #{action ? action.fetch('action').tr('_', ' ') : 'none'}"
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+  unless %w[pod fleet campaign].include?(type)
+    raise OptionParser::InvalidArgument, "subject must be pod, fleet, or campaign"
+  end
+  if type != "campaign" && handle.to_s.empty?
+    raise OptionParser::MissingArgument, "HANDLE"
+  end
+  if type == "campaign"
+    raise OptionParser::MissingArgument, "--campaign" unless options[:campaign]
+    raise OptionParser::MissingArgument, "--budget" unless options[:budget]
+    raise OptionParser::InvalidArgument, "--logs is valid only for pods" if options[:logs]
+    doctor = RunpodOllamaFleet::OperatorDoctor.new(
+      state_root: options[:state_root], campaign_binding: campaign_binding(options)
+    )
+    result = doctor.campaign
+  else
+    snapshot = aggregate_snapshot(options[:state_root], options[:repo_root])
+    doctor = RunpodOllamaFleet::OperatorDoctor.new(snapshot:, state_root: options[:state_root])
+    result = if options[:logs]
+               raise OptionParser::InvalidArgument, "--logs is valid only for pods" unless type == "pod"
+               doctor.pod_logs(handle, lines: options[:lines])
+             else
+               doctor.public_send(type, handle)
+             end
+  end
+
+  if options[:json]
+    puts JSON.pretty_generate(result)
+  elsif options[:logs]
+    puts "Pod: #{result.dig('subject', 'handle')}"
+    puts "Evidence: #{result['source'] || 'none'}"
+    result.fetch("lines").each { |line| puts "  #{line}" }
+  else
+    render(result)
+  end
+rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError, OptionParser::ParseError,
+       LocalModelEvaluation::RunpodFleetNamespace::Error,
+       LocalModelEvaluation::RunpodFleetState::Error,
+       LocalModelEvaluation::RunpodStatus::Error,
+       RunpodOllamaFleet::CapacityCampaign::Error,
+       RunpodOllamaFleet::CampaignBudgetBinding::Error,
+       RunpodOllamaFleet::OperatorDoctor::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end

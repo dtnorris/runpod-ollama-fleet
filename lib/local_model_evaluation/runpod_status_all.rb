@@ -138,6 +138,10 @@ module LocalModelEvaluation
         "fleet_key" => fleet_key,
         "fleet_alias" => fleet_alias,
         "index" => Integer(worker.fetch("index")),
+        "pod_id" => worker.fetch("pod_id").to_s,
+        "worker_id" => worker["worker_id"],
+        "generation_id" => worker["generation_id"],
+        "lme_status" => worker.fetch("lme_status").to_s,
         "gpu_id" => worker.fetch("gpu_id").to_s,
         "available_models" => Array(worker["available_models"]),
         "loaded_models" => Array(worker["loaded_models"]),
@@ -147,7 +151,8 @@ module LocalModelEvaluation
         "registry_state" => worker.fetch("registry_state", "-"),
         "hourly_rate_usd" => Float(worker.fetch("hourly_rate_usd")),
         "inference_status" => normalize_inference_status(worker["inference_status"]),
-        "bootstrap_status" => bootstrap_label(fleet_snapshot["bootstrap"], worker)
+        "bootstrap_status" => bootstrap_label(fleet_snapshot["bootstrap"], worker),
+        "bootstrap_log" => bootstrap_log(fleet_snapshot["bootstrap"], worker)
       }
     end
 
@@ -223,6 +228,18 @@ module LocalModelEvaluation
         progress = record["progress"].to_s
         stage == "COPYING" && !progress.empty? ? "#{stage} #{progress}" : stage
       end
+    end
+
+    def bootstrap_log(bootstrap, worker)
+      return nil unless bootstrap && bootstrap["evidence_dir"]
+
+      record = Array(bootstrap["workers"]).find do |candidate|
+        Integer(candidate.fetch("index")) == Integer(worker.fetch("index")) &&
+          candidate.fetch("pod_id").to_s == worker.fetch("pod_id").to_s
+      rescue KeyError, ArgumentError, TypeError
+        false
+      end
+      record && File.join(bootstrap.fetch("evidence_dir"), "burst_#{worker.fetch('index')}.log")
     end
   end
 end

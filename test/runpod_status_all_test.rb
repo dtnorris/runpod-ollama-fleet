@@ -108,9 +108,12 @@ class RunpodStatusAllTest < Minitest::Test
       workers: [worker(1, "new_pod", "NVIDIA A40", 0.49, available: ["gpt-oss:20b"], inference: "idle")],
       bootstrap_workers: [bootstrap_worker(1, "old_pod")]
     )
+    fleet.dig("snapshot", "bootstrap")["evidence_dir"] = "/state/bootstrap/stale"
 
-    output = @overview.render(@overview.snapshot([fleet]))
+    snapshot = @overview.snapshot([fleet])
+    output = @overview.render(snapshot)
 
+    assert_nil snapshot.dig("workers", 0, "bootstrap_log")
     assert_includes output, "A: replacement"
     assert_match(/^A\s+1\s+.*gpt-oss:20b.*IDLE.*-$/, output)
     refute_match(/^A\s+1\s+.*PASSED$/, output)
@@ -159,6 +162,23 @@ class RunpodStatusAllTest < Minitest::Test
     output = @overview.render(@overview.snapshot([fleet]))
 
     assert_match(/^A\s+1\s+.*COPYING 37%$/, output)
+  end
+
+  def test_aggregate_retains_exact_worker_identity_and_bootstrap_log_pointer
+    row = worker(2, "pod_b", "NVIDIA A40", 0.49, available: ["qwen:27b"])
+    row.merge!("worker_id" => "worker-b", "generation_id" => "generation-3")
+    fleet = entry(
+      "identity", rate: 0.49, accrued: 0.10, workers: [row],
+      bootstrap_workers: [bootstrap_worker(2, "pod_b")]
+    )
+    fleet.dig("snapshot", "bootstrap")["evidence_dir"] = "/state/bootstrap/run-1"
+
+    worker_row = @overview.snapshot([fleet]).fetch("workers").first
+
+    assert_equal "pod_b", worker_row.fetch("pod_id")
+    assert_equal "worker-b", worker_row.fetch("worker_id")
+    assert_equal "generation-3", worker_row.fetch("generation_id")
+    assert_equal "/state/bootstrap/run-1/burst_2.log", worker_row.fetch("bootstrap_log")
   end
 
   def test_copying_without_progress_and_terminal_labels_remain_unchanged
