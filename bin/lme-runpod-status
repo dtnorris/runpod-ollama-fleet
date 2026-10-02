@@ -2,6 +2,8 @@
 # frozen_string_literal: true
 
 require "dotenv"
+require "json"
+require "optparse"
 
 ROOT = File.expand_path("..", __dir__)
 Dotenv.load(File.join(ROOT, ".env"))
@@ -13,15 +15,29 @@ require "local_model_evaluation/runpod_fleet_namespace"
 require "local_model_evaluation/runpod_fleet_state"
 require "local_model_evaluation/runpod_status"
 require "local_model_evaluation/runpod_status_all"
+require "local_model_evaluation/runpod_compact_status"
 require "local_model_evaluation/runpod_cost_control"
 require "local_model_evaluation/runpod_shutdown_control"
 require "runpod_ollama_fleet/dynamic_worker_registry"
 
-all_fleets = ARGV == ["--all"]
-unless ARGV.empty? || all_fleets
-  warn "Usage: bin/rpof status [--all]"
-  exit 2
+options = { all: false, verbose: false, json: false, width: LocalModelEvaluation::RunpodCompactStatus::DEFAULT_WIDTH }
+begin
+  OptionParser.new do |parser|
+    parser.banner = "Usage: bin/rpof status [--all] [--verbose | --json] [--width COLUMNS]"
+    parser.on("--all") { options[:all] = true }
+    parser.on("--verbose") { options[:verbose] = true }
+    parser.on("--json") { options[:json] = true }
+    parser.on("--width COLUMNS", Integer) { |value| options[:width] = value }
+  end.parse!(ARGV)
+  raise OptionParser::InvalidArgument, "--verbose and --json are mutually exclusive" if options[:verbose] && options[:json]
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+rescue OptionParser::ParseError => e
+  warn "ERROR: #{e.message}"
+  exit 1
 end
+
+all_fleets = options[:all]
+compact = LocalModelEvaluation::RunpodCompactStatus.new(width: options[:width])
 
 state_root = ENV["RPOF_STATE_ROOT"].to_s.strip
 state_root = File.join(ROOT, "output", "runpod-fleets") if state_root.empty?
@@ -85,13 +101,19 @@ begin
 
     overview = LocalModelEvaluation::RunpodStatusAll.new
     snapshot = overview.snapshot(entries)
-    $stdout.write(overview.render(snapshot))
-    shutdown = LocalModelEvaluation::RunpodShutdownControl.new(root: state_root, repo_root: state_repo_root)
-    $stdout.write("\n")
-    $stdout.write(shutdown.render(fleet_aliases: snapshot.fetch("fleet_aliases")))
-    cost = LocalModelEvaluation::RunpodCostControl.new(root: state_root, repo_root: state_repo_root)
-    $stdout.write("\n")
-    $stdout.write(cost.render)
+    if options[:json]
+      puts JSON.pretty_generate(snapshot)
+    elsif options[:verbose]
+      $stdout.write(overview.render(snapshot))
+      shutdown = LocalModelEvaluation::RunpodShutdownControl.new(root: state_root, repo_root: state_repo_root)
+      $stdout.write("\n")
+      $stdout.write(shutdown.render(fleet_aliases: snapshot.fetch("fleet_aliases")))
+      cost = LocalModelEvaluation::RunpodCostControl.new(root: state_root, repo_root: state_repo_root)
+      $stdout.write("\n")
+      $stdout.write(cost.render)
+    else
+      $stdout.write(compact.render_all(snapshot))
+    end
   else
     namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
       root: state_root,
@@ -99,13 +121,20 @@ begin
       fleet_key: ENV.fetch("LME_RUNPOD_FLEET", LocalModelEvaluation::RunpodFleetNamespace::DEFAULT_KEY)
     )
     status, snapshot = build_status.call(namespace)
-    $stdout.write(status.render(snapshot))
+    if options[:json]
+      puts JSON.pretty_generate(snapshot)
+    elsif options[:verbose]
+      $stdout.write(status.render(snapshot))
+    else
+      $stdout.write(compact.render_fleet(snapshot))
+    end
   end
 rescue LocalModelEvaluation::RunpodFleetNamespace::Error,
        LocalModelEvaluation::RunpodStatus::Error,
        LocalModelEvaluation::RunpodFleetState::Error,
        LocalModelEvaluation::RunpodCostControl::Error,
        LocalModelEvaluation::RunpodShutdownControl::Error,
+       OptionParser::ParseError,
        ArgumentError => e
   warn "ERROR: #{e.message}"
   exit 1

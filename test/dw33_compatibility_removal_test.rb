@@ -34,7 +34,7 @@ class Dw33CompatibilityRemovalTest < Minitest::Test
         "RPOF_STATE_REPO_ROOT" => root
       }
       out, err, status = Open3.capture3(
-        env, RbConfig.ruby, File.join(ROOT, "bin/rpof"), "status", "--all"
+        env, RbConfig.ruby, File.join(ROOT, "bin/rpof"), "status", "--all", "--verbose"
       )
 
       assert status.success?, err

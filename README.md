@@ -103,6 +103,15 @@ its legacy meaning is provider-active fleet-state rows, recorded by
 `ready_workers_legacy_meaning`. New consumers must use
 `provider_active_workers` and `registry_ready_workers`.
 
+`bin/rpof status` and `bin/rpof status --all` default to a compact pod table
+bounded to 72 columns. Each worker occupies one physical line with its existing
+short handle (`burst_N` or aggregate alias such as `A1`), GPU, bootstrap-qualified
+model, provider state, registry state, and tracked hourly rate. `PROV=UP` means
+provider `RUNNING`; it does not imply `REG=READY`. Long GPU/model values end in
+`~` and remain complete in `--json` and `--verbose` output. Use `--width COLUMNS`
+for wider panes; `--verbose` retains the detailed lifecycle, bootstrap, tunnel,
+inference, lease, shutdown, and cost views.
+
 ## Operator process ownership
 
 RPOF command completion, process lifetime and provider-resource lifetime are
