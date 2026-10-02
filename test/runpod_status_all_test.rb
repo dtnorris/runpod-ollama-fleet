@@ -58,12 +58,14 @@ class RunpodStatusAllTest < Minitest::Test
     output = @overview.render(snapshot)
     assert_includes output, "RunPod aggregate status"
     assert_includes output, "Active fleets: 2"
-    assert_includes output, "Active workers: 4"
+    assert_includes output, "Managed-active workers: 4"
+    assert_includes output, "Provider-active workers: 4"
+    assert_includes output, "Registry: READY=2 NOT_READY=0 UNAVAILABLE=0 unpublished=2"
     assert_includes output, "Current managed rate: $2.0400/hr"
     assert_includes output, "Fleet aliases (current active set):"
     assert_includes output, "A: batch31-gptoss"
     assert_includes output, "B: batch31-nos-qwen27"
-    assert_match(/^A\s+1\s+NVIDIA A40.*gpt-oss:20b.*gpt-oss:20b.*IDLE.*READY$/, output)
+    assert_match(/^A\s+1\s+NVIDIA A40.*gpt-oss:20b.*gpt-oss:20b.*IDLE.*PASSED$/, output)
     assert_match(/^B\s+1\s+NVIDIA RTX A6000.*-.*UNAVAILABLE.*UNAVAILABLE.*-$/, output)
     refute_includes output, "old-destroyed"
   end
@@ -111,7 +113,7 @@ class RunpodStatusAllTest < Minitest::Test
 
     assert_includes output, "A: replacement"
     assert_match(/^A\s+1\s+.*gpt-oss:20b.*IDLE.*-$/, output)
-    refute_match(/^A\s+1\s+.*READY$/, output)
+    refute_match(/^A\s+1\s+.*PASSED$/, output)
   end
 
   def test_render_truncates_long_gpu_and_model_labels_and_keeps_full_fleet_alias
@@ -213,6 +215,8 @@ class RunpodStatusAllTest < Minitest::Test
       "model_status" => model_status,
       "lme_status" => lme_status,
       "provider_status" => lme_status == "active" ? "RUNNING" : "-",
+      "tunnel_status" => available.empty? ? "ABSENT" : "ESTABLISHED",
+      "registry_state" => available.empty? ? "UNPUBLISHED" : "READY",
       "hourly_rate_usd" => rate,
       "inference_status" => inference
     }

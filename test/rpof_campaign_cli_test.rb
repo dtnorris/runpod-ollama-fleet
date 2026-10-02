@@ -72,6 +72,44 @@ class RpofCampaignCliTest < Minitest::Test
     ], exec_argv
   end
 
+  def test_campaign_status_labels_provider_active_and_registry_ready_separately
+    expected = {
+      "command" => "campaign status",
+      "read_only" => true,
+      "campaign" => { "campaign_id" => "production-batch-039" },
+      "budget_state" => "ARMED",
+      "guardian_healthy" => true,
+      "deadline_at_utc" => "2030-01-01T01:00:00Z",
+      "active_workers" => 1,
+      "pending_workers" => 0,
+      "max_workers" => 2,
+      "active_plus_pending_hourly_rate_usd" => 0.49,
+      "max_aggregate_hourly_rate_usd" => 2.0,
+      "reserved_maximum_liability_usd" => 5.0,
+      "max_cumulative_compute_usd" => 10.0,
+      "pending_ambiguous_reservations" => [],
+      "profiles" => [{
+        "profile_id" => "gptoss",
+        "provider_active_workers" => 1,
+        "registry_status" => "available",
+        "registry_ready_workers" => 0,
+        "registry_not_ready_workers" => 1,
+        "registry_unpublished_workers" => 0,
+        "bootstrap_passed_workers" => 1,
+        "tunnel_established_workers" => 1,
+        "desired_workers" => 1,
+        "max_workers" => 2
+      }]
+    }
+
+    stdout, stderr, status = with_stubbed_campaign(:status, expected) { run_cli("status") }
+
+    assert status.success?, stderr
+    assert_includes stdout, "provider-active=1 registry-ready=0"
+    assert_includes stdout, "registry-not-ready=1"
+    refute_includes stdout, " ready="
+  end
+
   private
 
   def with_stubbed_campaign(action, result)

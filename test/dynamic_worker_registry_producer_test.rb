@@ -119,6 +119,39 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     assert_equal "NOT_READY", registry.snapshot.dig("workers", 0, "state")
   end
 
+  def test_readiness_status_distinguishes_bootstrap_tunnel_and_registry_state
+    record = bootstrap_record
+    record["status"] = "running"
+    write_bootstrap(record)
+
+    waiting = registry.readiness_status
+    assert_equal "available", waiting.fetch("status")
+    assert_equal 1, waiting.dig("counts", "bootstrap_passed")
+    assert_equal 1, waiting.dig("counts", "tunnel_established")
+    assert_equal 1, waiting.dig("counts", "NOT_READY")
+    assert_equal "NOT_READY", waiting.dig("workers", 0, "registry_state")
+
+    record["status"] = "passed"
+    write_bootstrap(record)
+    @now += 1
+
+    ready = registry.readiness_status
+    assert_equal 1, ready.dig("counts", "READY")
+    assert_equal 0, ready.dig("counts", "NOT_READY")
+    assert_equal "READY", ready.dig("workers", 0, "registry_state")
+  end
+
+  def test_readiness_status_marks_worker_unpublished_when_registry_evidence_is_incomplete
+    File.delete(File.join(@state.artifact_dir(@fleet.fetch("fleet_id"), "tunnels"), "tunnels.json"))
+
+    status = registry.readiness_status
+
+    assert_equal 0, status.dig("counts", "READY")
+    assert_equal 1, status.dig("counts", "registry_unpublished")
+    refute status.dig("workers", 0, "tunnel_established")
+    assert_nil status.dig("workers", 0, "registry_state")
+  end
+
   def test_missing_capability_evidence_omits_worker
     record = bootstrap_record
     record["status"] = "running"

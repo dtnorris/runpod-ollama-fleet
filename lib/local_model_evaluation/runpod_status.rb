@@ -9,11 +9,15 @@ module LocalModelEvaluation
   class RunpodStatus
     class Error < StandardError; end
 
-    def initialize(fleet_state:, client: nil, wall_clock: nil, activity_monitor: nil)
+    PROVIDER_ACTIVE_STATUSES = %w[RUNNING].freeze
+
+    def initialize(fleet_state:, client: nil, wall_clock: nil, activity_monitor: nil,
+                   readiness_observer: nil)
       @fleet_state = fleet_state
       @client = client
       @wall_clock = wall_clock || -> { Time.now.utc }
       @activity_monitor = activity_monitor
+      @readiness_observer = readiness_observer
     end
 
     def snapshot
@@ -50,10 +54,16 @@ module LocalModelEvaluation
 
       bootstrap = bootstrap_snapshot(fleet, now)
       bootstrap_workers = bootstrap_workers_by_index(bootstrap)
+      readiness = readiness_snapshot
+      readiness_workers = Array(readiness["workers"]).to_h do |worker|
+        [Integer(worker.fetch("index")), worker]
+      end
       workers.each do |worker|
         bootstrap_worker = bootstrap_workers[worker.fetch("index")]
         worker["available_models"] = available_models_from_bootstrap(bootstrap, bootstrap_worker, worker.fetch("pod_id"))
+        append_readiness!(worker, readiness, readiness_workers[worker.fetch("index")])
       end
+      readiness_counts = readiness["counts"] || {}
 
       {
         "fleet_id" => fleet.fetch("fleet_id"),
@@ -65,7 +75,17 @@ module LocalModelEvaluation
         "gpu_profiles" => gpu_profile_counts(active_workers),
         "worker_count" => workers.length,
         "active_worker_count" => active_workers.length,
+        "provider_active_worker_count" => @client && workers.count do |worker|
+          PROVIDER_ACTIVE_STATUSES.include?(worker.fetch("provider_status"))
+        end,
         "destroyed_worker_count" => workers.count { |worker| worker.fetch("lme_status") == "destroyed" },
+        "readiness" => readiness,
+        "bootstrap_passed_worker_count" => readiness_counts["bootstrap_passed"],
+        "tunnel_established_worker_count" => readiness_counts["tunnel_established"],
+        "registry_ready_worker_count" => readiness_counts["READY"],
+        "registry_not_ready_worker_count" => readiness_counts["NOT_READY"],
+        "registry_unavailable_worker_count" => readiness_counts["UNAVAILABLE"],
+        "registry_unpublished_worker_count" => readiness_counts["registry_unpublished"],
         "recorded_fleet_hourly_rate_usd" => Float(fleet.fetch("fleet_hourly_rate_usd")),
         "current_tracked_hourly_rate_usd" => active_workers.sum { |worker| worker.fetch("hourly_rate_usd") },
         "estimated_accrued_cost_usd" => workers.sum { |worker| worker.fetch("estimated_cost_usd") }.round(6),
@@ -94,11 +114,12 @@ module LocalModelEvaluation
       lines << "  Cloud: #{snapshot.fetch('cloud')}"
       lines << "  GPU profiles: #{gpu_profiles_label(snapshot.fetch('gpu_profiles'))}"
       lines << format(
-        "  Workers: %d total; %d active; %d destroyed",
+        "  Workers: %d total; %d managed-active; %d destroyed",
         snapshot.fetch("worker_count"),
         snapshot.fetch("active_worker_count"),
         snapshot.fetch("destroyed_worker_count")
       )
+      append_readiness_summary(lines, snapshot)
       lines << format("  Recorded fleet rate: $%.4f/hr", snapshot.fetch("recorded_fleet_hourly_rate_usd"))
       lines << format("  Current tracked rate: $%.4f/hr", snapshot.fetch("current_tracked_hourly_rate_usd"))
       lines << "  Tracked elapsed: #{format_duration(snapshot.fetch('tracked_elapsed_seconds'))}"
@@ -109,11 +130,16 @@ module LocalModelEvaluation
       lines << ""
       if snapshot["inference_activity"]
         lines << format(
-          "%-9s %-20s %-30s %-30s %-10s %-12s %-10s %-10s %-10s %-11s %s",
-          "WORKER", "GPU", "AVAILABLE", "LOADED", "LME", "RUNPOD", "RATE", "ELAPSED", "EST.COST", "INFERENCE", "BOOTSTRAP"
+          "%-9s %-20s %-30s %-30s %-10s %-12s %-10s %-10s %-10s %-11s %-11s %-12s %s",
+          "WORKER", "GPU", "AVAILABLE", "LOADED", "LME", "RUNPOD", "RATE", "ELAPSED", "EST.COST",
+          "INFERENCE", "TUNNEL", "REGISTRY", "BOOTSTRAP"
         )
       else
-        lines << format("%-9s %-20s %-30s %-10s %-12s %-10s %-10s %-10s %s", "WORKER", "GPU", "AVAILABLE", "LME", "RUNPOD", "RATE", "ELAPSED", "EST.COST", "BOOTSTRAP")
+        lines << format(
+          "%-9s %-20s %-30s %-10s %-12s %-10s %-10s %-10s %-11s %-12s %s",
+          "WORKER", "GPU", "AVAILABLE", "LME", "RUNPOD", "RATE", "ELAPSED", "EST.COST",
+          "TUNNEL", "REGISTRY", "BOOTSTRAP"
+        )
       end
 
       bootstrap_workers = bootstrap_workers_by_index(snapshot["bootstrap"])
@@ -121,7 +147,7 @@ module LocalModelEvaluation
         boot = bootstrap_worker_label(bootstrap_workers[worker.fetch("index")])
         if snapshot["inference_activity"]
           lines << format(
-            "%-9s %-20s %-30s %-30s %-10s %-12s $%-9.4f %-10s $%-9.4f %-11s %s",
+            "%-9s %-20s %-30s %-30s %-10s %-12s $%-9.4f %-10s $%-9.4f %-11s %-11s %-12s %s",
             "burst_#{worker.fetch('index')}",
             worker.fetch("gpu_id"),
             available_model_label(worker),
@@ -132,11 +158,13 @@ module LocalModelEvaluation
             format_duration(worker.fetch("tracked_elapsed_seconds")),
             worker.fetch("estimated_cost_usd"),
             inference_label(worker["inference_status"]),
+            worker.fetch("tunnel_status"),
+            worker.fetch("registry_state"),
             boot
           )
         else
           lines << format(
-            "%-9s %-20s %-30s %-10s %-12s $%-9.4f %-10s $%-9.4f %s",
+            "%-9s %-20s %-30s %-10s %-12s $%-9.4f %-10s $%-9.4f %-11s %-12s %s",
             "burst_#{worker.fetch('index')}",
             worker.fetch("gpu_id"),
             available_model_label(worker),
@@ -145,6 +173,8 @@ module LocalModelEvaluation
             worker.fetch("hourly_rate_usd"),
             format_duration(worker.fetch("tracked_elapsed_seconds")),
             worker.fetch("estimated_cost_usd"),
+            worker.fetch("tunnel_status"),
+            worker.fetch("registry_state"),
             boot
           )
         end
@@ -287,7 +317,7 @@ module LocalModelEvaluation
       return "-" unless worker
 
       status = worker["status"].to_s
-      return "READY" if status == "passed"
+      return "PASSED" if status == "passed"
       return "FAILED" if status == "failed"
       return "INTERRUPTED" if status == "interrupted"
 
@@ -322,6 +352,45 @@ module LocalModelEvaluation
         counts.fetch("interrupted", 0)
       )
       lines << "  Evidence: #{bootstrap.fetch('evidence_dir')}"
+    end
+
+    def readiness_snapshot
+      unless @readiness_observer
+        return { "status" => "unavailable", "error" => "registry readiness observer is not configured" }
+      end
+
+      @readiness_observer.readiness_status
+    rescue StandardError => e
+      { "status" => "unavailable", "error" => e.message }
+    end
+
+    def append_readiness!(worker, readiness, observation)
+      if readiness.fetch("status") == "unavailable"
+        worker["tunnel_status"] = "UNAVAILABLE"
+        worker["registry_state"] = "UNAVAILABLE"
+        return
+      end
+
+      worker["tunnel_status"] = observation&.fetch("tunnel_established", false) ? "ESTABLISHED" : "ABSENT"
+      worker["registry_state"] = observation&.fetch("registry_state", nil) || "UNPUBLISHED"
+    end
+
+    def append_readiness_summary(lines, snapshot)
+      readiness = snapshot.fetch("readiness")
+      provider = snapshot["provider_active_worker_count"]
+      provider_label = provider.nil? ? "not checked" : provider
+      if readiness.fetch("status") == "unavailable"
+        lines << "  Readiness: provider-active=#{provider_label}; registry=UNAVAILABLE (#{readiness['error']})"
+        return
+      end
+
+      lines << "  Readiness: provider-active=#{provider_label}; " \
+               "bootstrap-passed=#{snapshot.fetch('bootstrap_passed_worker_count')}; " \
+               "tunnel-established=#{snapshot.fetch('tunnel_established_worker_count')}; " \
+               "registry READY=#{snapshot.fetch('registry_ready_worker_count')} " \
+               "NOT_READY=#{snapshot.fetch('registry_not_ready_worker_count')} " \
+               "UNAVAILABLE=#{snapshot.fetch('registry_unavailable_worker_count')} " \
+               "unpublished=#{snapshot.fetch('registry_unpublished_worker_count')}"
     end
 
     def append_lease(lines, lease)

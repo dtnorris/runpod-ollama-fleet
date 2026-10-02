@@ -52,6 +52,12 @@ class RunpodStatusTest < Minitest::Test
     end
   end
 
+  FakeReadiness = Struct.new(:document) do
+    def readiness_status
+      document
+    end
+  end
+
   def setup
     @tmp = Dir.mktmpdir("lme-runpod-status-")
     @now = Time.utc(2026, 8, 29, 20, 30, 0)
@@ -170,11 +176,11 @@ class RunpodStatusTest < Minitest::Test
 
     output = status.render(snapshot)
     assert_includes output, "burst_1"
-    assert_includes output, "READY"
+    assert_includes output, "PASSED"
     assert_includes output, "WARMING"
     assert_includes output, "Models: gemma4:26b"
     assert_includes output, "1 running; 1 passed; 0 failed; 0 interrupted"
-    assert_match(/burst_1.*NVIDIA A40.*gemma4:26b.*READY/, output)
+    assert_match(/burst_1.*NVIDIA A40.*gemma4:26b.*PASSED/, output)
     assert_match(/burst_2.*NVIDIA A40.*-.*WARMING/, output)
   end
 
@@ -274,6 +280,43 @@ class RunpodStatusTest < Minitest::Test
     assert_match(/burst_2.*NVIDIA L4.*gpt-oss:20b/, output)
   end
 
+  def test_provider_active_bootstrap_and_registry_ready_are_distinct
+    fleet = fleet_record(workers: [worker(1, "pod_a", 0.44), worker(2, "pod_b", 0.44)])
+    client = FakeClient.new(
+      "pod_a" => { "status" => "RUNNING", "cost" => 0.44 },
+      "pod_b" => { "status" => "RUNNING", "cost" => 0.44 }
+    )
+    readiness = FakeReadiness.new({
+      "status" => "available",
+      "counts" => {
+        "bootstrap_passed" => 1, "capability_evidence_valid" => 1,
+        "tunnel_established" => 1, "READY" => 1, "NOT_READY" => 0,
+        "UNAVAILABLE" => 0, "registry_unpublished" => 1
+      },
+      "workers" => [
+        {
+          "index" => 1, "tunnel_established" => true, "registry_state" => "READY"
+        },
+        {
+          "index" => 2, "tunnel_established" => false, "registry_state" => nil
+        }
+      ]
+    })
+    status = build_status(fleet, client:, readiness_observer: readiness)
+
+    snapshot = status.snapshot
+
+    assert_equal 2, snapshot.fetch("provider_active_worker_count")
+    assert_equal 1, snapshot.fetch("bootstrap_passed_worker_count")
+    assert_equal 1, snapshot.fetch("tunnel_established_worker_count")
+    assert_equal 1, snapshot.fetch("registry_ready_worker_count")
+    assert_equal 1, snapshot.fetch("registry_unpublished_worker_count")
+    assert_equal %w[READY UNPUBLISHED], snapshot.fetch("workers").map { |row| row.fetch("registry_state") }
+    output = status.render(snapshot)
+    assert_includes output, "provider-active=2"
+    assert_includes output, "registry READY=1"
+  end
+
   def test_no_current_fleet_is_a_clean_zero_state
     state = FakeFleetState.new(root: @tmp, current: nil)
     status = LocalModelEvaluation::RunpodStatus.new(fleet_state: state, wall_clock: -> { @now })
@@ -284,13 +327,14 @@ class RunpodStatusTest < Minitest::Test
 
   private
 
-  def build_status(fleet, client: nil, activity_monitor: nil)
+  def build_status(fleet, client: nil, activity_monitor: nil, readiness_observer: nil)
     state = FakeFleetState.new(root: @tmp, current: fleet)
     LocalModelEvaluation::RunpodStatus.new(
       fleet_state: state,
       client: client,
       wall_clock: -> { @now },
-      activity_monitor: activity_monitor
+      activity_monitor: activity_monitor,
+      readiness_observer: readiness_observer
     )
   end
 

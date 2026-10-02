@@ -38,10 +38,16 @@ module LocalModelEvaluation
         [status, workers.select { |worker| worker.fetch("inference_status") == status }.sum { |worker| worker.fetch("hourly_rate_usd") }]
       end
       unproductive_rate = %w[idle unavailable unknown].sum { |status| inference_rates.fetch(status) }
+      provider_active = workers.count { |worker| worker.fetch("provider_status") == "RUNNING" }
+      registry_counts = %w[READY NOT_READY UNAVAILABLE UNPUBLISHED].to_h do |status|
+        [status, workers.count { |worker| worker.fetch("registry_state") == status }]
+      end
 
       {
         "active_fleet_count" => fleets.length,
         "active_worker_count" => workers.length,
+        "provider_active_worker_count" => provider_active,
+        "registry_counts" => registry_counts,
         "current_tracked_hourly_rate_usd" => fleets.sum do |entry|
           Float(entry.fetch("snapshot").fetch("current_tracked_hourly_rate_usd"))
         end,
@@ -70,7 +76,11 @@ module LocalModelEvaluation
       lines = []
       lines << "RunPod aggregate status"
       lines << "  Active fleets: #{snapshot.fetch('active_fleet_count')}"
-      lines << "  Active workers: #{snapshot.fetch('active_worker_count')}"
+      lines << "  Managed-active workers: #{snapshot.fetch('active_worker_count')}"
+      lines << "  Provider-active workers: #{snapshot.fetch('provider_active_worker_count')}"
+      registry = snapshot.fetch("registry_counts")
+      lines << "  Registry: READY=#{registry.fetch('READY')} NOT_READY=#{registry.fetch('NOT_READY')} " \
+               "UNAVAILABLE=#{registry.fetch('UNAVAILABLE')} unpublished=#{registry.fetch('UNPUBLISHED')}"
       lines << format("  Current managed rate: $%.4f/hr", snapshot.fetch("current_tracked_hourly_rate_usd"))
       lines << format("  Productive ACTIVE rate: $%.4f/hr", snapshot.fetch("productive_hourly_rate_usd"))
       lines << format("  Unproductive burn: $%.4f/hr", snapshot.fetch("unproductive_hourly_rate_usd"))
@@ -93,13 +103,14 @@ module LocalModelEvaluation
       end
       lines << ""
       lines << format(
-        "%-5s %-5s %-18s %-18s %-18s %-8s %-8s %-11s %s",
-        "FLEET", "BURST", "GPU", "AVAILABLE", "LOADED", "RUNPOD", "RATE", "INFERENCE", "BOOTSTRAP"
+        "%-5s %-5s %-18s %-18s %-18s %-8s %-8s %-11s %-11s %-12s %s",
+        "FLEET", "BURST", "GPU", "AVAILABLE", "LOADED", "RUNPOD", "RATE", "INFERENCE",
+        "TUNNEL", "REGISTRY", "BOOTSTRAP"
       )
 
       snapshot.fetch("workers").each do |worker|
         lines << format(
-          "%-5s %-5s %-18s %-18s %-18s %-8s $%-7.4f %-11s %s",
+          "%-5s %-5s %-18s %-18s %-18s %-8s $%-7.4f %-11s %-11s %-12s %s",
           truncate(worker.fetch("fleet_alias"), FLEET_WIDTH),
           truncate(worker.fetch("index"), BURST_WIDTH),
           truncate(worker.fetch("gpu_id"), GPU_WIDTH),
@@ -108,6 +119,8 @@ module LocalModelEvaluation
           truncate(worker.fetch("provider_status"), RUNPOD_WIDTH),
           worker.fetch("hourly_rate_usd"),
           inference_label(worker.fetch("inference_status")),
+          worker.fetch("tunnel_status"),
+          worker.fetch("registry_state"),
           worker.fetch("bootstrap_status")
         )
       end
@@ -130,6 +143,8 @@ module LocalModelEvaluation
         "loaded_models" => Array(worker["loaded_models"]),
         "model_status" => worker["model_status"].to_s,
         "provider_status" => worker.fetch("provider_status").to_s,
+        "tunnel_status" => worker.fetch("tunnel_status", "-"),
+        "registry_state" => worker.fetch("registry_state", "-"),
         "hourly_rate_usd" => Float(worker.fetch("hourly_rate_usd")),
         "inference_status" => normalize_inference_status(worker["inference_status"]),
         "bootstrap_status" => bootstrap_label(fleet_snapshot["bootstrap"], worker)
@@ -198,7 +213,7 @@ module LocalModelEvaluation
       end
 
       case record["status"].to_s
-      when "passed" then "READY"
+      when "passed" then "PASSED"
       when "failed" then "FAILED"
       when "interrupted" then "INTERRUPTED"
       else

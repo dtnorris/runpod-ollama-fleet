@@ -15,6 +15,7 @@ require "local_model_evaluation/runpod_status"
 require "local_model_evaluation/runpod_status_all"
 require "local_model_evaluation/runpod_cost_control"
 require "local_model_evaluation/runpod_shutdown_control"
+require "runpod_ollama_fleet/dynamic_worker_registry"
 
 all_fleets = ARGV == ["--all"]
 unless ARGV.empty? || all_fleets
@@ -40,10 +41,16 @@ build_status = lambda do |namespace|
     local_port_base: namespace.local_port_base
   )
   activity_monitor = LocalModelEvaluation::RunpodActivity.new(fleet_state: state)
+  readiness_observer = RunpodOllamaFleet::DynamicWorkerRegistry.new(
+    state_root: state_root,
+    repo_root: state_repo_root,
+    fleet_sources: [{ "fleet_key" => namespace.fleet_key, "state" => state }]
+  )
   status = LocalModelEvaluation::RunpodStatus.new(
     fleet_state: state,
     client: client,
-    activity_monitor: activity_monitor
+    activity_monitor: activity_monitor,
+    readiness_observer: readiness_observer
   )
   [status, status.snapshot]
 end

@@ -4,6 +4,7 @@ require_relative "../local_model_evaluation/runpod_fleet"
 require_relative "../local_model_evaluation/runpod_fleet_lifecycle"
 require_relative "../local_model_evaluation/runpod_fleet_namespace"
 require_relative "../local_model_evaluation/runpod_capacity_policy"
+require_relative "dynamic_worker_registry"
 
 module RunpodOllamaFleet
   # Adapter from campaign intent to the existing fleet mutation paths. It has
@@ -12,7 +13,7 @@ module RunpodOllamaFleet
     class Error < StandardError; end
 
     def initialize(root:, repo_root:, profile:, hardware:, client:, admission: nil, out: $stdout,
-                   wall_clock: nil)
+                   wall_clock: nil, readiness_observer: nil)
       @root = File.expand_path(root)
       @repo_root = File.expand_path(repo_root)
       @profile = profile
@@ -21,6 +22,7 @@ module RunpodOllamaFleet
       @admission = admission
       @out = out
       @wall_clock = wall_clock
+      @readiness_observer = readiness_observer
     end
 
     def current_worker_count
@@ -31,9 +33,25 @@ module RunpodOllamaFleet
     def status
       record = current_record
       workers = record && record["status"] == "active" ? Array(record.fetch("workers")) : []
+      provider_active = workers.count { |row| row["status"] == "active" }
+      readiness = readiness_status
+      counts = readiness["counts"] || {}
       {
         "current_workers" => workers.length,
-        "ready_workers" => workers.count { |row| row["status"] == "active" },
+        # Compatibility field: historically this meant active fleet-state rows,
+        # not dynamic-worker-registry READY.
+        "ready_workers" => provider_active,
+        "ready_workers_legacy_meaning" => "provider_active_workers",
+        "provider_active_workers" => provider_active,
+        "bootstrap_passed_workers" => counts["bootstrap_passed"],
+        "capability_evidence_workers" => counts["capability_evidence_valid"],
+        "tunnel_established_workers" => counts["tunnel_established"],
+        "registry_status" => readiness.fetch("status"),
+        "registry_ready_workers" => counts["READY"],
+        "registry_not_ready_workers" => counts["NOT_READY"],
+        "registry_unavailable_workers" => counts["UNAVAILABLE"],
+        "registry_unpublished_workers" => counts["registry_unpublished"],
+        "registry_error" => readiness["error"],
         "fleet_id" => record && record["fleet_id"],
         "fleet_status" => record && record["status"],
         "worker_readiness" => workers.group_by { |row| row.fetch("status") }.transform_values(&:length)
@@ -96,6 +114,17 @@ module RunpodOllamaFleet
 
     private
 
+    def readiness_status
+      observer = @readiness_observer || DynamicWorkerRegistry.new(
+        state_root: @root,
+        repo_root: @repo_root,
+        fleet_sources: [{ "fleet_key" => profile_id, "state" => current_state }]
+      )
+      observer.readiness_status
+    rescue DynamicWorkerRegistry::Error => e
+      { "status" => "unavailable", "error" => e.message }
+    end
+
     def qualified_gpu_id(max_hourly_rate_usd:, desired_workers:)
       worker_count = Integer(desired_workers)
       raise Error, "desired worker count must be positive" unless worker_count.positive?
@@ -124,10 +153,14 @@ module RunpodOllamaFleet
     end
 
     def current_record
-      root = File.join(@root, "fleets", profile_id)
-      LocalModelEvaluation::RunpodFleetState.new(root:, clock: @wall_clock).current
+      current_state.current
     rescue LocalModelEvaluation::RunpodFleetState::Error => e
       raise Error, e.message
+    end
+
+    def current_state
+      root = File.join(@root, "fleets", profile_id)
+      LocalModelEvaluation::RunpodFleetState.new(root:, clock: @wall_clock)
     end
   end
 end

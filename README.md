@@ -84,6 +84,25 @@ eligible for new work.
 `RPOF_STATE_ROOT` and `RPOF_STATE_REPO_ROOT` select the same state namespace
 for `workers --json` and `status --all` (also single-fleet status).
 
+Operator status keeps lifecycle and scheduling terms separate:
+
+- **provider active** means provider or provider-owned fleet evidence says the
+  paid resource exists/runs;
+- **bootstrap passed** means current generation-specific capability evidence
+  passed; it is not registry readiness;
+- **tunnel established** means the recorded managed tunnel process identity is
+  alive and matches the current pod/endpoint;
+- **registry READY** means the frozen registry predicate also has valid
+  capability evidence and a healthy current-generation endpoint;
+- **compatible**, **busy**, **idle**, and WLO blocking reasons belong to WLO,
+  not RPOF.
+
+Single-fleet, aggregate, and campaign human status label these facts explicitly.
+Campaign JSON retains the historical `ready_workers` field for compatibility;
+its legacy meaning is provider-active fleet-state rows, recorded by
+`ready_workers_legacy_meaning`. New consumers must use
+`provider_active_workers` and `registry_ready_workers`.
+
 ## Operator process ownership
 
 RPOF command completion, process lifetime and provider-resource lifetime are

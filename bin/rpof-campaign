@@ -85,8 +85,14 @@ def render_human(command, result)
     puts "Liability=$#{result['reserved_maximum_liability_usd']} cap=$#{result['max_cumulative_compute_usd']}"
     puts "Pending ambiguous reservations=#{result.fetch('pending_ambiguous_reservations').length}"
     result.fetch("profiles").each do |row|
-      puts "  #{row.fetch('profile_id')}: current=#{row.fetch('current_workers')} " \
-           "ready=#{row.fetch('ready_workers')} desired=#{row.fetch('desired_workers')} max=#{row.fetch('max_workers')}"
+      registry_ready = row["registry_ready_workers"].nil? ? "UNAVAILABLE" : row.fetch("registry_ready_workers")
+      puts "  #{row.fetch('profile_id')}: provider-active=#{row.fetch('provider_active_workers')} " \
+           "registry-ready=#{registry_ready} desired=#{row.fetch('desired_workers')} max=#{row.fetch('max_workers')}"
+      puts "    bootstrap-passed=#{row['bootstrap_passed_workers'] || '-'} " \
+           "tunnel-established=#{row['tunnel_established_workers'] || '-'} " \
+           "registry-not-ready=#{row['registry_not_ready_workers'] || '-'} " \
+           "registry-unpublished=#{row['registry_unpublished_workers'] || '-'}"
+      puts "    registry unavailable: #{row['registry_error']}" if row["registry_status"] == "unavailable"
     end
   when "stop"
     puts "Campaign stop: budget=#{result.fetch('budget_state')} absence_verified=#{result.fetch('provider_absence_verified')}"

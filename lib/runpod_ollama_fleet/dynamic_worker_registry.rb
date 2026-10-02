@@ -50,6 +50,29 @@ module RunpodOllamaFleet
       raise Error, e.message
     end
 
+    # Read-only diagnostics from the same provider-neutral evidence and READY
+    # predicate used by #snapshot. This does not advance publisher state.
+    def readiness_status
+      workers = sources.flat_map { |source| readiness_for(source) }
+                       .sort_by { |worker| [worker.fetch("fleet_key"), worker.fetch("index")] }
+      states = %w[READY NOT_READY UNAVAILABLE].to_h do |state|
+        [state, workers.count { |worker| worker["registry_state"] == state }]
+      end
+      {
+        "status" => "available",
+        "workers" => workers,
+        "counts" => states.merge(
+          "bootstrap_passed" => workers.count { |worker| worker.fetch("bootstrap_passed") },
+          "capability_evidence_valid" => workers.count { |worker| worker.fetch("capability_evidence_valid") },
+          "tunnel_established" => workers.count { |worker| worker.fetch("tunnel_established") },
+          "registry_unpublished" => workers.count { |worker| worker["registry_state"].nil? }
+        )
+      }
+    rescue LocalModelEvaluation::RunpodFleetNamespace::Error,
+           LocalModelEvaluation::RunpodFleetState::Error => e
+      raise Error, e.message
+    end
+
     def self.capability_fingerprint(worker)
       capabilities = worker.fetch("capabilities")
       models = capabilities.dig("ollama", "models").map do |model|
@@ -106,6 +129,60 @@ module RunpodOllamaFleet
       end
     rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError, TypeError => e
       raise Error, "invalid source state for fleet #{fleet_key.inspect}: #{e.message}"
+    end
+
+    def readiness_for(source)
+      fleet_key = source.fetch("fleet_key").to_s
+      state = source.fetch("state")
+      fleet = state.current
+      return [] unless fleet
+
+      bootstrap = load_bootstrap(state, fleet)
+      runtime_aliases = load_runtime_aliases(state, fleet)
+      tunnels = load_tunnels(state, fleet)
+      Array(fleet.fetch("workers")).map do |worker|
+        index = positive_integer(worker.fetch("index"), "worker index")
+        published = build_worker(state:, fleet:, worker:, bootstrap:, runtime_aliases:, tunnels:)
+        models = capability_models(worker, worker_gpu_id(fleet, worker), bootstrap, runtime_aliases)
+        tunnel = tunnels[index]
+        {
+          "fleet_key" => fleet_key,
+          "index" => index,
+          "pod_id" => nonempty(worker.fetch("pod_id"), "worker pod identity"),
+          "bootstrap_passed" => bootstrap_passed?(bootstrap, worker),
+          "capability_evidence_valid" => !models.empty?,
+          "tunnel_established" => tunnel_established?(worker, tunnel),
+          "registry_state" => published && published.fetch("state"),
+          "worker_id" => published && published.fetch("worker_id"),
+          "generation_id" => published && published.fetch("generation_id")
+        }
+      end
+    rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError, TypeError => e
+      raise Error, "invalid source state for fleet #{fleet_key.inspect}: #{e.message}"
+    end
+
+    def bootstrap_passed?(bootstrap, worker)
+      return false unless bootstrap
+
+      evidence = Array(bootstrap.fetch("workers")).find do |candidate|
+        Integer(candidate.fetch("index")) == Integer(worker.fetch("index")) &&
+          candidate.fetch("pod_id").to_s == worker.fetch("pod_id").to_s
+      rescue KeyError, ArgumentError, TypeError
+        false
+      end
+      !!(evidence && evidence["status"] == "passed" && evidence["provenance_error"].nil? &&
+        evidence["provenance"].is_a?(Hash))
+    end
+
+    def tunnel_established?(worker, tunnel)
+      return false unless tunnel
+      return false unless tunnel.fetch("pod_id").to_s == worker.fetch("pod_id").to_s
+      return false unless valid_endpoint(tunnel.fetch("endpoint")) == valid_endpoint(worker.fetch("local_ollama_url"))
+
+      pid = tunnel.fetch("pid")
+      @process.alive?(pid) && @process.matches?(pid, tunnel.fetch("process_identity"))
+    rescue KeyError, ArgumentError, TypeError, URI::InvalidURIError, Error
+      false
     end
 
     def build_worker(state:, fleet:, worker:, bootstrap:, runtime_aliases:, tunnels:)
