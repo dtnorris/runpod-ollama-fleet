@@ -86,10 +86,10 @@ end
 
 def positive_float(value, label)
   number = Float(value)
-  raise ArgumentError unless number.positive?
+  raise ArgumentError unless number.positive? && number.finite?
   number
 rescue ArgumentError, TypeError
-  raise LocalModelEvaluation::RunpodFulfillment::Error, "#{label} must be a positive number"
+  raise LocalModelEvaluation::RunpodFulfillment::Error, "#{label} must be positive and finite"
 end
 
 def budget_context(opts)

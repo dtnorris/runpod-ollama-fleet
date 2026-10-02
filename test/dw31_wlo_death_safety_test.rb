@@ -117,6 +117,8 @@ class Dw31WloDeathSafetyTest < Minitest::Test
     def status(budget:)
       row = @guardian.request("command" => "status")
       {
+        "budget_id" => budget.budget_id,
+        "plan_sha256" => budget.plan_sha256,
         "enabled" => true,
         "launchd_loaded" => true,
         "ready" => row.fetch("ready"),

@@ -298,6 +298,10 @@ module LocalModelEvaluation
     end
 
     def write_runtime(path, document)
+      document = {
+        "budget_id" => @budget.budget_id,
+        "plan_sha256" => @budget.plan_sha256
+      }.merge(document)
       FileUtils.mkdir_p(File.dirname(path))
       tmp = "#{path}.tmp.#{$$}"
       File.write(tmp, JSON.pretty_generate(document) + "\n")

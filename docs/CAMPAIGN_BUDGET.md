@@ -65,6 +65,13 @@ The independent guardian continues heartbeat evaluation and teardown after the
 campaign-starting process exits. Guardian teardown errors are retained in the
 parent ledger until a later retry verifies provider absence and closes it.
 
+Before the first paid mutation, campaign start now evaluates the authoritative
+[`rpof-capacity-campaign-safety-report/v0.1`](PAID_START_SAFETY.md). The report
+uses this same ledger calculation (rather than a second estimate), proves the
+guardian runtime identity matches the budget/binding, includes the full
+projected start, and fails closed on any missing proof. It also states the
+conditional enforcement failure domain and the compute-only billing scope.
+
 `mutation_authority!` and `reserve_capacity_mutation!` prove the original
 binding and reject projected worker, hourly-rate or cumulative-liability
 widening. Campaign start and later scale or replacement mutations use that

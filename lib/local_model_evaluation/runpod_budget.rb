@@ -23,6 +23,31 @@ module LocalModelEvaluation
 
     class Error < StandardError; end
 
+    CRASH_HORIZON_FIELDS = %w[
+      guardian_poll_seconds orchestrator_heartbeat_timeout_seconds
+      teardown_reserve_seconds
+    ].freeze
+
+    def self.crash_horizon_seconds(limits)
+      values = CRASH_HORIZON_FIELDS.map do |field|
+        value = Float(limits.fetch(field))
+        raise Error, "#{field} must be positive and finite" unless value.positive? && value.finite?
+        value
+      end
+      values.sum
+    rescue KeyError, ArgumentError, TypeError
+      raise Error, "guardian crash-horizon timing must be positive and finite"
+    end
+
+    def self.maximum_additional_compute_liability_usd(hourly_rate_usd:, limits:)
+      rate = Float(hourly_rate_usd)
+      raise Error, "liability hourly rate must be non-negative and finite" unless !rate.negative? && rate.finite?
+
+      rate * crash_horizon_seconds(limits) / 3600.0
+    rescue ArgumentError, TypeError
+      raise Error, "liability hourly rate must be non-negative and finite"
+    end
+
     def initialize(root:, budget_id:, plan_sha256:, wall_clock: nil)
       @root = File.expand_path(root)
       @budget_id = nonempty_string(budget_id, "budget id")
@@ -637,10 +662,10 @@ module LocalModelEvaluation
       committed_workers = resources.count { |resource| resource.fetch("status") == "active" } +
                           pending_reservations.length
       limits = document.fetch("limits")
-      horizon = Float(limits.fetch("guardian_poll_seconds")) +
-                Float(limits.fetch("orchestrator_heartbeat_timeout_seconds")) +
-                Float(limits.fetch("teardown_reserve_seconds"))
-      reserve = committed_rate * horizon / 3600.0
+      reserve = self.class.maximum_additional_compute_liability_usd(
+        hourly_rate_usd: committed_rate,
+        limits:
+      )
       {
         "accrued_compute_usd" => accrued,
         "committed_rate_usd_per_hour" => committed_rate,

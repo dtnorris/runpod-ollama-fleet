@@ -38,6 +38,12 @@ guardian continues enforcing the original authority. The guardian is a safety
 enforcer: it does not schedule WLO jobs, maintain desired capacity continuously,
 or replace a future FO-09 controller.
 
+An authorized start must emit a PASSing paid-start safety report before its
+first provider mutation. The report proves finite projected compute authority,
+the original deadline, guardian health/identity, crash-liability calculation,
+billing scope, and the enforcement failure domain. See
+[`PAID_START_SAFETY.md`](PAID_START_SAFETY.md).
+
 `campaign status` is a one-shot read-only observer. Interrupting or closing it
 changes no workload or provider lifecycle. `campaign stop` durably requests
 guardian-owned teardown; the request returning is not proof of completion.

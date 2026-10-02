@@ -97,6 +97,37 @@ def render_human(command, result)
   end
 end
 
+def render_safety_report(report, io: $stdout)
+  workers = report.fetch("workers")
+  hourly = report.fetch("hourly_compute_usd")
+  cumulative = report.fetch("cumulative_compute_usd")
+  runtime = report.fetch("runtime")
+  crash = report.fetch("crash_liability")
+  enforcement = report.fetch("enforcement")
+  billing = report.fetch("billing_scope")
+  io.puts "Safety gate: #{report.fetch('safety_gate')}"
+  io.puts "Workers: #{workers.fetch('projected')} / #{workers.fetch('maximum')} max"
+  io.puts format(
+    "Projected compute rate: $%.6f/hr (ceiling $%.6f/hr)",
+    hourly.fetch("projected"), hourly.fetch("maximum")
+  )
+  io.puts format(
+    "Cumulative compute: accrued $%.6f; current liability $%.6f; cap $%.6f",
+    cumulative.fetch("accrued"),
+    cumulative.fetch("committed_and_pending_maximum_liability"),
+    cumulative.fetch("maximum")
+  )
+  io.puts "Runtime: #{runtime.fetch('maximum_seconds')}s; original deadline #{runtime.fetch('original_deadline_at_utc')}"
+  io.puts format(
+    "Crash horizon: %.3fs; max additional compute after controller loss: $%.6f",
+    crash.fetch("horizon_seconds"),
+    crash.fetch("maximum_additional_compute_usd_after_orchestrator_loss")
+  )
+  io.puts "Enforcement: guardian healthy/armed=#{enforcement.fetch('guardian_healthy_and_armed')} " \
+          "identity_match=#{enforcement.fetch('guardian_identity_matches')}"
+  io.puts "Billing scope: #{billing.fetch('label')}; charges outside cap=#{billing.fetch('charges_may_continue_outside_cap')}"
+end
+
 begin
   parser.parse!(ARGV)
   raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
@@ -147,7 +178,18 @@ begin
   result = case command
            when "plan" then lifecycle.plan
            when "start"
-             lifecycle.start(authorize_paid: options[:authorize_paid], ssh_public_key_path: options[:ssh_public_key])
+             reporter = lambda do |report|
+               if options[:json]
+                 warn JSON.generate("event" => "paid_start_safety_gate", "safety_report" => report)
+               else
+                 render_safety_report(report)
+               end
+             end
+             lifecycle.start(
+               authorize_paid: options[:authorize_paid],
+               ssh_public_key_path: options[:ssh_public_key],
+               safety_reporter: reporter
+             )
            when "status" then lifecycle.status
            when "stop" then lifecycle.stop(reason: options[:reason])
            end

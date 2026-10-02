@@ -51,11 +51,11 @@ class RpofFulfillBudgetCliTest < Minitest::Test
     }
   end
 
-  def test_noninteractive_paid_fulfillment_requires_parent_budget
-    assert_invalid("parent burst budget options are required")
+  def test_noninteractive_direct_paid_fulfillment_is_blocked
+    assert_invalid("automated direct paid fulfillment is blocked")
   end
 
-  def test_complete_budget_options_pass_parser_before_provider_key_gate
+  def test_complete_legacy_budget_does_not_bypass_automated_direct_block
     _stdout, stderr, status = Open3.capture3(
       { "RUNPOD_API_KEY" => "" },
       *base_command,
@@ -63,9 +63,26 @@ class RpofFulfillBudgetCliTest < Minitest::Test
       chdir: ROOT
     )
 
-    assert_equal 1, status.exitstatus
-    assert_includes stderr, "RUNPOD_API_KEY is missing"
-    refute_includes stderr, "parent burst budget options are required"
+    assert_equal 2, status.exitstatus
+    assert_includes stderr, "automated direct paid fulfillment is blocked"
+    refute_includes stderr, "RUNPOD_API_KEY is missing"
+  end
+
+  def test_manual_direct_fulfillment_requires_both_lease_bounds
+    assert_invalid(
+      "requires both --max-runtime-minutes and --max-spend-usd",
+      yes: false
+    )
+    LocalModelEvaluation::RunpodFulfillOptions.validate!(
+      valid_options.merge(yes: false, max_runtime_seconds: 600.0, max_spend_usd: 1.0),
+      []
+    )
+    assert_invalid(
+      "must be positive and finite",
+      yes: false,
+      max_runtime_seconds: Float::INFINITY,
+      max_spend_usd: 1.0
+    )
   end
 
   def test_partial_budget_options_fail_closed

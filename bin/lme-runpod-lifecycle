@@ -68,10 +68,10 @@ end
 
 def positive_cap(value, label)
   number = Float(value)
-  raise ArgumentError unless number.positive?
+  raise ArgumentError unless number.positive? && number.finite?
   number
 rescue ArgumentError, TypeError
-  raise LocalModelEvaluation::RunpodFleetLifecycle::Error, "#{label} must be a positive number"
+  raise LocalModelEvaluation::RunpodFleetLifecycle::Error, "#{label} must be positive and finite"
 end
 
 def confirm_or_abort(prompt, assume_yes:)
@@ -174,6 +174,18 @@ begin
                 )
               end
   scale_down = command == "scale" && preflight.scale_direction == "down"
+  LocalModelEvaluation::RunpodDirectPaidSafety.assert_not_automated!(
+    operation: command,
+    assume_yes: opts[:yes],
+    dry_run: opts[:dry_run],
+    paid_mutation: !scale_down
+  )
+  LocalModelEvaluation::RunpodDirectPaidSafety.assert_complete_manual_lease!(
+    operation: command,
+    lease: state.current && state.current["lease"],
+    dry_run: opts[:dry_run],
+    paid_mutation: !scale_down
+  )
   ssh_public_key = scale_down ? nil : fleet.read_ssh_public_key(opts[:ssh_public_key])
   requested_total_rate = positive_cap(opts[:max_total_hourly_usd], "aggregate managed RunPod hourly safety cap")
   cost_control = LocalModelEvaluation::RunpodCostControl.new(
@@ -312,6 +324,7 @@ rescue LocalModelEvaluation::RunpodClient::Error,
        LocalModelEvaluation::RunpodFleet::Error,
        LocalModelEvaluation::RunpodFleetState::Error,
        LocalModelEvaluation::RunpodFleetNamespace::Error,
+       LocalModelEvaluation::RunpodDirectPaidSafety::Error,
        LocalModelEvaluation::RunpodFleetLifecycle::Error => e
   warn "ERROR: #{e.message}"
   exit 1

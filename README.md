@@ -104,7 +104,7 @@ separate facts. The classifications below describe the invoking process:
 | `campaign start` | RESOURCE MUTATION | The independent launchd guardian and any created provider resources continue. There is no continuing campaign controller. | May interrupt an in-flight mutation; it is not rollback, WLO pause or teardown. Inspect campaign status before retrying. | `campaign stop`, then status until `CLOSED` with provider absence verified. |
 | `campaign stop` | TEARDOWN REQUEST | The independent guardian continues teardown and retries after the CLI returns. | Interrupts only the requesting CLI; it does not cancel the durable teardown request or prove its completion. | Re-run status/stop until provider absence is verified and the budget is `CLOSED`. |
 | `workers --json`, `status`, `capacity`, `capability-check` | ONE-SHOT INSPECTION/PUBLICATION | Workloads, guardians, tunnels and provider resources continue. Registry publication may advance its durable revision but owns no work or capacity. | Interrupts only the request. | Use WLO and RPOF lifecycle commands explicitly. |
-| `create`, `fulfill`, `scale`, `replace` | RESOURCE MUTATION | Provider resources remain; a configured lease watchdog is detached and remains independently responsible for its lease. | May leave a partial or completed mutation; it is not rollback or teardown. Inspect state/provider evidence before retrying. | For campaign-owned capacity use `campaign stop`; otherwise use `destroy` or `shutdown` as applicable. |
+| `create`, `fulfill`, `scale`, `replace` | MANUAL RESOURCE MUTATION | Provider resources remain; a configured lease watchdog is detached but is not campaign-grade independent enforcement. Automated `--yes` paid forms are blocked; positive manual mutations require finite runtime and spend leases. | May leave a partial or completed mutation; it is not rollback or teardown. Inspect state/provider evidence before retrying. | Use authorized `campaign start` for production automation; otherwise use `destroy` or `shutdown` as applicable. |
 | `destroy` | TEARDOWN REQUEST | No selected paid worker should remain only after synchronous provider-absence verification succeeds; unrelated resources/watchdogs may remain. | Interrupting the CLI does not prove deletion. | Inspect `status`; repeat explicit teardown if required. |
 | `shutdown` | TEARDOWN REQUEST | Immediate graceful/force modes own the request until verified completion; `--terminal` launches a detached shutdown watchdog. | Ctrl-C of an immediate request is not completion. After `--terminal` returns, shell Ctrl-C has no effect on its watchdog. | Inspect `status`; use `keep` only to cancel a pending lifecycle gate, not a hard lease. |
 | `keep` | CONTROL REQUEST | Paid resources continue; only the pending/timed-out lifecycle shutdown gate is cancelled. | Interrupts only the request. | Use `shutdown`, `destroy` or `campaign stop` for teardown. |
@@ -124,6 +124,16 @@ pause. It does not tear down paid resources. For production campaign capacity,
 `rpof campaign stop` is the teardown request, and completion requires a later
 status proving provider absence and `CLOSED`. Closing a view, pressing Ctrl-C,
 losing a shell or losing a terminal is never a substitute for either action.
+
+## Paid-start safety
+
+Authorized campaign start fails closed before its first provider mutation
+unless the durable authority, projected compute liability, original deadline,
+and matching healthy independent guardian produce a PASSing safety report. The
+cap covers recorded RunPod pod compute only—not storage, Global Volume,
+network/egress, or other provider charges—and the report states the host/network/provider
+failure domain instead of claiming a provider-side hard total-spend cap. See
+[`docs/PAID_START_SAFETY.md`](docs/PAID_START_SAFETY.md).
 
 ## Safety
 

@@ -192,7 +192,7 @@ module LocalModelEvaluation
         return nil if value.nil?
 
         number = Float(value)
-        raise Error, "#{label} must be positive" unless number.positive?
+        raise Error, "#{label} must be positive and finite" unless number.positive? && number.finite?
 
         number
       end
@@ -210,7 +210,7 @@ module LocalModelEvaluation
 
     def positive_float(value, label)
       number = Float(value)
-      raise Error, "#{label} must be positive" unless number.positive?
+      raise Error, "#{label} must be positive and finite" unless number.positive? && number.finite?
 
       number
     rescue ArgumentError, TypeError

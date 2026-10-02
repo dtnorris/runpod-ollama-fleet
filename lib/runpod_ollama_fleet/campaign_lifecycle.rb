@@ -47,7 +47,7 @@ module RunpodOllamaFleet
       raise Error, e.message
     end
 
-    def start(authorize_paid:, ssh_public_key_path: nil)
+    def start(authorize_paid:, ssh_public_key_path: nil, safety_reporter: nil)
       unless authorize_paid
         return plan.merge(
           "authorization_required" => true,
@@ -63,11 +63,17 @@ module RunpodOllamaFleet
       @binding.bind!
       authority = @binding.arm!
       verify_started_authority!(authority)
+      prepared = prepare_start(authority)
+      safety_report = @binding.assert_safety_gate!(
+        projected_workers: prepared.fetch("projected_workers"),
+        projected_hourly_rate_usd: prepared.fetch("projected_hourly_rate_usd")
+      )
+      safety_reporter&.call(safety_report)
       results = []
-      @campaign.profiles.each do |profile|
-        admission = CampaignCapacityAdmission.new(binding: @binding, profile_id: profile.fetch("profile_id"))
-        runtime = @runtime_factory.call(profile, hardware_for(profile), admission)
-        current = runtime.current_worker_count
+      prepared.fetch("profiles").each do |row|
+        profile = row.fetch("profile")
+        runtime = row.fetch("runtime")
+        current = row.fetch("current_workers")
         desired = profile.fetch("desired_workers")
         maximum = profile.fetch("max_workers")
         raise Error, "profile #{profile.fetch('profile_id').inspect} has #{current} workers above max #{maximum}" if current > maximum
@@ -89,7 +95,12 @@ module RunpodOllamaFleet
         raise Error, "partial campaign startup at #{profile.fetch('profile_id')}: #{e.message}"
       end
 
-      status.merge("command" => "campaign start", "paid_authorized" => true, "profiles" => results)
+      status.merge(
+        "command" => "campaign start",
+        "paid_authorized" => true,
+        "safety_report" => safety_report,
+        "profiles" => results
+      )
     rescue CampaignBudgetBinding::Error, CampaignCapacityAdmission::Error => e
       raise Error, e.message
     end
@@ -190,6 +201,53 @@ module RunpodOllamaFleet
       raise Error, "campaign parent budget is not ARMED" unless ledger.fetch("state") == "ARMED"
       deadline = Time.parse(authority.fetch("deadline_at_utc")).utc
       raise Error, "campaign original deadline has expired" unless deadline > utc_now
+    end
+
+    def prepare_start(authority)
+      committed_by_profile = authority.dig("authority", "committed_workers_by_profile") || {}
+      committed_workers = Integer(authority.dig("authority", "committed_workers"))
+      committed_rate = Float(authority.dig("authority", "committed_hourly_rate_usd"))
+      additions = 0
+      additional_rate = 0.0
+      rate_available = true
+      rows = @campaign.profiles.map do |profile|
+        hardware = hardware_for(profile)
+        admission = CampaignCapacityAdmission.new(binding: @binding, profile_id: profile.fetch("profile_id"))
+        runtime = @runtime_factory.call(profile, hardware, admission)
+        current = runtime.current_worker_count
+        maximum = profile.fetch("max_workers")
+        if current > maximum
+          raise Error, "profile #{profile.fetch('profile_id').inspect} has #{current} workers above max #{maximum}"
+        end
+
+        committed_profile = Integer(committed_by_profile.fetch(profile.fetch("profile_id"), 0))
+        if current > committed_profile
+          raise Error, "profile #{profile.fetch('profile_id').inspect} has paid workers outside the campaign ledger"
+        end
+        accounted = [current, committed_profile].max
+        missing = [profile.fetch("desired_workers") - accounted, 0].max
+        if missing.positive?
+          rate = @price_resolver&.call(profile, hardware)
+          if rate.nil?
+            rate_available = false
+          else
+            rate = Float(rate)
+            unless rate.positive? && rate.finite?
+              raise Error, "profile #{profile.fetch('profile_id').inspect} projected hourly rate must be positive and finite"
+            end
+            additional_rate += rate * missing
+          end
+          additions += missing
+        end
+        { "profile" => profile, "runtime" => runtime, "current_workers" => current }
+      end
+      {
+        "profiles" => rows,
+        "projected_workers" => committed_workers + additions,
+        "projected_hourly_rate_usd" => rate_available ? committed_rate + additional_rate : nil
+      }
+    rescue KeyError, ArgumentError, TypeError => e
+      raise Error, "could not calculate paid-start projection: #{e.message}"
     end
 
     def hardware_for(profile)

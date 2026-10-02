@@ -16,6 +16,7 @@ module RunpodOllamaFleet
     CONTRACT_VERSION = "rpof-capacity-campaign-budget/v0.1"
     STATE_CONTRACT_VERSION = "rpof-capacity-campaign-budget-state/v0.1"
     MUTATION_AUTHORITY_VERSION = "rpof-capacity-campaign-mutation-authority/v0.1"
+    SAFETY_REPORT_VERSION = "rpof-capacity-campaign-safety-report/v0.1"
     PHASES = %w[BOUND ARMING ARMED].freeze
     DIGEST = /\A[0-9a-f]{64}\z/i
     DECLARATION_KEYS = %w[
@@ -187,6 +188,120 @@ module RunpodOllamaFleet
            LocalModelEvaluation::RunpodBudgetGuardianSupervisor::Error,
            KeyError, ArgumentError, TypeError => e
       raise Error, e.message
+    end
+
+    # Authoritative, read-only paid-start proof. The calculation consumes the
+    # same durable ledger and guardian evidence used by live mutation admission;
+    # it neither refreshes a heartbeat nor changes budget state.
+    def safety_report(projected_workers:, projected_hourly_rate_usd:)
+      binding = with_lock { binding_snapshot(load_state!) }
+      ledger = @parent_budget.status
+      verify_ledger!(ledger)
+      verify_original_times!(binding, ledger)
+      guardian = guardian_status
+      authority = authority_snapshot(ledger, guardian:)
+      workers = nonnegative_integer!(projected_workers, "projected workers")
+      rate = optional_nonnegative_float!(projected_hourly_rate_usd, "projected hourly rate")
+      limits = ledger.fetch("limits")
+      deadline = parse_time(ledger.fetch("deadline_at_utc"), "parent deadline_at_utc")
+      now = utc_now
+      horizon = LocalModelEvaluation::RunpodBudget.crash_horizon_seconds(limits)
+      projected_additional = rate &&
+                             LocalModelEvaluation::RunpodBudget.maximum_additional_compute_liability_usd(
+                               hourly_rate_usd: rate,
+                               limits:
+                             )
+      accrued = Float(ledger.fetch("accrued_compute_usd"))
+      current_maximum = Float(ledger.fetch("committed_maximum_liability_usd"))
+      projected_maximum = projected_additional && accrued + projected_additional
+      cap = declaration.fetch("max_cumulative_compute_usd")
+      active_resources = ledger.fetch("owned_resources").values.select { |row| row.fetch("status") == "active" }
+      pending_reservations = ledger.fetch("reservations").values.select { |row| row.fetch("status") == "pending" }
+      active_rate = active_resources.sum { |row| Float(row.fetch("hourly_rate_usd")) }
+      pending_rate = pending_reservations.sum { |row| Float(row.fetch("max_hourly_rate_delta_usd")) }
+      refusal_reasons = authority.fetch("violations").dup
+      refusal_reasons << "binding_not_armed" unless binding.fetch("phase") == "ARMED"
+      refusal_reasons << "guardian_identity_mismatch" unless guardian.fetch("identity_matches")
+      refusal_reasons << "original_deadline_expired" unless deadline > now
+      refusal_reasons << "projected_workers_below_committed" if workers < authority.fetch("committed_workers")
+      refusal_reasons << "projected_worker_ceiling_exceeded" if workers > declaration.fetch("max_workers")
+      refusal_reasons << "projected_hourly_rate_unavailable" unless rate
+      if rate
+        refusal_reasons << "projected_rate_below_committed" if rate + 1e-9 < authority.fetch("committed_hourly_rate_usd")
+        if rate > declaration.fetch("max_aggregate_hourly_rate_usd") + 1e-9
+          refusal_reasons << "projected_hourly_rate_ceiling_exceeded"
+        end
+      end
+      if projected_maximum && projected_maximum > cap + 1e-9
+        refusal_reasons << "projected_cumulative_compute_authority_exceeded"
+      end
+      refusal_reasons.uniq!
+
+      {
+        "contract_version" => SAFETY_REPORT_VERSION,
+        "safety_gate" => refusal_reasons.empty? ? "PASS" : "FAIL",
+        "refusal_reasons" => refusal_reasons.freeze,
+        "campaign_id" => campaign.campaign_id,
+        "campaign_identity_sha256" => campaign.identity_sha256,
+        "binding_sha256" => binding_sha256,
+        "budget_id" => declaration.fetch("budget_id"),
+        "workers" => {
+          "active" => active_resources.length,
+          "pending_or_ambiguous" => pending_reservations.length,
+          "committed_and_pending" => authority.fetch("committed_workers"),
+          "projected" => workers,
+          "maximum" => declaration.fetch("max_workers")
+        },
+        "hourly_compute_usd" => {
+          "active" => active_rate.round(6),
+          "pending_or_ambiguous" => pending_rate.round(6),
+          "committed_and_pending" => authority.fetch("committed_hourly_rate_usd"),
+          "projected" => rate&.round(6),
+          "maximum" => declaration.fetch("max_aggregate_hourly_rate_usd")
+        },
+        "cumulative_compute_usd" => {
+          "maximum" => cap,
+          "accrued" => accrued.round(6),
+          "committed_and_pending_maximum_liability" => current_maximum.round(6),
+          "remaining_uncommitted_authority" => Float(
+            ledger.fetch("remaining_uncommitted_budget_usd")
+          ).round(6),
+          "projected_maximum_liability" => projected_maximum&.round(6),
+          "remaining_after_projection" => projected_maximum && [cap - projected_maximum, 0.0].max.round(6)
+        },
+        "runtime" => {
+          "maximum_seconds" => declaration.fetch("max_runtime_seconds"),
+          "armed_at_utc" => ledger.fetch("armed_at_utc"),
+          "original_deadline_at_utc" => ledger.fetch("deadline_at_utc"),
+          "remaining_seconds" => [deadline - now, 0.0].max.round(6)
+        },
+        "crash_liability" => {
+          "guardian_poll_seconds" => declaration.fetch("guardian_poll_seconds"),
+          "orchestrator_heartbeat_timeout_seconds" => declaration.fetch(
+            "orchestrator_heartbeat_timeout_seconds"
+          ),
+          "teardown_reserve_seconds" => declaration.fetch("teardown_reserve_seconds"),
+          "horizon_seconds" => horizon,
+          "maximum_additional_compute_usd_after_orchestrator_loss" => projected_additional&.round(6),
+          "derivation" => "projected_hourly_compute_usd * " \
+                          "(guardian_poll_seconds + orchestrator_heartbeat_timeout_seconds + " \
+                          "teardown_reserve_seconds) / 3600"
+        },
+        "enforcement" => enforcement_evidence(guardian),
+        "billing_scope" => billing_scope_evidence,
+        "absolute_refusal_conditions" => absolute_refusal_conditions
+      }.freeze
+    rescue LocalModelEvaluation::RunpodBudget::Error,
+           LocalModelEvaluation::RunpodBudgetGuardianSupervisor::Error,
+           KeyError, ArgumentError, TypeError => e
+      raise Error, e.message
+    end
+
+    def assert_safety_gate!(projected_workers:, projected_hourly_rate_usd:)
+      report = safety_report(projected_workers:, projected_hourly_rate_usd:)
+      return report if report.fetch("safety_gate") == "PASS"
+
+      raise Error, "paid campaign start safety gate failed: #{report.fetch('refusal_reasons').join(', ')}"
     end
 
     # Produces an immutable proof that a proposed capacity mutation is within
@@ -417,7 +532,10 @@ module RunpodOllamaFleet
         end
       end
 
-      projected_additional = projected_rate * authority.fetch("crash_liability_horizon_seconds") / 3600.0
+      projected_additional = LocalModelEvaluation::RunpodBudget.maximum_additional_compute_liability_usd(
+        hourly_rate_usd: projected_rate,
+        limits: ledger.fetch("limits")
+      )
       projected_total = ledger.fetch("accrued_compute_usd") + projected_additional
       if projected_total > declaration.fetch("max_cumulative_compute_usd") + 1e-9
         raise Error, "capacity mutation would exceed remaining cumulative authority"
@@ -457,10 +575,11 @@ module RunpodOllamaFleet
         by_profile[row.fetch("fleet_key")] += 1 if row.fetch("status") == "pending"
       end
       rate = Float(ledger.fetch("committed_rate_usd_per_hour"))
-      horizon = declaration.fetch("guardian_poll_seconds") +
-                declaration.fetch("orchestrator_heartbeat_timeout_seconds") +
-                declaration.fetch("teardown_reserve_seconds")
-      additional = rate * horizon / 3600.0
+      horizon = LocalModelEvaluation::RunpodBudget.crash_horizon_seconds(ledger.fetch("limits"))
+      additional = LocalModelEvaluation::RunpodBudget.maximum_additional_compute_liability_usd(
+        hourly_rate_usd: rate,
+        limits: ledger.fetch("limits")
+      )
       violations = []
       violations << "worker_ceiling_exceeded" if workers > declaration.fetch("max_workers")
       if rate > declaration.fetch("max_aggregate_hourly_rate_usd") + 1e-9
@@ -545,6 +664,9 @@ module RunpodOllamaFleet
       errors << "not ready" unless status["ready"] == true
       pid = Integer(status["pid"])
       errors << "not independent" unless pid.positive? && pid != Process.pid
+      identity_matches = status["budget_id"] == declaration.fetch("budget_id") &&
+                         status["plan_sha256"].to_s.downcase == binding_sha256
+      errors << "budget/campaign identity mismatch" unless identity_matches
       heartbeat = parse_time(status.fetch("ledger_heartbeat_at_utc"), "guardian ledger heartbeat")
       now = utc_now
       errors << "future heartbeat" if heartbeat > now
@@ -553,6 +675,7 @@ module RunpodOllamaFleet
       errors << "guardian is not enforcing ARMED state" unless status["state"] == "ARMED"
       status.merge(
         "healthy" => errors.empty?,
+        "identity_matches" => identity_matches,
         "health_errors" => errors,
         "ledger_heartbeat_age_seconds" => age.round(6)
       )
@@ -575,6 +698,89 @@ module RunpodOllamaFleet
       guardian_status
     rescue Error, LocalModelEvaluation::RunpodBudgetGuardianSupervisor::Error => e
       { "healthy" => false, "error" => e.message }
+    end
+
+    def enforcement_evidence(guardian)
+      {
+        "mechanism" => "per-user macOS launchd KeepAlive(PathState) rpof-budget-guardian",
+        "guardian_healthy_and_armed" => guardian.fetch("healthy") && guardian.fetch("state") == "ARMED",
+        "guardian_identity_matches" => guardian.fetch("identity_matches"),
+        "guardian_pid" => guardian.fetch("pid"),
+        "launchd_label" => guardian["launchd_label"],
+        "survives" => {
+          "initiating_cli_exit" => true,
+          "wlo_exit" => true,
+          "initiating_agent_exit" => true,
+          "shell_or_terminal_exit" => true,
+          "guardian_process_restart_via_launchd_when_user_service_available" => true
+        },
+        "does_not_guarantee" => {
+          "guardian_restart_within_modeled_crash_horizon" => true,
+          "launchd_or_user_service_unavailable" => true,
+          "host_power_loss_or_reboot_before_service_restoration" => true,
+          "host_sleep" => true,
+          "host_network_loss" => true,
+          "provider_api_unavailability" => true,
+          "provider_delete_failure_or_unverifiable_absence" => true
+        },
+        "statement" => "The compute-liability bound survives loss of the initiating CLI, WLO, " \
+                       "agent, shell, and terminal while the healthy guardian continues. Launchd is " \
+                       "configured to restart the guardian, but restart latency is not bounded by the " \
+                       "modeled crash horizon. Teardown requires an awake networked host, a reachable " \
+                       "RunPod API, successful deletion, and verifiable provider absence."
+      }
+    end
+
+    def billing_scope_evidence
+      {
+        "label" => "runpod_pod_compute_only",
+        "bounded" => [
+          "RunPod pod compute represented by catalog/observed pod hourly cost and the campaign ledger"
+        ],
+        "not_proven_bounded" => [
+          "container or persistent-disk storage charges",
+          "pre-existing network or Global Volume charges",
+          "snapshot or retained-storage charges",
+          "network or egress charges",
+          "provider billing granularity, taxes, credits, and other provider charges"
+        ],
+        "requested_resources" => {
+          "pod_compute" => {
+            "created_or_retained_by_rpof" => true,
+            "hourly_admission" => true,
+            "cumulative_liability" => true,
+            "guardian_teardown_owned" => true,
+            "provider_absence_verifiable" => true
+          },
+          "container_disk" => {
+            "created_with_pod" => true,
+            "separately_priced_in_ledger" => false,
+            "destroyed_with_pod_assumed_but_not_separately_verified" => true
+          },
+          "global_volume" => {
+            "pre_existing_and_attached_only" => true,
+            "created_by_campaign" => false,
+            "priced_in_ledger" => false,
+            "guardian_teardown_owned" => false,
+            "provider_absence_verifiable_by_campaign" => false
+          }
+        },
+        "charges_may_continue_outside_cap" => true
+      }
+    end
+
+    def absolute_refusal_conditions
+      %w[
+        invalid_or_nonfinite_bound binding_not_armed ambiguous_durable_authority
+        budget_or_campaign_identity_mismatch worker_ceiling_exceeded
+        aggregate_hourly_rate_exceeded cumulative_liability_exhausted
+        parent_budget_not_armed parent_budget_mutation_blocked
+        guardian_not_independent_or_fresh guardian_identity_mismatch
+        original_deadline_expired projected_workers_below_committed
+        projected_worker_ceiling_exceeded projected_hourly_rate_unavailable
+        projected_rate_below_committed projected_hourly_rate_ceiling_exceeded
+        projected_cumulative_compute_authority_exceeded
+      ]
     end
 
     def retain_arm_error(message, initial:)
@@ -688,6 +894,11 @@ module RunpodOllamaFleet
       number
     rescue NoMethodError
       raise Error, "#{label} must be non-negative and finite"
+    end
+
+    def optional_nonnegative_float!(value, label)
+      return nil if value.nil?
+      nonnegative_float!(value, label)
     end
 
     def parse_time(value, label)

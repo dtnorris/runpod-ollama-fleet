@@ -3,6 +3,7 @@
 require "minitest/autorun"
 require "tmpdir"
 require "fileutils"
+require "json"
 require_relative "../lib/local_model_evaluation/runpod_budget"
 require_relative "../lib/local_model_evaluation/runpod_budget_guardian"
 
@@ -205,6 +206,21 @@ class RunpodBudgetGuardianTest < Minitest::Test
       build_guardian(provider: broken).provider_probe!
     end
     assert_includes error.message, "provider probe failed"
+  end
+
+  def test_runtime_evidence_carries_exact_budget_identity
+    path = File.join(@tmp, "runtime.json")
+    build_guardian.send(
+      :write_runtime,
+      path,
+      "ready" => true,
+      "pid" => Process.pid,
+      "state" => "WAITING_FOR_ARM"
+    )
+
+    runtime = JSON.parse(File.read(path))
+    assert_equal "batch034", runtime.fetch("budget_id")
+    assert_equal PLAN, runtime.fetch("plan_sha256")
   end
 
   private

@@ -29,6 +29,8 @@ class CampaignLifecycleTest < Minitest::Test
 
     def status(budget:)
       {
+        "budget_id" => budget.budget_id,
+        "plan_sha256" => budget.plan_sha256,
         "enabled" => healthy, "launchd_loaded" => healthy, "ready" => healthy,
         "pid" => Process.pid + 1, "provider_probe_at_utc" => @clock.call.iso8601,
         "ledger_heartbeat_at_utc" => @clock.call.iso8601,

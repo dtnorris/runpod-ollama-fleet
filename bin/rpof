@@ -90,8 +90,9 @@ else
         TEARDOWN REQUEST. The guardian owns continued teardown. Success is not
         complete until campaign status reports CLOSED with provider absence verified.
       create, fulfill, scale, replace
-        RESOURCE MUTATION. Ctrl-C interrupts only the requesting CLI and is not
-        rollback or teardown; provider resources and detached watchdogs may remain.
+        MANUAL RESOURCE MUTATION. Automated --yes paid forms are blocked; use
+        campaign start for production automation. Ctrl-C is not rollback or teardown;
+        provider resources and detached compatibility watchdogs may remain.
       destroy, shutdown
         TEARDOWN REQUEST. Ctrl-C does not prove provider absence; inspect status
         and repeat the explicit teardown command when necessary.

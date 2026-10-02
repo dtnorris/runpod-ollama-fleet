@@ -856,8 +856,9 @@ module LocalModelEvaluation
 
     def positive_float(value, label, allow_zero: false)
       number = Float(value)
-      valid = allow_zero ? number >= 0 : number.positive?
-      raise Error, "#{label} must be #{allow_zero ? 'non-negative' : 'positive'}" unless valid
+      valid = number.finite? && (allow_zero ? number >= 0 : number.positive?)
+      requirement = allow_zero ? "non-negative and finite" : "positive and finite"
+      raise Error, "#{label} must be #{requirement}" unless valid
 
       number
     rescue ArgumentError, TypeError

@@ -158,6 +158,19 @@ when "create"
   opts = create_options(ARGV)
   fleet_key = selected_fleet_key
   begin
+    unless opts[:dry_run]
+      LocalModelEvaluation::RunpodDirectPaidSafety.assert_not_automated!(
+        operation: "create", assume_yes: opts[:yes], dry_run: opts[:dry_run]
+      )
+      LocalModelEvaluation::RunpodDirectPaidSafety.assert_complete_manual_lease!(
+        operation: "create",
+        lease: {
+          "max_runtime_seconds" => opts[:max_runtime_seconds],
+          "max_spend_usd" => opts[:max_spend_usd]
+        },
+        dry_run: opts[:dry_run]
+      )
+    end
     namespace = namespace_for(fleet_key, provisional: true)
     fleet = fleet_for(namespace:)
     fleet.gpu_id = opts[:gpu_id]
@@ -254,6 +267,7 @@ when "create"
     warn "ERROR: aggregate managed RunPod hourly safety cap must be a positive number"
     exit 1
   rescue LocalModelEvaluation::RunpodClient::Error, LocalModelEvaluation::RunpodFleet::Error,
+         LocalModelEvaluation::RunpodDirectPaidSafety::Error,
          LocalModelEvaluation::RunpodFleetNamespace::Error => e
     warn "ERROR: #{e.message}"
     exit 1

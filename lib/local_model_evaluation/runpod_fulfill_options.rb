@@ -37,12 +37,28 @@ module LocalModelEvaluation
               "parent burst budget derives the child fleet runtime/spend lease; " \
               "do not combine budget options with --max-runtime-minutes or --max-spend-usd"
       end
-      if opts[:yes] && !opts[:dry_run] && supplied_budget_keys.empty?
+      if opts[:yes] && !opts[:dry_run]
+        raise OptionParser::InvalidArgument,
+              "automated direct paid fulfillment is blocked; use an authorized campaign start with its safety gate"
+      end
+      if !opts[:dry_run] && supplied_budget_keys.empty? &&
+         (!opts[:max_runtime_seconds] || !opts[:max_spend_usd])
         raise OptionParser::MissingArgument,
-              "parent burst budget options are required for non-interactive paid fulfillment"
+              "direct paid fulfillment requires both --max-runtime-minutes and --max-spend-usd"
+      end
+      if !opts[:dry_run] && supplied_budget_keys.empty?
+        %i[max_runtime_seconds max_spend_usd].each do |key|
+          number = Float(opts.fetch(key))
+          unless number.positive? && number.finite?
+            raise OptionParser::InvalidArgument,
+                  "direct paid fulfillment #{key} must be positive and finite"
+          end
+        end
       end
 
       true
+    rescue ArgumentError, TypeError
+      raise OptionParser::InvalidArgument, "direct paid fulfillment lease bounds must be positive and finite"
     end
   end
 end
