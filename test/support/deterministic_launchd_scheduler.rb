@@ -90,7 +90,7 @@ class DeterministicLaunchdScheduler
         rescue StandardError => e
           response = result("", e.message, 1)
         end
-        File.write(response_path, JSON.generate(response) + "\n")
+        write_json_atomic(response_path, response)
         File.delete(request_path) if File.file?(request_path)
       end
       sleep 0.002
@@ -107,6 +107,14 @@ class DeterministicLaunchdScheduler
       end
       sleep 0.005
     end
+  end
+
+  def write_json_atomic(path, document)
+    temporary = "#{path}.tmp.#{Process.pid}.#{Thread.current.object_id}"
+    File.write(temporary, JSON.generate(document) + "\n")
+    File.rename(temporary, path)
+  ensure
+    File.delete(temporary) if defined?(temporary) && temporary && File.exist?(temporary)
   end
 
   def handle_command(argv)
