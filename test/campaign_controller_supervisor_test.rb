@@ -5,7 +5,7 @@ require "json"
 require_relative "../lib/runpod_ollama_fleet"
 
 class CampaignControllerSupervisorTest < Minitest::Test
-  Campaign = Struct.new(:identity_sha256)
+  Campaign = Struct.new(:identity_sha256, :profiles, :hardware_bindings)
   Binding = Struct.new(:state_path, :binding_sha256, :campaign, :declaration)
 
   def setup
@@ -16,10 +16,13 @@ class CampaignControllerSupervisorTest < Minitest::Test
     @campaign_path = artifact("campaign.json")
     @budget_path = artifact("budget.json")
     @hardware_path = artifact("hardware.yml")
+    @requirement_path = File.join(@tmp, "model-requirement.json")
+    File.write(@requirement_path, JSON.generate(model_requirement_document))
     binding_dir = File.join(@tmp, "campaign-budgets", "binding")
     FileUtils.mkdir_p(binding_dir)
     @binding = Binding.new(
-      File.join(binding_dir, "binding.json"), "b" * 64, Campaign.new("a" * 64),
+      File.join(binding_dir, "binding.json"), "b" * 64,
+      Campaign.new("a" * 64, [profile], [hardware_binding]),
       { "budget_id" => "budget-1", "orchestrator_heartbeat_timeout_seconds" => 30.0 }
     )
     @loaded = false
@@ -76,6 +79,36 @@ class CampaignControllerSupervisorTest < Minitest::Test
     assert @commands.any? { |argv| argv.include?("bootout") }
   end
 
+  def test_request_binds_exact_model_requirement_artifact_and_fingerprint
+    supervisor = build_supervisor
+    supervisor.ensure_running!(
+      binding: @binding, ssh_public_key_path: "fixture.pub", heartbeat_timeout_seconds: 30
+    )
+
+    request = JSON.parse(File.binread(controller_path("request.json")))
+    row = request.fetch("model_requirements").fetch(0)
+    requirement = RunpodOllamaFleet::ModelRequirement.load(@requirement_path)
+    assert_equal RunpodOllamaFleet::CampaignControllerSupervisor::REQUEST_CONTRACT_VERSION,
+                 request.fetch("contract_version")
+    assert_equal "profile-1", row.fetch("profile_id")
+    assert_equal Digest::SHA256.file(@requirement_path).hexdigest, row.fetch("artifact_sha256")
+    assert_equal requirement.fingerprint, row.fetch("requirement_sha256")
+  end
+
+  def test_requirement_validation_fails_before_controller_launch
+    File.write(@requirement_path, JSON.generate(model_requirement_document.merge(
+      "ollama" => model_requirement_document.fetch("ollama").merge("expected_digest" => "d" * 64)
+    )))
+    supervisor = build_supervisor
+
+    error = assert_raises(RunpodOllamaFleet::CampaignControllerSupervisor::Error) do
+      supervisor.validate_requirements!(binding: @binding)
+    end
+
+    assert_includes error.message, "expected_digest mismatch"
+    assert_empty @commands
+  end
+
   private
 
   def artifact(name)
@@ -113,8 +146,43 @@ class CampaignControllerSupervisorTest < Minitest::Test
     RunpodOllamaFleet::CampaignControllerSupervisor.new(
       root: @tmp, repo_root: @repo, campaign_path: @campaign_path,
       budget_path: @budget_path, hardware_path: @hardware_path,
+      model_requirement_paths: { "profile-1" => @requirement_path },
       command_runner: runner, sleeper: ->(*) {}, monotonic_clock: -> { 0 },
       wall_clock: -> { @now }, platform: "arm64-darwin"
     )
+  end
+
+  def profile
+    {
+      "profile_id" => "profile-1",
+      "model" => "qualified-model:latest",
+      "expected_digest" => "c" * 64,
+      "required_context_length" => 131_072,
+      "require_fully_gpu_resident" => true
+    }
+  end
+
+  def hardware_binding
+    { "profile_id" => "profile-1", "qualified_gpu_ids" => ["NVIDIA A40"] }
+  end
+
+  def model_requirement_document
+    {
+      "contract_version" => "adventurefinder-model-requirement/v0.1",
+      "batch_handle" => "39",
+      "production_batch_id" => "production-batch-039",
+      "plan_id" => "production-batch-039",
+      "plan_sha256" => "e" * 64,
+      "alias" => "qualified",
+      "pool_id" => "profile-1",
+      "required_labels" => ["inference"],
+      "ollama" => {
+        "model" => "qualified-model:latest",
+        "expected_digest" => "c" * 64,
+        "required_context_length" => 131_072,
+        "require_fully_gpu_resident" => true,
+        "required_gpu_id" => "NVIDIA A40"
+      }
+    }
   end
 end

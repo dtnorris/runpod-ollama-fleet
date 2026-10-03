@@ -83,6 +83,8 @@ class RunpodTunnelsTest < Minitest::Test
         {
           "index" => i,
           "pod_id" => "pod_#{i}",
+          "worker_id" => "worker-#{i}",
+          "generation_id" => "generation-#{i}-1",
           "host" => "198.51.100.#{i}",
           "ssh_port" => 22_000 + i,
           "local_ollama_url" => "http://127.0.0.1:#{11_440 + i}",
@@ -147,6 +149,8 @@ class RunpodTunnelsTest < Minitest::Test
     @fleet.fetch("workers") << {
       "index" => 12,
       "pod_id" => "pod_12",
+      "worker_id" => "worker-12",
+      "generation_id" => "generation-12-1",
       "host" => "198.51.100.12",
       "ssh_port" => 22_012,
       "local_ollama_url" => "http://127.0.0.1:11452",
@@ -279,5 +283,45 @@ class RunpodTunnelsTest < Minitest::Test
     rows = build_manager.status(worker_indices: [1])
     assert_equal "missing", rows.first.fetch("process_status")
     assert_equal "missing", rows.first.fetch("health_status")
+  end
+
+  def test_start_replaces_live_tunnel_from_superseded_worker_generation
+    manager = build_manager
+    first = manager.start(worker_indices: [1], wait_seconds: 1, poll_seconds: 0.01)
+    first_pid = first.fetch("workers").first.fetch("pid")
+    @fleet.fetch("workers").first.merge!(
+      "pod_id" => "replacement-pod",
+      "generation_id" => "generation-1-2"
+    )
+
+    second = manager.start(worker_indices: [1], wait_seconds: 1, poll_seconds: 0.01)
+    row = second.fetch("workers").first
+
+    assert_equal [[first_pid, 3.0]], @process.terminated
+    assert_equal 2, @process.spawns.length
+    assert_equal "replacement-pod", row.fetch("pod_id")
+    assert_equal "worker-1", row.fetch("worker_id")
+    assert_equal "generation-1-2", row.fetch("generation_id")
+    assert_equal "healthy", row.fetch("health_status")
+  end
+
+  def test_start_refuses_to_replace_superseded_tunnel_when_pid_identity_is_ambiguous
+    manager = build_manager
+    first = manager.start(worker_indices: [1], wait_seconds: 1, poll_seconds: 0.01)
+    first_pid = first.fetch("workers").first.fetch("pid")
+    @process.mismatch(first_pid)
+    @fleet.fetch("workers").first.merge!(
+      "pod_id" => "replacement-pod",
+      "generation_id" => "generation-1-2"
+    )
+
+    error = assert_raises(LocalModelEvaluation::RunpodTunnels::Error) do
+      manager.start(worker_indices: [1], wait_seconds: 1, poll_seconds: 0.01)
+    end
+
+    assert_includes error.message, "stale-generation tunnel replacement"
+    assert_equal 1, @process.spawns.length
+    assert_empty @process.terminated
+    assert @process.alive?(first_pid)
   end
 end

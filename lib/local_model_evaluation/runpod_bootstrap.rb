@@ -159,6 +159,10 @@ module LocalModelEvaluation
       children = {}
       begin
         workers.each do |worker|
+          worker_record = worker_record(record, worker.fetch("index"))
+          worker_record["status"] = "launching"
+          worker_record["started_at_utc"] = utc_now.iso8601
+          write_record(record_path, record)
           child = spawn_worker(
             worker:,
             models:,
@@ -175,10 +179,10 @@ module LocalModelEvaluation
             run_dir:
           )
           children[worker.fetch("index")] = child
-          worker_record = worker_record(record, worker.fetch("index"))
           worker_record["pid"] = child.fetch(:pid)
+          worker_record["process_identity"] = child.fetch(:process_identity)
           worker_record["status"] = "running"
-          worker_record["started_at_utc"] = utc_now.iso8601
+          write_record(record_path, record)
           @out.puts format(
             "Starting %s bootstrap on burst_%d (%s:%d)...",
             models.join(", "),
@@ -197,7 +201,7 @@ module LocalModelEvaluation
         record["error"] = "launcher error: #{e.message}"
         record["finished_at_utc"] = utc_now.iso8601
         record.fetch("workers").each do |worker|
-          next unless worker["status"] == "running"
+          next unless %w[launching running].include?(worker["status"])
 
           worker["status"] = "aborted"
           worker["finished_at_utc"] = record["finished_at_utc"]
@@ -383,7 +387,8 @@ module LocalModelEvaluation
 
       log = @store.open_worker_log(run_dir:, worker_index: index)
       pid = @process_supervisor.spawn(command:, chdir: @repo_root, output: log.io)
-      { pid:, log_path: log.path }
+      process_identity = @process_supervisor.process_identity(pid:, command:)
+      { pid:, process_identity:, log_path: log.path }
     ensure
       @store.close_worker_log(log) if defined?(log) && log
     end
@@ -596,7 +601,7 @@ module LocalModelEvaluation
       record["status"] = "interrupted"
       record["finished_at_utc"] = timestamp
       record.fetch("workers").each do |worker|
-        next unless worker["status"] == "running"
+        next unless %w[launching running].include?(worker["status"])
 
         worker["status"] = "interrupted"
         worker["finished_at_utc"] = timestamp
@@ -652,13 +657,17 @@ module LocalModelEvaluation
           {
             "index" => worker.fetch("index"),
             "pod_id" => worker.fetch("pod_id"),
+            "worker_id" => worker.fetch("worker_id"),
+            "generation_id" => worker.fetch("generation_id"),
             "host" => worker.fetch("host"),
             "ssh_port" => worker.fetch("ssh_port"),
             "expected_gpu" => expected_gpus.fetch(Integer(worker.fetch("index"))),
             "status" => "pending",
             "stage" => "PENDING",
             "progress" => nil,
+            "attempt_id" => SecureRandom.uuid,
             "pid" => nil,
+            "process_identity" => nil,
             "log" => "burst_#{worker.fetch('index')}.log",
             "started_at_utc" => nil,
             "finished_at_utc" => nil,

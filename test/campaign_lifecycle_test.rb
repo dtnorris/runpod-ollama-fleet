@@ -168,6 +168,10 @@ class CampaignLifecycleTest < Minitest::Test
       raise RunpodOllamaFleet::CampaignControllerSupervisor::Error, e.message
     end
 
+    def validate_requirements!(binding:)
+      true
+    end
+
     def reconcile!(binding:, ssh_public_key_path:)
       binding.parent_budget.heartbeat!(source: "orchestrator")
       lifecycle.reconcile_once(ssh_public_key_path:)

@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
+require "digest"
+require "json"
 require "stringio"
 require_relative "../lib/local_model_evaluation/runpod_bootstrap"
 
@@ -161,6 +163,17 @@ class RunpodBootstrapTest < Minitest::Test
       [pid, child.fetch(:status)]
     end
 
+    def process_identity(pid:, command:)
+      {
+        "pid" => pid,
+        "process_group_id" => pid,
+        "start_token" => "fake-start-#{pid}",
+        "command_sha256" => Digest::SHA256.hexdigest(JSON.generate(command))
+      }
+    end
+
+    def same_process?(identity) = @children.key?(identity.fetch("pid"))
+
     def signal_group(signal, pid)
       @signals << [signal, pid]
       child = @children[pid]
@@ -242,6 +255,8 @@ class RunpodBootstrapTest < Minitest::Test
           "index" => index,
           "name" => "af-lme-burst-#{index}",
           "pod_id" => "pod_#{index}",
+          "worker_id" => "worker-#{index}",
+          "generation_id" => "generation-#{index}-1",
           "host" => "198.51.100.#{index}",
           "ssh_port" => 22_000 + index,
           "hourly_rate_usd" => 0.44,
@@ -624,6 +639,8 @@ class RunpodBootstrapTest < Minitest::Test
       "index" => 12,
       "name" => "af-lme-burst-12",
       "pod_id" => "pod_12",
+      "worker_id" => "worker-12",
+      "generation_id" => "generation-12-1",
       "host" => "198.51.100.12",
       "ssh_port" => 22_012,
       "hourly_rate_usd" => 0.44,

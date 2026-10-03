@@ -206,6 +206,13 @@ campaign profile and hardware binding before any provider lookup or mutation. Mo
 full digest, context, residency, and optional GPU identity must match exactly; the
 human alias is retained only as provenance and is never translated by RPOF.
 
+`campaign start` requires one `--model-requirement PROFILE=FILE` binding per
+campaign profile. The supervised request binds the file SHA-256 and semantic
+requirement fingerprint across controller restarts. The generation-bound,
+durable tunnel/bootstrap/capability prerequisite is documented in
+[`docs/WORKER_BRINGUP.md`](docs/WORKER_BRINGUP.md); it intentionally stops before
+automatic provider creation and registry READY publication.
+
 ## Safety
 
 No command in `script/import-frozen-lme` or `script/verify-frozen-import` contacts RunPod or creates paid infrastructure. The imported provider helper commands retain their existing confirmations, dry-run behavior, cost caps, managed-pod deletion checks, leases, and fail-closed behavior from the frozen source.

@@ -47,6 +47,8 @@ class RpofCapabilityV02Test < Minitest::Test
           "index" => 1,
           "status" => "active",
           "pod_id" => "pod-1",
+          "worker_id" => "worker-1",
+          "generation_id" => "generation-1",
           "hourly_rate_usd" => 0.49,
           "created_at_utc" => "2026-09-16T20:00:00Z",
           "local_ollama_url" => "http://127.0.0.1:11441"
@@ -82,6 +84,8 @@ class RpofCapabilityV02Test < Minitest::Test
           "workers" => [{
             "index" => 1,
             "pod_id" => "pod-1",
+            "worker_id" => "worker-1",
+            "generation_id" => "generation-1",
             "pid" => 123,
             "endpoint" => "http://127.0.0.1:11441",
             "process_identity" => {

@@ -102,6 +102,8 @@ class CampaignSafetyGateTest < Minitest::Test
       status(binding:)
     end
 
+    def validate_requirements!(binding:) = true
+
     def status(binding:)
       { "state" => "RUNNING", "pid" => Process.pid + 1, "binding_sha256" => binding.binding_sha256 }
     end

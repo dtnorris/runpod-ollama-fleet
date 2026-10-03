@@ -166,7 +166,9 @@ module RunpodOllamaFleet
 
       evidence = Array(bootstrap.fetch("workers")).find do |candidate|
         Integer(candidate.fetch("index")) == Integer(worker.fetch("index")) &&
-          candidate.fetch("pod_id").to_s == worker.fetch("pod_id").to_s
+          candidate.fetch("pod_id").to_s == worker.fetch("pod_id").to_s &&
+          candidate.fetch("worker_id").to_s == worker.fetch("worker_id").to_s &&
+          candidate.fetch("generation_id").to_s == worker.fetch("generation_id").to_s
       rescue KeyError, ArgumentError, TypeError
         false
       end
@@ -177,6 +179,8 @@ module RunpodOllamaFleet
     def tunnel_established?(worker, tunnel)
       return false unless tunnel
       return false unless tunnel.fetch("pod_id").to_s == worker.fetch("pod_id").to_s
+      return false unless tunnel.fetch("worker_id").to_s == worker.fetch("worker_id").to_s
+      return false unless tunnel.fetch("generation_id").to_s == worker.fetch("generation_id").to_s
       return false unless valid_endpoint(tunnel.fetch("endpoint")) == valid_endpoint(worker.fetch("local_ollama_url"))
 
       pid = tunnel.fetch("pid")
@@ -231,7 +235,9 @@ module RunpodOllamaFleet
 
       evidence = Array(bootstrap.fetch("workers")).find do |candidate|
         Integer(candidate.fetch("index")) == Integer(worker.fetch("index")) &&
-          candidate.fetch("pod_id").to_s == worker.fetch("pod_id").to_s
+          candidate.fetch("pod_id").to_s == worker.fetch("pod_id").to_s &&
+          candidate.fetch("worker_id").to_s == worker.fetch("worker_id").to_s &&
+          candidate.fetch("generation_id").to_s == worker.fetch("generation_id").to_s
       rescue KeyError, ArgumentError, TypeError
         false
       end
@@ -316,6 +322,8 @@ module RunpodOllamaFleet
       tunnel = tunnels[Integer(worker.fetch("index"))]
       return "NOT_READY" unless tunnel
       return "NOT_READY" unless tunnel.fetch("pod_id").to_s == pod_id
+      return "NOT_READY" unless tunnel.fetch("worker_id").to_s == worker.fetch("worker_id").to_s
+      return "NOT_READY" unless tunnel.fetch("generation_id").to_s == worker.fetch("generation_id").to_s
       return "NOT_READY" unless valid_endpoint(tunnel.fetch("endpoint")) == endpoint
 
       pid = tunnel.fetch("pid")

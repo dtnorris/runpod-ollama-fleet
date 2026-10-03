@@ -247,6 +247,8 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
       "index" => 2,
       "name" => "burst-2",
       "pod_id" => "pod-2",
+      "worker_id" => "state-worker-2",
+      "generation_id" => "state-generation-2-1",
       "local_ollama_url" => "http://127.0.0.1:11442"
     )
     @fleet.fetch("workers").unshift(worker_two)
@@ -409,6 +411,8 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
         "index" => 1,
         "name" => "burst-1",
         "pod_id" => "pod-1",
+        "worker_id" => "state-worker-1",
+        "generation_id" => "state-generation-1-1",
         "generation" => 1,
         "created_at_utc" => "2026-09-29T17:55:00Z",
         "status" => "active",
@@ -432,9 +436,12 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
   end
 
   def bootstrap_worker(index: 1, pod_id: "pod-1")
+    worker = @fleet.fetch("workers").find { |candidate| candidate.fetch("index") == index }
     {
       "index" => index,
       "pod_id" => pod_id,
+      "worker_id" => worker.fetch("worker_id"),
+      "generation_id" => worker.fetch("generation_id"),
       "status" => "passed",
       "provenance_error" => nil,
       "provenance" => {
@@ -479,9 +486,12 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
   end
 
   def tunnel_worker(index: 1, pod_id: "pod-1", endpoint: "http://127.0.0.1:11441")
+    worker = @fleet.fetch("workers").find { |candidate| candidate.fetch("index") == index }
     {
       "index" => index,
       "pod_id" => pod_id,
+      "worker_id" => worker.fetch("worker_id"),
+      "generation_id" => worker.fetch("generation_id"),
       "pid" => 123,
       "endpoint" => endpoint,
       "process_identity" => {

@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "digest"
 require "json"
 
 module RunpodOllamaFleet
@@ -50,6 +51,10 @@ module RunpodOllamaFleet
 
     def required_gpu_id
       ollama["required_gpu_id"]
+    end
+
+    def fingerprint
+      Digest::SHA256.hexdigest(JSON.generate(document))
     end
 
     private

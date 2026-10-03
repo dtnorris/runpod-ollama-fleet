@@ -68,6 +68,8 @@ class RunpodBootstrapIntegrationTest < Minitest::Test
           "index" => 1,
           "name" => "af-lme-burst-1",
           "pod_id" => "pod_1",
+          "worker_id" => "worker-1",
+          "generation_id" => "generation-1-1",
           "host" => "198.51.100.1",
           "ssh_port" => 22_001,
           "hourly_rate_usd" => 0.44,

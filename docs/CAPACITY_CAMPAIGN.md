@@ -39,6 +39,14 @@ admission path. The independent guardian continues enforcing the original
 authority and owns teardown; it never creates replacement capacity. WLO remains
 only a consumer of published READY workers.
 
+Start also requires one exact AdventureFinder model-requirement artifact for
+every campaign profile. The supervised request binds each artifact's bytes and
+semantic fingerprint so a restarted controller cannot reinterpret aliases or
+adopt bring-up evidence for a different requirement. See
+[`WORKER_BRINGUP.md`](WORKER_BRINGUP.md) for the generation-bound resumable seam;
+full automatic bring-up and READY publication are deliberately not part of this
+campaign contract yet.
+
 The controller reads the current identity-bound `rpof-desired-capacity/v0.1`
 revision on every reconciliation pass. Revision zero preserves the immutable
 campaign declaration's desired counts. `campaign desired-set` changes only that

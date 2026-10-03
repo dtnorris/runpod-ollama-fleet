@@ -42,6 +42,7 @@ class RpofCapabilityCheckTest < Minitest::Test
         "fleet_hourly_rate_usd" => 0.44,
         "workers" => [{
           "index" => 1, "status" => "active", "pod_id" => "pod-1",
+          "worker_id" => "worker-1", "generation_id" => "generation-1",
           "hourly_rate_usd" => 0.44, "created_at_utc" => "2026-09-14T12:00:00Z",
           "local_ollama_url" => "http://127.0.0.1:11441"
         }]
@@ -55,6 +56,7 @@ class RpofCapabilityCheckTest < Minitest::Test
         "fleet_id" => fleet.fetch("fleet_id"), "status" => "interrupted", "context" => 32_768,
         "workers" => [{
           "index" => 1, "pod_id" => "pod-1", "status" => "passed",
+          "worker_id" => "worker-1", "generation_id" => "generation-1",
           "provenance" => {
             "gpu" => { "name" => "NVIDIA A40" },
             "models" => { "fixture-model" => {
@@ -71,6 +73,7 @@ class RpofCapabilityCheckTest < Minitest::Test
         "fleet_id" => fleet.fetch("fleet_id"), "status" => "running", "context" => 32_768,
         "workers" => [{
           "index" => 2, "pod_id" => "other-pod", "status" => "running",
+          "worker_id" => "worker-2", "generation_id" => "generation-2",
           "provenance" => nil
         }]
       }) + "\n")
@@ -80,6 +83,7 @@ class RpofCapabilityCheckTest < Minitest::Test
         "fleet_id" => fleet.fetch("fleet_id"),
         "workers" => [{
           "index" => 1, "pod_id" => "pod-1", "pid" => 123,
+          "worker_id" => "worker-1", "generation_id" => "generation-1",
           "endpoint" => "http://127.0.0.1:11441",
           "process_identity" => { "forward" => "fixture", "ssh_port" => 22001, "target" => "root@fixture" }
         }]
@@ -159,7 +163,43 @@ class RpofCapabilityCheckTest < Minitest::Test
     end
   end
 
+  def test_rejects_tunnel_from_wrong_worker_or_generation_identity
+    Dir.mktmpdir("rpof-capability-tunnel-generation-") do |root|
+      state = mixed_gpu_state(root)
+      tunnel_path = File.join(
+        state.artifact_dir(state.current.fetch("fleet_id"), "tunnels"),
+        "tunnels.json"
+      )
+      request = mixed_gpu_request
+      request.fetch("worker_selector")["indices"] = [1]
+      checker = RunpodOllamaFleet::CapabilityCheck.new(
+        fleet_state: state, fleet_key: "default", process_adapter: FakeProcess.new,
+        health_checker: FakeHealth.new, wall_clock: -> { Time.utc(2026, 9, 14, 12, 5, 0) }
+      )
+
+      tunnels = JSON.parse(File.binread(tunnel_path))
+      tunnels.fetch("workers").first["worker_id"] = "wrong-worker"
+      File.write(tunnel_path, JSON.pretty_generate(tunnels) + "\n")
+      worker_result = checker.check(request)
+      refute worker_result.fetch("ready")
+      assert_includes tunnel_detail(worker_result), "worker identity mismatch"
+
+      tunnels.fetch("workers").first.merge!(
+        "worker_id" => "worker-1",
+        "generation_id" => "wrong-generation"
+      )
+      File.write(tunnel_path, JSON.pretty_generate(tunnels) + "\n")
+      generation_result = checker.check(request)
+      refute generation_result.fetch("ready")
+      assert_includes tunnel_detail(generation_result), "generation identity mismatch"
+    end
+  end
+
   private
+
+  def tunnel_detail(result)
+    result.fetch("diagnostics").find { |row| row.fetch("code") == "tunnels.healthy" }.fetch("detail")
+  end
 
   def mixed_gpu_state(root)
     fleet = {
@@ -172,11 +212,13 @@ class RpofCapabilityCheckTest < Minitest::Test
       "workers" => [
         {
           "index" => 1, "status" => "active", "pod_id" => "pod-1",
+          "worker_id" => "worker-1", "generation_id" => "generation-1",
           "hourly_rate_usd" => 0.44, "created_at_utc" => "2026-09-14T12:00:00Z",
           "local_ollama_url" => "http://127.0.0.1:11441"
         },
         {
           "index" => 2, "status" => "active", "pod_id" => "pod-2",
+          "worker_id" => "worker-2", "generation_id" => "generation-2",
           "gpu_id" => "NVIDIA RTX A6000",
           "hourly_rate_usd" => 0.60, "created_at_utc" => "2026-09-14T12:00:00Z",
           "local_ollama_url" => "http://127.0.0.1:11442"
@@ -203,6 +245,7 @@ class RpofCapabilityCheckTest < Minitest::Test
       "workers" => [1, 2].map do |index|
         {
           "index" => index, "pod_id" => "pod-#{index}", "pid" => 120 + index,
+          "worker_id" => "worker-#{index}", "generation_id" => "generation-#{index}",
           "endpoint" => "http://127.0.0.1:#{11_440 + index}",
           "process_identity" => {
             "forward" => "fixture-#{index}", "ssh_port" => 22_000 + index, "target" => "root@fixture-#{index}"
@@ -217,6 +260,8 @@ class RpofCapabilityCheckTest < Minitest::Test
     {
       "index" => index,
       "pod_id" => "pod-#{index}",
+      "worker_id" => "worker-#{index}",
+      "generation_id" => "generation-#{index}",
       "status" => "passed",
       "provenance" => {
         "gpu" => { "name" => gpu_id },

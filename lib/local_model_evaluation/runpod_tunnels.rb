@@ -154,6 +154,20 @@ module LocalModelEvaluation
           workers.each do |worker|
             index = worker.fetch("index")
             existing = state_worker(state, index)
+            if existing && !same_worker_generation?(existing, worker)
+              if existing["pid"] && @process.alive?(existing["pid"])
+                unless @process.matches?(existing["pid"], existing.fetch("process_identity"))
+                  failures << "burst_#{index}: refusing stale-generation tunnel replacement because managed pid identity does not match"
+                  existing["process_status"] = "mismatch"
+                  existing["health_status"] = "unknown"
+                  next
+                end
+                @process.terminate_group(existing.fetch("pid"), grace_seconds: TERMINATION_GRACE_SECONDS)
+              end
+              mark_generation_stale(existing, worker)
+              existing = nil
+              write_state(root, state)
+            end
             if existing && existing["pid"] && @process.alive?(existing["pid"])
               unless @process.matches?(existing["pid"], existing.fetch("process_identity"))
                 failures << "burst_#{index}: managed pid #{existing['pid']} no longer matches recorded SSH tunnel identity"
@@ -497,6 +511,8 @@ module LocalModelEvaluation
       {
         "index" => Integer(worker.fetch("index")),
         "pod_id" => worker.fetch("pod_id").to_s,
+        "worker_id" => worker.fetch("worker_id").to_s,
+        "generation_id" => worker.fetch("generation_id").to_s,
         "pid" => Integer(pid),
         "process_status" => "starting",
         "health_status" => "pending",
@@ -534,6 +550,10 @@ module LocalModelEvaluation
       end
 
       pid = record["pid"]
+      unless same_worker_generation?(record, worker)
+        mark_generation_stale(record, worker)
+        return status_row(record)
+      end
       unless pid && @process.alive?(pid)
         mark_stale(record)
         return status_row(record)
@@ -555,6 +575,9 @@ module LocalModelEvaluation
     def status_row(record)
       {
         "index" => Integer(record.fetch("index")),
+        "pod_id" => record["pod_id"],
+        "worker_id" => record["worker_id"],
+        "generation_id" => record["generation_id"],
         "pid" => record["pid"],
         "process_status" => record.fetch("process_status"),
         "health_status" => record.fetch("health_status"),
@@ -578,6 +601,23 @@ module LocalModelEvaluation
       record["health_status"] = "unhealthy"
       record["last_health_at_utc"] = utc_now.iso8601
       record["last_health_detail"] = "recorded tunnel pid is not running"
+    end
+
+    def mark_generation_stale(record, worker)
+      record["process_status"] = "stale_generation"
+      record["health_status"] = "unknown"
+      record["last_health_at_utc"] = utc_now.iso8601
+      record["last_health_detail"] =
+        "retained tunnel belongs to #{record['generation_id'] || record['pod_id'] || 'unknown generation'}, " \
+        "not #{worker['generation_id'] || worker['pod_id']}"
+    end
+
+    def same_worker_generation?(record, worker)
+      record["pod_id"].to_s == worker.fetch("pod_id").to_s &&
+        record["worker_id"].to_s == worker.fetch("worker_id").to_s &&
+        record["generation_id"].to_s == worker.fetch("generation_id").to_s
+    rescue KeyError
+      false
     end
 
     def stop_record(record, force_identity: false)

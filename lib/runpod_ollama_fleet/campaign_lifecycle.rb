@@ -70,6 +70,11 @@ module RunpodOllamaFleet
         raise Error, "campaign is closed and cannot be restarted under the same binding"
       end
 
+      unless @controller_supervisor
+        raise Error, "authorized campaign start requires a continuing controller supervisor"
+      end
+      @controller_supervisor.validate_requirements!(binding: @binding)
+
       @binding.bind!
       authority = reusable_authority(existing) || @binding.arm!
       verify_started_authority!(authority)
@@ -79,9 +84,6 @@ module RunpodOllamaFleet
         projected_hourly_rate_usd: prepared.fetch("projected_hourly_rate_usd")
       )
       safety_reporter&.call(safety_report)
-      unless @controller_supervisor
-        raise Error, "authorized campaign start requires a continuing controller supervisor"
-      end
       controller = @controller_supervisor.ensure_running!(
         binding: @binding,
         ssh_public_key_path: ssh_public_key_path,

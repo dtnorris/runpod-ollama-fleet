@@ -75,6 +75,15 @@ class ModelRequirementTest < Minitest::Test
     assert_equal "whatever-the-operator-typed", requirement.document.fetch("alias")
   end
 
+  def test_fingerprint_is_stable_and_covers_the_exact_requirement
+    requirement = RunpodOllamaFleet::ModelRequirement.new(document)
+    changed = RunpodOllamaFleet::ModelRequirement.new(document.merge("alias" => "another-alias"))
+
+    assert_match(/\A[0-9a-f]{64}\z/, requirement.fingerprint)
+    assert_equal requirement.fingerprint, RunpodOllamaFleet::ModelRequirement.new(document).fingerprint
+    refute_equal requirement.fingerprint, changed.fingerprint
+  end
+
   private
 
   def document

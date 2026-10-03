@@ -2,6 +2,7 @@
 
 require "minitest/autorun"
 require "minitest/mock"
+require "stringio"
 require "tmpdir"
 require_relative "../lib/local_model_evaluation/process_supervisor"
 
@@ -97,6 +98,62 @@ class ProcessSupervisorTest < Minitest::Test
       supervisor&.signal_group("KILL", pid) if defined?(pid) && pid
       supervisor&.wait(pid) if defined?(pid) && pid
       log&.close unless log&.closed?
+    end
+  end
+
+  def test_process_identity_uses_pid_group_and_start_token
+    supervisor = LocalModelEvaluation::ProcessSupervisor.new
+    command = ["/bin/sleep", "30"]
+    Process.stub(:getpgid, 12_345) do
+      supervisor.stub(:process_start_token, "proc:987654") do
+        identity = supervisor.process_identity(pid: 12_345, command:)
+
+        assert_equal 12_345, identity.fetch("pid")
+        assert_equal 12_345, identity.fetch("process_group_id")
+        assert_match(/\A[0-9a-f]{64}\z/, identity.fetch("command_sha256"))
+        assert supervisor.same_process?(identity)
+        refute supervisor.same_process?(identity.merge("start_token" => "different-start"))
+      end
+    end
+  end
+
+  def test_process_identity_falls_back_fail_closed_when_process_already_vanished
+    supervisor = LocalModelEvaluation::ProcessSupervisor.new
+    Process.stub(:getpgid, ->(*) { raise Errno::ESRCH }) do
+      identity = supervisor.process_identity(pid: 12_345, command: ["worker", "arg"])
+
+      assert_equal 12_345, identity.fetch("process_group_id")
+      assert_match(/\Aexited-before-capture:/, identity.fetch("start_token"))
+      refute supervisor.same_process?(identity)
+    end
+  end
+
+  def test_same_process_rejects_empty_and_malformed_identity
+    supervisor = LocalModelEvaluation::ProcessSupervisor.new
+
+    refute supervisor.same_process?("pid" => 1, "process_group_id" => 1, "start_token" => "")
+    refute supervisor.same_process?({})
+  end
+
+  def test_linux_process_start_token_uses_proc_stat_start_time
+    supervisor = LocalModelEvaluation::ProcessSupervisor.new
+    stat = "123 (worker name) S #{Array.new(18, "0").join(' ')} 987654 0"
+
+    File.stub(:file?, true) do
+      File.stub(:binread, stat) do
+        assert_equal "proc:987654", supervisor.send(:process_start_token, 123)
+      end
+    end
+  end
+
+  def test_non_proc_process_start_token_uses_ps_start_time
+    supervisor = LocalModelEvaluation::ProcessSupervisor.new
+    stream = StringIO.new("Mon Jan  1 00:00:00 2030\n")
+
+    File.stub(:file?, false) do
+      IO.stub(:popen, ->(*_args, &block) { block.call(stream) }) do
+        assert_equal "ps:Mon Jan  1 00:00:00 2030", supervisor.send(:process_start_token, 123)
+      end
     end
   end
 end

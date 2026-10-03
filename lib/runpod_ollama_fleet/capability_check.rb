@@ -225,6 +225,8 @@ module RunpodOllamaFleet
         next unless boot
         next unless boot["status"] == "passed"
         next unless boot["pod_id"].to_s == pod_id
+        next unless boot["worker_id"].to_s == worker.fetch("worker_id").to_s
+        next unless boot["generation_id"].to_s == worker.fetch("generation_id").to_s
 
         provenance = boot.fetch("provenance", {})
         next unless provenance.dig("gpu", "name").to_s == expected_gpu
@@ -328,6 +330,10 @@ module RunpodOllamaFleet
         row = by_index[index]
         next "burst_#{index}: tunnel record missing" unless row
         next "burst_#{index}: tunnel pod identity mismatch" unless row["pod_id"].to_s == worker["pod_id"].to_s
+        next "burst_#{index}: tunnel worker identity mismatch" unless row["worker_id"].to_s == worker["worker_id"].to_s
+        unless row["generation_id"].to_s == worker["generation_id"].to_s
+          next "burst_#{index}: tunnel generation identity mismatch"
+        end
         pid = row["pid"]
         next "burst_#{index}: tunnel pid missing" unless pid && @process.alive?(pid)
         next "burst_#{index}: tunnel process identity mismatch" unless @process.matches?(pid, row.fetch("process_identity"))
