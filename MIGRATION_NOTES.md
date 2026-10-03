@@ -1,4 +1,7 @@
-# Step 4 migration notes
+# Historical extraction and completed migration notes
+
+This file records the original repository extraction. It is not an active
+implementation plan or an operator workflow.
 
 ## Included
 
@@ -20,6 +23,11 @@ The seed does not copy:
 
 Changing `LocalModelEvaluation::*` class names while also moving repository ownership would mix topology change with implementation rename. v0.1 explicitly treats these historical names as migration compatibility. Namespace cleanup can happen only after behavior and bridge evidence are green.
 
-## Next bridge step
+## Completed bridge state
 
-After this repo passes its extracted deterministic suite, implement the frozen AFIO-facing `capability-check` and `dispatch` contracts and then replace LME provider implementations with thin CLI/file-contract shims. Only after that cutover is proven should duplicated provider code be removed from LME.
+The read-only capability seam is implemented. Workload `dispatch`, dispatch
+admission/close, legacy dispatch, and execution-pool fulfillment were later
+retired by DW-33. Their frozen validators remain for audit only. Current RPOF
+owns capacity campaigns and publishes `dynamic-worker-registry/v0.1`; WLO
+selects workers and executes jobs. Do not implement or restore the superseded
+dispatch step described by the original extraction plan.

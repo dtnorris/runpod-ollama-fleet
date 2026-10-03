@@ -2,15 +2,16 @@
 
 RPOF's existing per-fleet lease remains the final hard breaker. Runtime cost
 controls add a second, opt-in layer for graceful draining, ephemeral-worker
-reaping, aggregate dispatch admission, and cost visibility.
+reaping, aggregate provisioning limits, and cost visibility.
 
 Nothing changes until `bin/rpof cost enable` is run.
 
 ## Recommended production pattern
 
 For a manually administered or historically managed fleet, soft limits can
-stop RPOF's compatibility dispatch between inference requests, while hard
-limits remain the final emergency teardown. `managed` is the provider default;
+mark the fleet draining and retire it after observed inference becomes idle;
+hard limits remain the final emergency teardown. RPOF workload dispatch is
+retired. `managed` is the provider default;
 `persistent` disables that fleet's automatic terminal retirement. Production
 AdventureFinder execution instead uses an RPOF capacity campaign with its
 original cumulative cap, deadline, hourly cap, worker limit and independent
@@ -28,9 +29,10 @@ bin/rpof cost configure \
 ```
 
 At a soft limit the fleet enters `draining`: already-running inference is not
-interrupted, but capability checks and dispatch stop admitting new jobs. Once
-all active workers are idle, the watchdog tears the fleet down. A hard limit
-still destroys active workers immediately.
+interrupted. Once all active workers are idle, the watchdog tears the fleet
+down. A hard limit still destroys active workers immediately. Retained
+dispatch-gate methods are internal compatibility evidence, not a current
+workload-scheduling interface.
 
 Runtime/spend thresholds are measured from the first watchdog observation of
 the current fleet generation, so applying a policy to an already-running fleet
@@ -69,9 +71,9 @@ Set the normal aggregate managed-rate ceiling and start the local watchdog:
 bin/rpof cost enable --max-total-hourly-usd 5.00 --poll-seconds 15
 ```
 
-For manual or compatibility dispatch, exceeding this runtime cap blocks new
-dispatch and drains queued dispatch work between jobs; it does not interrupt a
-request already in flight. The hard
+For manual fleet administration, the policy tightens an existing provisioning
+cap and records draining state; it does not interrupt inference already in
+flight. No public RPOF workload-dispatch command consumes this state. The hard
 per-fleet lease remains the emergency breaker. Existing `--max-runtime-minutes`
 and `--max-spend-usd` leases are still hard-stop controls; set them at or beyond
 the cost policy's hard thresholds so they do not preempt graceful drain.
