@@ -156,4 +156,15 @@ class ProcessSupervisorTest < Minitest::Test
       end
     end
   end
+
+  def test_non_proc_process_start_token_rejects_empty_ps_result
+    supervisor = LocalModelEvaluation::ProcessSupervisor.new
+    stream = StringIO.new("\n")
+
+    File.stub(:file?, false) do
+      IO.stub(:popen, ->(*_args, &block) { block.call(stream) }) do
+        assert_raises(Errno::ESRCH) { supervisor.send(:process_start_token, 123) }
+      end
+    end
+  end
 end
