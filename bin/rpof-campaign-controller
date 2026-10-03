@@ -85,6 +85,15 @@ campaign.profiles.each do |profile|
   model_requirements.fetch(profile_id).validate_profile!(profile:, hardware: qualification)
 end
 
+readiness_gate = RunpodOllamaFleet::WorkerBringupReadinessGate.new(
+  root: request.fetch("state_root"),
+  campaign_identity_sha256: campaign.identity_sha256,
+  requirements: model_requirements
+)
+registry_publisher = RunpodOllamaFleet::DynamicWorkerRegistry.new(
+  state_root: request.fetch("state_root"), repo_root:, readiness_gate:
+)
+
 api_key = ENV.fetch("RUNPOD_API_KEY")
 client = LocalModelEvaluation::RunpodClient.new(
   api_key:,
@@ -98,11 +107,12 @@ end
 runtime_factory = lambda do |profile, qualification, admission|
   RunpodOllamaFleet::CampaignRunpodRuntime.new(
     root: request.fetch("state_root"), repo_root:, profile:, hardware: qualification,
-    client:, admission:, model_requirement: model_requirements.fetch(profile.fetch("profile_id"))
+    client:, admission:, model_requirement: model_requirements.fetch(profile.fetch("profile_id")),
+    campaign_identity_sha256: campaign.identity_sha256, readiness_gate:
   )
 end
 lifecycle = RunpodOllamaFleet::CampaignLifecycle.new(
-  campaign:, binding:, runtime_factory:, price_resolver:
+  campaign:, binding:, runtime_factory:, price_resolver:, registry_publisher:
 )
 controller = RunpodOllamaFleet::CampaignController.new(
   binding:, lifecycle:, state_path: options.fetch(:runtime), enabled_path: options.fetch(:enabled),

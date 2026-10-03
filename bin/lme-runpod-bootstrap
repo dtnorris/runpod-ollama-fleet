@@ -34,7 +34,11 @@ opts = {
   heartbeat_seconds: ENV.fetch(
     "LME_RUNPOD_BOOTSTRAP_HEARTBEAT_SECONDS",
     LocalModelEvaluation::RunpodBootstrap::DEFAULT_HEARTBEAT_SECONDS
-  )
+  ),
+  local_state_root: File.join(ROOT, "output", "runpod-fleets"),
+  bringup_identity_sha256: nil,
+  bringup_attempt_id: nil,
+  model_requirement_sha256: nil
 }
 
 parser = OptionParser.new do |o|
@@ -52,6 +56,10 @@ parser = OptionParser.new do |o|
   o.on("--context N", Integer, "Ollama context length; remote default is 131072") { |v| opts[:context] = v }
   o.on("--pull-timeout-seconds N", Integer, "Per-model ollama pull timeout in seconds (default: 360)") { |v| opts[:pull_timeout_seconds] = v }
   o.on("--heartbeat-seconds N", Float, "Fleet heartbeat interval (default: 10)") { |v| opts[:heartbeat_seconds] = v }
+  o.on("--local-state-root DIR", "Local durable fleet-state root") { |v| opts[:local_state_root] = File.expand_path(v) }
+  o.on("--bringup-identity SHA256", "Generation-bound bring-up identity") { |v| opts[:bringup_identity_sha256] = v }
+  o.on("--bringup-attempt ID", "Generation-bound bring-up attempt identity") { |v| opts[:bringup_attempt_id] = v }
+  o.on("--model-requirement SHA256", "Exact model-requirement fingerprint") { |v| opts[:model_requirement_sha256] = v }
 end
 
 begin
@@ -65,7 +73,7 @@ end
 
 begin
   namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
-    root: File.join(ROOT, "output", "runpod-fleets"),
+    root: opts[:local_state_root],
     repo_root: ROOT,
     fleet_key: opts[:fleet_key]
   )
@@ -90,6 +98,9 @@ begin
     keep_root_models: opts[:keep_root_models],
     context: opts[:context],
     state_root: opts[:state_root],
+    bringup_identity_sha256: opts[:bringup_identity_sha256],
+    bringup_attempt_id: opts[:bringup_attempt_id],
+    model_requirement_sha256: opts[:model_requirement_sha256],
     pull_timeout_seconds: opts[:pull_timeout_seconds],
     heartbeat_seconds: opts[:heartbeat_seconds]
   )

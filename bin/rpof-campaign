@@ -215,6 +215,21 @@ begin
   binding = RunpodOllamaFleet::CampaignBudgetBinding.new(
     root: options[:state_root], repo_root: ROOT, campaign:, declaration: budget_declaration
   )
+  profile_ids = campaign.respond_to?(:profiles) ? campaign.profiles.map { |profile| profile.fetch("profile_id") } : []
+  controller_supervisor = RunpodOllamaFleet::CampaignControllerSupervisor.new(
+    root: options[:state_root], repo_root: ROOT,
+    campaign_path: options.fetch(:campaign), budget_path: options.fetch(:budget),
+    hardware_path: options.fetch(:hardware), model_requirement_paths:
+  )
+  if !profile_ids.empty? && model_requirements.empty?
+    model_requirements = controller_supervisor.resolved_model_requirements(binding:)
+  end
+  readiness_gate = if !profile_ids.empty? && model_requirements.keys.sort == profile_ids.sort
+                     RunpodOllamaFleet::WorkerBringupReadinessGate.new(
+                       root: options[:state_root], campaign_identity_sha256: campaign.identity_sha256,
+                       requirements: model_requirements
+                     )
+                   end
 
   api_key = ENV["RUNPOD_API_KEY"].to_s
   client = if api_key.empty?
@@ -240,14 +255,10 @@ begin
   runtime_factory = lambda do |profile, qualification, admission|
     RunpodOllamaFleet::CampaignRunpodRuntime.new(
       root: options[:state_root], repo_root: ROOT, profile:, hardware: qualification,
-      client:, admission:, model_requirement: model_requirements[profile.fetch("profile_id")]
+      client:, admission:, model_requirement: model_requirements[profile.fetch("profile_id")],
+      campaign_identity_sha256: campaign.identity_sha256, readiness_gate:
     )
   end
-  controller_supervisor = RunpodOllamaFleet::CampaignControllerSupervisor.new(
-    root: options[:state_root], repo_root: ROOT,
-    campaign_path: options.fetch(:campaign), budget_path: options.fetch(:budget),
-    hardware_path: options.fetch(:hardware), model_requirement_paths:
-  )
   lifecycle = RunpodOllamaFleet::CampaignLifecycle.new(
     campaign:, binding:, runtime_factory:, price_resolver:, controller_supervisor:
   )

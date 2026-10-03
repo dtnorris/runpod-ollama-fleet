@@ -4,8 +4,14 @@ require_relative "../local_model_evaluation/runpod_fleet"
 require_relative "../local_model_evaluation/runpod_fleet_lifecycle"
 require_relative "../local_model_evaluation/runpod_fleet_namespace"
 require_relative "../local_model_evaluation/runpod_capacity_policy"
+require_relative "../local_model_evaluation/process_supervisor"
+require_relative "../local_model_evaluation/runpod_bootstrap"
+require_relative "../local_model_evaluation/runpod_tunnels"
+require_relative "capability_check"
 require_relative "dynamic_worker_registry"
 require_relative "model_requirement"
+require_relative "worker_bringup_adapters"
+require_relative "worker_bringup_reconciler"
 
 module RunpodOllamaFleet
   # Adapter from campaign intent to the existing fleet mutation paths. It has
@@ -14,7 +20,9 @@ module RunpodOllamaFleet
     class Error < StandardError; end
 
     def initialize(root:, repo_root:, profile:, hardware:, client:, admission: nil, out: $stdout,
-                   wall_clock: nil, readiness_observer: nil, model_requirement: nil)
+                   wall_clock: nil, readiness_observer: nil, model_requirement: nil,
+                   campaign_identity_sha256: nil, readiness_gate: nil,
+                   bringup_reconciler_factory: nil)
       @root = File.expand_path(root)
       @repo_root = File.expand_path(repo_root)
       @profile = profile
@@ -25,6 +33,9 @@ module RunpodOllamaFleet
       @wall_clock = wall_clock
       @readiness_observer = readiness_observer
       @model_requirement = model_requirement
+      @campaign_identity_sha256 = campaign_identity_sha256
+      @readiness_gate = readiness_gate
+      @bringup_reconciler_factory = bringup_reconciler_factory
       @model_requirement&.validate_profile!(profile: @profile, hardware: @hardware)
     end
 
@@ -115,13 +126,49 @@ module RunpodOllamaFleet
       raise Error, e.message
     end
 
+    def reconcile_bringup!(desired_workers:, transition_guard:)
+      desired = Integer(desired_workers)
+      return [] if desired.zero?
+      raise Error, "exact model requirement is required for automatic bring-up" unless @model_requirement
+      unless @campaign_identity_sha256.to_s.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, "campaign identity is required for automatic bring-up"
+      end
+
+      fleet = current_record
+      return [] unless fleet && fleet["status"] == "active"
+      workers = Array(fleet.fetch("workers")).select { |worker| worker["status"] == "active" }
+                                              .sort_by { |worker| Integer(worker.fetch("index")) }
+                                              .first(desired)
+      reconciler = bringup_reconciler(transition_guard)
+      workers.map do |worker|
+        reconciler.reconcile!(
+          campaign_identity_sha256: @campaign_identity_sha256,
+          profile: @profile,
+          worker:,
+          generation_id: worker.fetch("generation_id"),
+          requirement: @model_requirement,
+          retry_bootstrap: true
+        )
+      end
+    rescue WorkerBringupReconciler::Error, LocalModelEvaluation::RunpodFleetState::Error,
+           KeyError, ArgumentError, TypeError => e
+      raise Error, e.message
+    end
+
     private
 
     def readiness_status
+      if @campaign_identity_sha256 && !@readiness_gate && !@readiness_observer
+        return {
+          "status" => "unavailable",
+          "error" => "exact generation-bound bring-up readiness binding is unavailable"
+        }
+      end
       observer = @readiness_observer || DynamicWorkerRegistry.new(
         state_root: @root,
         repo_root: @repo_root,
-        fleet_sources: [{ "fleet_key" => profile_id, "state" => current_state }]
+        fleet_sources: [{ "fleet_key" => profile_id, "state" => current_state }],
+        readiness_gate: @readiness_gate
       )
       observer.readiness_status
     rescue DynamicWorkerRegistry::Error => e
@@ -154,6 +201,36 @@ module RunpodOllamaFleet
     def required_gpu_ids
       required = @model_requirement&.required_gpu_id
       required ? [required] : @hardware.fetch("qualified_gpu_ids")
+    end
+
+    def bringup_reconciler(transition_guard)
+      return @bringup_reconciler_factory.call(transition_guard) if @bringup_reconciler_factory
+
+      state = current_state
+      tunnels = LocalModelEvaluation::RunpodTunnels.new(
+        fleet_state: state, repo_root: @repo_root, out: @out, wall_clock: @wall_clock
+      )
+      process = LocalModelEvaluation::ProcessSupervisor.new
+      WorkerBringupReconciler.new(
+        root: @root,
+        tunnel: WorkerBringupAdapters::Tunnel.new(
+          tunnels:, requirement: @model_requirement, transition_guard:
+        ),
+        bootstrap: WorkerBringupAdapters::Bootstrap.new(
+          root: @root, repo_root: @repo_root, fleet_state: state,
+          shared_store_path: @hardware.fetch("ollama_store_path"),
+          process_supervisor: process, requirement: @model_requirement,
+          transition_guard:, clock: @wall_clock
+        ),
+        capability: WorkerBringupAdapters::Capability.new(
+          checker: CapabilityCheck.new(
+            fleet_state: state, fleet_key: profile_id, wall_clock: @wall_clock
+          ),
+          requirement: @model_requirement, transition_guard:
+        ),
+        process_inspector: process,
+        clock: @wall_clock
+      )
     end
 
     def profile_id

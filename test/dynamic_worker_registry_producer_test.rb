@@ -66,6 +66,15 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     def check(_endpoint) = Result.new(healthy:, version: "fixture")
   end
 
+  Gate = Struct.new(:allowed, :error) do
+    def satisfied?(fleet_key:, worker:)
+      raise error if error
+      raise "wrong fleet" unless fleet_key == "main"
+      raise "wrong generation" unless worker.fetch("generation_id") == "state-generation-1-1"
+      allowed
+    end
+  end
+
   def setup
     @tmp = Dir.mktmpdir("rpof-worker-registry-")
     @publisher_root = File.join(@tmp, "publisher")
@@ -109,6 +118,22 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     }], worker.dig("capabilities", "ollama", "models")
     assert_equal RunpodOllamaFleet::DynamicWorkerRegistry.capability_fingerprint(worker),
                  worker.fetch("capability_fingerprint")
+  end
+
+  def test_generation_bound_gate_is_authoritative_for_ready_publication
+    blocked = registry(readiness_gate: Gate.new(false, nil)).snapshot
+    assert_equal "NOT_READY", blocked.dig("workers", 0, "state")
+
+    @now += 1
+    ready = registry(readiness_gate: Gate.new(true, nil)).snapshot
+    assert_equal "READY", ready.dig("workers", 0, "state")
+  end
+
+  def test_generation_bound_gate_tamper_refuses_publication
+    error = assert_raises(RunpodOllamaFleet::DynamicWorkerRegistry::Error) do
+      registry(readiness_gate: Gate.new(false, RuntimeError.new("tampered"))).snapshot
+    end
+    assert_includes error.message, "refused publication"
   end
 
   def test_bootstrap_incomplete_worker_is_not_ready
@@ -389,7 +414,7 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     )
   end
 
-  def registry
+  def registry(readiness_gate: nil)
     RunpodOllamaFleet::DynamicWorkerRegistry.new(
       state_root: @publisher_root,
       repo_root: @tmp,
@@ -397,7 +422,8 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
       process_adapter: @process,
       health_checker: @health,
       fleet_sources: [{ "fleet_key" => "main", "state" => @state }],
-      id_generator: -> { "rpof-test" }
+      id_generator: -> { "rpof-test" },
+      readiness_gate:
     )
   end
 

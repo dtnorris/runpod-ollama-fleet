@@ -34,6 +34,7 @@ module LocalModelEvaluation
     def run(worker_indices:, models:, expected_digests: [], clean: false, reuse_existing: false,
             copy_to_workspace: false, copy_from_shared_store: nil, keep_root_models: false,
             context: nil, state_root: nil,
+            bringup_identity_sha256: nil, bringup_attempt_id: nil, model_requirement_sha256: nil,
             pull_timeout_seconds: DEFAULT_PULL_TIMEOUT_SECONDS,
             heartbeat_seconds: DEFAULT_HEARTBEAT_SECONDS, poll_seconds: DEFAULT_POLL_SECONDS)
       fleet = active_fleet!
@@ -98,6 +99,9 @@ module LocalModelEvaluation
       poll_seconds = positive_float(poll_seconds, "poll seconds")
       context = context ? positive_integer(context, "context") : 131_072
       pull_timeout_seconds = positive_integer(pull_timeout_seconds, "pull timeout seconds")
+      bringup_binding = normalize_bringup_binding(
+        bringup_identity_sha256:, bringup_attempt_id:, model_requirement_sha256:
+      )
       validate_remote_setup!
 
       bootstrap_root = @fleet_state.artifact_dir(fleet.fetch("fleet_id"), "bootstrap")
@@ -118,7 +122,8 @@ module LocalModelEvaluation
           pull_timeout_seconds:,
           heartbeat_seconds:,
           poll_seconds:,
-          bootstrap_root:
+          bootstrap_root:,
+          bringup_binding:
         )
       end
     rescue BootstrapStore::LockUnavailable
@@ -129,7 +134,7 @@ module LocalModelEvaluation
 
     def execute_run(fleet:, workers:, models:, digests:, expected_gpus:, clean:, reuse_existing:,
                     copy_to_workspace:, copy_from_shared_store:, keep_root_models:, state_root:, context:,
-                    pull_timeout_seconds:, heartbeat_seconds:, poll_seconds:, bootstrap_root:)
+                    pull_timeout_seconds:, heartbeat_seconds:, poll_seconds:, bootstrap_root:, bringup_binding:)
       started_wall = utc_now
       started_mono = @monotonic_clock.call
       run_id = build_run_id(started_wall)
@@ -151,7 +156,8 @@ module LocalModelEvaluation
         pull_timeout_seconds:,
         heartbeat_seconds:,
         started_wall:,
-        run_id:
+        run_id:,
+        bringup_binding:
       )
       record_path = @store.record_path(run_dir)
       write_record(record_path, record)
@@ -629,11 +635,14 @@ module LocalModelEvaluation
 
     def initial_record(fleet:, workers:, models:, digests:, expected_gpus:, clean:, reuse_existing:,
                        copy_to_workspace:, copy_from_shared_store:, keep_root_models:, state_root:, context:,
-                       pull_timeout_seconds:, heartbeat_seconds:, started_wall:, run_id:)
+                       pull_timeout_seconds:, heartbeat_seconds:, started_wall:, run_id:, bringup_binding:)
       gpu_ids = expected_gpus.values.uniq
       {
         "schema_version" => 2,
         "bootstrap_run_id" => run_id,
+        "bringup_identity_sha256" => bringup_binding["bringup_identity_sha256"],
+        "bringup_attempt_id" => bringup_binding["bringup_attempt_id"],
+        "model_requirement_sha256" => bringup_binding["model_requirement_sha256"],
         "fleet_id" => fleet.fetch("fleet_id"),
         "status" => "running",
         "started_at_utc" => started_wall.iso8601,
@@ -676,6 +685,28 @@ module LocalModelEvaluation
             "provenance_error" => nil
           }
         end
+      }
+    end
+
+    def normalize_bringup_binding(bringup_identity_sha256:, bringup_attempt_id:, model_requirement_sha256:)
+      values = [bringup_identity_sha256, bringup_attempt_id, model_requirement_sha256]
+      return {} if values.all?(&:nil?)
+      if values.any?(&:nil?)
+        raise Error, "generation-bound bootstrap requires identity, attempt, and model-requirement bindings"
+      end
+      identity = bringup_identity_sha256.to_s
+      requirement = model_requirement_sha256.to_s
+      attempt = bringup_attempt_id.to_s
+      digest = /\A[0-9a-f]{64}\z/
+      raise Error, "bring-up identity must be a lowercase SHA-256" unless identity.match?(digest)
+      raise Error, "model requirement must be a lowercase SHA-256" unless requirement.match?(digest)
+      if attempt.empty? || attempt != attempt.strip || attempt.match?(/[[:cntrl:]]/)
+        raise Error, "bring-up attempt identity must be a non-empty trimmed string"
+      end
+      {
+        "bringup_identity_sha256" => identity,
+        "bringup_attempt_id" => attempt,
+        "model_requirement_sha256" => requirement
       }
     end
 

@@ -38,6 +38,35 @@ module RunpodOllamaFleet
       raise Error, "could not reconcile worker bring-up state: #{e.message}"
     end
 
+    def read_current(worker_id:)
+      identity = worker_id.to_s
+      unless identity.match?(/\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z/)
+        raise Error, "worker identity has invalid syntax"
+      end
+
+      worker_root = File.join(@root, "worker-bringup-v0.1", identity)
+      pointer = File.join(worker_root, "current")
+      return nil unless File.file?(pointer)
+
+      File.open(File.join(worker_root, ".lock"), File::RDWR | File::CREAT, 0o600) do |lock|
+        lock.flock(File::LOCK_SH)
+        sha256 = File.binread(pointer).strip
+        raise Error, "worker bring-up current pointer is invalid" unless sha256.match?(/\A[0-9a-f]{64}\z/)
+
+        path = state_path(worker_root, sha256)
+        raise Error, "worker bring-up current state is missing" unless File.file?(path)
+
+        state = JSON.parse(File.binread(path))
+        validate_shape!(state)
+        unless state.fetch("identity_sha256") == sha256
+          raise Error, "worker bring-up current pointer does not match retained identity"
+        end
+        deep_copy(state)
+      end
+    rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError, TypeError => e
+      raise Error, "could not read worker bring-up state: #{e.message}"
+    end
+
     private
 
     def retire_previous(worker_root, identity)

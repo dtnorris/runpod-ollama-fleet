@@ -3,6 +3,7 @@
 require "time"
 require_relative "campaign_capacity_admission"
 require_relative "desired_capacity"
+require_relative "dynamic_worker_registry"
 
 module RunpodOllamaFleet
   # Human-facing orchestration for one immutable capacity campaign. Provider
@@ -13,7 +14,7 @@ module RunpodOllamaFleet
     class TransientReconciliationError < Error; end
 
     def initialize(campaign:, binding:, runtime_factory:, price_resolver: nil, wall_clock: nil,
-                   desired_capacity: nil, controller_supervisor: nil)
+                   desired_capacity: nil, controller_supervisor: nil, registry_publisher: nil)
       @campaign = campaign
       @binding = binding
       @runtime_factory = runtime_factory
@@ -21,6 +22,7 @@ module RunpodOllamaFleet
       @wall_clock = wall_clock || -> { Time.now.utc }
       @desired_capacity = desired_capacity || DesiredCapacity.new(binding:, wall_clock: @wall_clock)
       @controller_supervisor = controller_supervisor
+      @registry_publisher = registry_publisher
       unless binding.campaign.identity_sha256 == campaign.identity_sha256
         raise Error, "campaign binding does not match the requested campaign"
       end
@@ -242,9 +244,17 @@ module RunpodOllamaFleet
       results = prepared.fetch("profiles").map do |row|
         reconcile_profile(row, authority, ssh_public_key_path)
       end
-      { "desired_capacity" => desired_state, "safety_report" => safety_report, "profiles" => results }
+      registry = publish_registry
+      {
+        "desired_capacity" => desired_state,
+        "safety_report" => safety_report,
+        "profiles" => results,
+        "registry" => registry
+      }
     rescue CampaignBudgetBinding::Error, CampaignCapacityAdmission::Error, DesiredCapacity::Error => e
       raise Error, e.message
+    rescue DynamicWorkerRegistry::Error => e
+      raise TransientReconciliationError, "dynamic worker registry publication failed: #{e.message}"
     end
 
     private
@@ -270,17 +280,52 @@ module RunpodOllamaFleet
           max_hourly_rate_usd: @campaign.max_hourly_rate_usd
         )
       end
+      bringup = if desired.positive?
+                  runtime.reconcile_bringup!(
+                    desired_workers: desired,
+                    transition_guard: method(:verify_reconciliation_authority!)
+                  )
+                else
+                  []
+                end
       runtime.status.merge(
         "profile_id" => profile.fetch("profile_id"),
         "desired_workers" => desired,
         "max_workers" => maximum,
-        "action" => current < desired && committed <= current ? "ensure_desired_capacity" : "none"
+        "bringup" => bringup.map do |state|
+          {
+            "worker_id" => state.dig("identity", "worker_id"),
+            "generation_id" => state.dig("identity", "generation_id"),
+            "status" => state.fetch("overall_status")
+          }
+        end,
+        "action" => reconciliation_action(current:, desired:, committed:, bringup:)
       )
     rescue CampaignRunpodRuntime::Error => e
       raise TransientReconciliationError,
             "campaign reconciliation failed at #{profile.fetch('profile_id')}: #{e.message}"
     rescue StandardError => e
       raise Error, "campaign reconciliation failed at #{profile.fetch('profile_id')}: #{e.message}"
+    end
+
+    def reconciliation_action(current:, desired:, committed:, bringup:)
+      return "ensure_desired_capacity" if current < desired && committed <= current
+      return "reconcile_worker_bringup" unless bringup.empty?
+
+      "none"
+    end
+
+    def publish_registry
+      return nil unless @registry_publisher
+
+      verify_reconciliation_authority!
+      snapshot = @registry_publisher.snapshot
+      snapshot.slice("registry_id", "revision", "published_at", "expires_at")
+    end
+
+    def verify_reconciliation_authority!
+      verify_started_authority!(@binding.status)
+      true
     end
 
     def desired_workers_for(profile)

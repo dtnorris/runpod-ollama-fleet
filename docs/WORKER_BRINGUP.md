@@ -1,10 +1,10 @@
 # Generation-bound worker bring-up v0.1
 
-RPOF exposes a controller-callable `WorkerBringupReconciler` prerequisite for
-automatic worker bring-up. It advances one exact worker generation through
-tunnel, bootstrap, and capability evidence, then stops with
-`readiness_prerequisites_satisfied`. It does not create provider resources or
-publish a worker as READY.
+RPOF composes the controller-callable `WorkerBringupReconciler` into the FO-09
+campaign controller. After provider-capacity reconciliation, it advances one
+exact worker generation through tunnel, bootstrap, and capability evidence.
+The controller then publishes a dynamic-worker-registry snapshot; READY is
+possible only when the durable state says `readiness_prerequisites_satisfied`.
 
 The durable identity binds the campaign identity SHA, profile, logical worker
 slot, provider resource, worker ID, monotonically increasing worker generation,
@@ -21,12 +21,14 @@ This lets a restarted controller reconstruct progress without remembering that
 it launched a child process.
 
 Tunnel evidence must match the exact provider resource, worker, generation,
-and endpoint. Bootstrap attempts are persisted before launch. An in-progress
-attempt must retain its attempt ID and a process identity containing PID,
-process group, operating-system start token, and command fingerprint. PID or
-process-name matching alone is not sufficient. A vanished or ambiguous process
-fails closed and is not silently relaunched; retryable bootstrap state advances
-only when the caller explicitly requests a retry.
+and endpoint. Bootstrap attempts are persisted before launch. The production
+adapter starts the existing bootstrap command as a nonblocking owned process so
+the campaign controller can continue its heartbeat. An in-progress attempt
+retains its attempt ID and a process identity containing PID, process group,
+operating-system start token, and command fingerprint. PID or process-name
+matching alone is not sufficient. A restarted controller adopts an exact
+matching process/evidence record. A vanished or ambiguous process fails closed
+and is not silently relaunched.
 
 Passed bootstrap and capability evidence must match the worker generation and
 the exact model, digest, context, full-residency requirement, and constrained
@@ -35,7 +37,7 @@ GPU when present. The human alias remains provenance only.
 `campaign start` now accepts a repeatable exact-requirement binding:
 
 ```console
-bin/rpof-campaign campaign start CAMPAIGN.json \
+bin/rpof campaign start --campaign CAMPAIGN.json --budget BUDGET.json \
   --model-requirement PROFILE_ID=MODEL_REQUIREMENT.json
 ```
 
@@ -45,6 +47,18 @@ fingerprint, and validates them before controller/provider startup and again in
 the restarted controller. A retained older controller request is rejected
 rather than adopted without this binding.
 
-FO-11 will supply the production adapters and compose this primitive with
-provider-capacity reconciliation and dynamic-registry READY publication.
-Replacement policy and later lifecycle behavior remain outside this contract.
+Desired zero performs no provider or bring-up work. Lower desired counts do not
+drain already retained workers. Every tunnel launch, bootstrap launch,
+capability transition, and registry publication rechecks current campaign
+authority; teardown prevents later stages and publication. Generation changes
+make the prior tunnel, bootstrap, capability, and READY evidence ineligible.
+
+The deterministic hard-offline acceptance check is:
+
+```console
+bundle exec bin/rpof-worker-bringup-acceptance
+```
+
+It exercises one authorized start through automatic READY using fakes only and
+does not contact RunPod, open tunnels, call Ollama, pull models, or run
+inference. Replacement and downscale policy remain outside FO-11.

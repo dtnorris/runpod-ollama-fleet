@@ -76,6 +76,32 @@ module RunpodOllamaFleet
       raise Error, "campaign model requirements are invalid: #{e.message}"
     end
 
+    # Read-only resolution for campaign status after the initiating CLI has
+    # exited. With no explicitly supplied paths, reuse only the exact artifact
+    # bindings already retained in the supervised controller request.
+    def resolved_model_requirements(binding:, require_all: false)
+      paths = @model_requirement_paths
+      if paths.empty?
+        request = read_json(paths_for(binding).fetch(:request_path))
+        return {} unless request
+
+        validate_retained_requirements!(request, binding)
+        paths = request.fetch("model_requirements").to_h do |row|
+          [row.fetch("profile_id"), File.expand_path(row.fetch("path"))]
+        end
+      end
+      original = @model_requirement_paths
+      @model_requirement_paths = paths
+      model_requirement_bindings(binding, require_all:).to_h do |row|
+        [row.fetch("profile_id"), ModelRequirement.load(row.fetch("path"))]
+      end
+    rescue ModelRequirement::Error, KeyError, ArgumentError, TypeError, SystemCallError,
+           JSON::ParserError => e
+      raise Error, "campaign model requirements are invalid: #{e.message}"
+    ensure
+      @model_requirement_paths = original if defined?(original)
+    end
+
     def status(binding:)
       paths = paths_for(binding)
       row = read_json(paths.fetch(:runtime_path)) || {}

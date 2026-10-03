@@ -43,9 +43,10 @@ Start also requires one exact AdventureFinder model-requirement artifact for
 every campaign profile. The supervised request binds each artifact's bytes and
 semantic fingerprint so a restarted controller cannot reinterpret aliases or
 adopt bring-up evidence for a different requirement. See
-[`WORKER_BRINGUP.md`](WORKER_BRINGUP.md) for the generation-bound resumable seam;
-full automatic bring-up and READY publication are deliberately not part of this
-campaign contract yet.
+[`WORKER_BRINGUP.md`](WORKER_BRINGUP.md) for the generation-bound resumable
+workflow. The same supervised reconciliation pass now composes provider
+capacity, tunnel establishment, exact model bootstrap, capability verification,
+and truthful dynamic-registry READY publication.
 
 The controller reads the current identity-bound `rpof-desired-capacity/v0.1`
 revision on every reconciliation pass. Revision zero preserves the immutable

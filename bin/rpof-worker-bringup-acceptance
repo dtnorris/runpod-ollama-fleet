@@ -1,0 +1,6 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+ENV["RPOF_HARD_OFFLINE"] = "1"
+ARGV.replace(["--name", "/test_bu_c20_one_authorized_start_is_sufficient_offline/"])
+load File.expand_path("../test/worker_bringup_closeout_test.rb", __dir__)

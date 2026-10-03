@@ -138,7 +138,7 @@ separate facts. The classifications below describe the invoking process:
 | --- | --- | --- | --- | --- |
 | `campaign plan`, `campaign status`, `campaign desired` | ONE-SHOT INSPECTION | Existing guardian, provider resources, tunnels and WLO execution continue. | Interrupts only the request/view. | `wlo pause` pauses work; `campaign stop` requests paid teardown. |
 | `campaign desired-set` | CONTROL REQUEST | Revisioned desired state changes; the request itself makes no provider call. A running matching controller reads the accepted revision on its next pass. The original budget/deadline, guardian and WLO execution remain unchanged. | May leave either the prior complete revision or the new complete revision; interrupting it never implies provider rollback or teardown. | Inspect with `campaign desired`; use `campaign start` to ensure continuing reconciliation is supervised. |
-| `campaign start` | DETACHED/SUPERVISED CONTROLLER LAUNCHER | One identity-bound launchd controller owns ordinary heartbeat and desired-capacity reconciliation after the CLI, WLO, shell, or terminal exits. The independent guardian remains the safety enforcer. | After launch, Ctrl-C affects only the initiating output/view; it does not stop the controller or capacity. | `campaign stop`, then status until `CLOSED` with provider absence verified. |
+| `campaign start` | DETACHED/SUPERVISED CONTROLLER LAUNCHER | One identity-bound launchd controller owns ordinary heartbeat, desired-capacity reconciliation, generation-bound tunnel/bootstrap/capability bring-up, and dynamic-registry publication after the CLI, WLO, shell, or terminal exits. The independent guardian remains the safety enforcer. | After launch, Ctrl-C affects only the initiating output/view; it does not stop the controller or capacity. | `campaign stop`, then status until `CLOSED` with provider absence verified. |
 | `campaign stop` | TEARDOWN REQUEST | The budget first blocks mutation, controller supervision is disabled, and the independent guardian continues teardown after the CLI returns. | Interrupts only the requesting CLI; it does not cancel the durable teardown request or prove completion. | Re-run status/stop until provider absence is verified and the budget is `CLOSED`. |
 | `workers --json`, `status`, `doctor`, `capacity`, `capability-check` | ONE-SHOT INSPECTION/PUBLICATION | Workloads, guardians, tunnels and provider resources continue. Registry publication may advance its durable revision; doctor only consumes retained evidence. Neither owns work or capacity. | Interrupts only the request. | Use WLO and RPOF lifecycle commands explicitly. |
 | `create`, `fulfill`, `scale`, `replace` | MANUAL RESOURCE MUTATION | Provider resources remain; a configured lease watchdog is detached but is not campaign-grade independent enforcement. Automated `--yes` paid forms are blocked; positive manual mutations require finite runtime and spend leases. | May leave a partial or completed mutation; it is not rollback or teardown. Inspect state/provider evidence before retrying. | Use authorized `campaign start` for production automation; otherwise use `destroy` or `shutdown` as applicable. |
@@ -209,9 +209,10 @@ human alias is retained only as provenance and is never translated by RPOF.
 `campaign start` requires one `--model-requirement PROFILE=FILE` binding per
 campaign profile. The supervised request binds the file SHA-256 and semantic
 requirement fingerprint across controller restarts. The generation-bound,
-durable tunnel/bootstrap/capability prerequisite is documented in
-[`docs/WORKER_BRINGUP.md`](docs/WORKER_BRINGUP.md); it intentionally stops before
-automatic provider creation and registry READY publication.
+durable tunnel/bootstrap/capability workflow is documented in
+[`docs/WORKER_BRINGUP.md`](docs/WORKER_BRINGUP.md). The FO-09 controller now
+composes it after existing provider-capacity reconciliation and publishes READY
+only for the exact generation whose prerequisites passed.
 
 ## Safety
 

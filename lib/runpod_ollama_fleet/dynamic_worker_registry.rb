@@ -27,7 +27,7 @@ module RunpodOllamaFleet
 
     def initialize(state_root:, repo_root:, clock: nil, ttl_seconds: DEFAULT_TTL_SECONDS,
                    process_adapter: nil, health_checker: nil, fleet_sources: nil,
-                   id_generator: nil)
+                   id_generator: nil, readiness_gate: nil)
       @state_root = File.expand_path(state_root)
       @repo_root = File.expand_path(repo_root)
       @clock = clock || -> { Time.now.utc }
@@ -36,6 +36,7 @@ module RunpodOllamaFleet
       @health = health_checker || LocalModelEvaluation::RunpodTunnels::HttpHealthChecker.new
       @fleet_sources = fleet_sources
       @id_generator = id_generator || -> { "rpof-#{SecureRandom.hex(16)}" }
+      @readiness_gate = readiness_gate
     end
 
     def snapshot
@@ -125,7 +126,7 @@ module RunpodOllamaFleet
       runtime_aliases = load_runtime_aliases(state, fleet)
       tunnels = load_tunnels(state, fleet)
       Array(fleet.fetch("workers")).filter_map do |worker|
-        build_worker(state:, fleet:, worker:, bootstrap:, runtime_aliases:, tunnels:)
+        build_worker(fleet_key:, state:, fleet:, worker:, bootstrap:, runtime_aliases:, tunnels:)
       end
     rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError, TypeError => e
       raise Error, "invalid source state for fleet #{fleet_key.inspect}: #{e.message}"
@@ -142,7 +143,7 @@ module RunpodOllamaFleet
       tunnels = load_tunnels(state, fleet)
       Array(fleet.fetch("workers")).map do |worker|
         index = positive_integer(worker.fetch("index"), "worker index")
-        published = build_worker(state:, fleet:, worker:, bootstrap:, runtime_aliases:, tunnels:)
+        published = build_worker(fleet_key:, state:, fleet:, worker:, bootstrap:, runtime_aliases:, tunnels:)
         models = capability_models(worker, worker_gpu_id(fleet, worker), bootstrap, runtime_aliases)
         tunnel = tunnels[index]
         {
@@ -189,7 +190,7 @@ module RunpodOllamaFleet
       false
     end
 
-    def build_worker(state:, fleet:, worker:, bootstrap:, runtime_aliases:, tunnels:)
+    def build_worker(fleet_key:, state:, fleet:, worker:, bootstrap:, runtime_aliases:, tunnels:)
       index = positive_integer(worker.fetch("index"), "worker index")
       pod_id = nonempty(worker.fetch("pod_id"), "worker pod identity")
       gpu_id = worker_gpu_id(fleet, worker)
@@ -208,7 +209,7 @@ module RunpodOllamaFleet
         "worker_id" => identity.fetch("worker_id"),
         "generation_id" => identity.fetch("generation_id"),
         "endpoint" => endpoint,
-        "state" => registry_state(fleet, worker, bootstrap, tunnels, endpoint, pod_id),
+        "state" => registry_state(fleet_key, fleet, worker, bootstrap, tunnels, endpoint, pod_id),
         "labels" => LABELS,
         "capabilities" => {
           "gpu_id" => gpu_id,
@@ -315,8 +316,9 @@ module RunpodOllamaFleet
       }
     end
 
-    def registry_state(fleet, worker, bootstrap, tunnels, endpoint, pod_id)
+    def registry_state(fleet_key, fleet, worker, bootstrap, tunnels, endpoint, pod_id)
       return "UNAVAILABLE" unless fleet["status"] == "active" && worker["status"] == "active"
+      return "NOT_READY" unless readiness_gate_satisfied?(fleet_key, worker)
       return "NOT_READY" unless bootstrap_ready?(bootstrap)
 
       tunnel = tunnels[Integer(worker.fetch("index"))]
@@ -334,6 +336,14 @@ module RunpodOllamaFleet
       health.respond_to?(:healthy) && health.healthy ? "READY" : "NOT_READY"
     rescue KeyError, ArgumentError, TypeError, URI::InvalidURIError
       "NOT_READY"
+    end
+
+    def readiness_gate_satisfied?(fleet_key, worker)
+      return true unless @readiness_gate
+
+      @readiness_gate.satisfied?(fleet_key:, worker:)
+    rescue StandardError => e
+      raise Error, "worker bring-up readiness gate refused publication: #{e.message}"
     end
 
     def bootstrap_ready?(bootstrap)

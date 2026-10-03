@@ -109,6 +109,19 @@ class CampaignControllerSupervisorTest < Minitest::Test
     assert_empty @commands
   end
 
+  def test_status_can_resolve_exact_requirements_from_retained_request
+    build_supervisor.ensure_running!(
+      binding: @binding, ssh_public_key_path: "fixture.pub", heartbeat_timeout_seconds: 30
+    )
+    restarted = build_supervisor(model_requirement_paths: {})
+
+    requirements = restarted.resolved_model_requirements(binding: @binding)
+
+    assert_equal ["profile-1"], requirements.keys
+    assert_equal RunpodOllamaFleet::ModelRequirement.load(@requirement_path).fingerprint,
+                 requirements.fetch("profile-1").fingerprint
+  end
+
   private
 
   def artifact(name)
@@ -121,7 +134,7 @@ class CampaignControllerSupervisorTest < Minitest::Test
     File.join(File.dirname(@binding.state_path), "controller", name)
   end
 
-  def build_supervisor
+  def build_supervisor(model_requirement_paths: { "profile-1" => @requirement_path })
     runner = lambda do |argv|
       @commands << argv
       case argv[1]
@@ -146,7 +159,7 @@ class CampaignControllerSupervisorTest < Minitest::Test
     RunpodOllamaFleet::CampaignControllerSupervisor.new(
       root: @tmp, repo_root: @repo, campaign_path: @campaign_path,
       budget_path: @budget_path, hardware_path: @hardware_path,
-      model_requirement_paths: { "profile-1" => @requirement_path },
+      model_requirement_paths:,
       command_runner: runner, sleeper: ->(*) {}, monotonic_clock: -> { 0 },
       wall_clock: -> { @now }, platform: "arm64-darwin"
     )

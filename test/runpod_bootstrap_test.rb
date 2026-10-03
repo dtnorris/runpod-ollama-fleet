@@ -753,6 +753,38 @@ class RunpodBootstrapTest < Minitest::Test
     assert_includes @out.string, "provenance: gemma4:26b digest mismatch"
   end
 
+  def test_generation_bound_bootstrap_persists_exact_outer_attempt_identity
+    record = build_runner(fake_remote_script("puts 'bound fixture'\n")).run(
+      worker_indices: [1], models: ["gemma4:26b"],
+      expected_digests: ["gemma4:26b=#{DIGEST}"], poll_seconds: 0.005,
+      bringup_identity_sha256: "c" * 64, bringup_attempt_id: "attempt-1",
+      model_requirement_sha256: "d" * 64
+    )
+
+    assert_equal "c" * 64, record.fetch("bringup_identity_sha256")
+    assert_equal "attempt-1", record.fetch("bringup_attempt_id")
+    assert_equal "d" * 64, record.fetch("model_requirement_sha256")
+  end
+
+  def test_generation_bound_bootstrap_rejects_partial_or_invalid_bindings
+    runner = build_runner(fake_remote_script("raise 'must not run'\n"))
+    common = {
+      worker_indices: [1], models: ["gemma4:26b"],
+      expected_digests: ["gemma4:26b=#{DIGEST}"]
+    }
+    invalid = [
+      { bringup_identity_sha256: "c" * 64 },
+      { bringup_identity_sha256: "bad", bringup_attempt_id: "attempt-1", model_requirement_sha256: "d" * 64 },
+      { bringup_identity_sha256: "c" * 64, bringup_attempt_id: " ", model_requirement_sha256: "d" * 64 },
+      { bringup_identity_sha256: "c" * 64, bringup_attempt_id: "attempt-1", model_requirement_sha256: "bad" }
+    ]
+
+    invalid.each do |bindings|
+      assert_raises(LocalModelEvaluation::RunpodBootstrap::Error) { runner.run(**common, **bindings) }
+    end
+    assert_empty @process_supervisor.commands
+  end
+
 
   private
 
