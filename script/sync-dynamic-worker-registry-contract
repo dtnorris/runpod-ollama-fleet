@@ -1,0 +1,58 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "digest"
+require "fileutils"
+require "tmpdir"
+
+repo_root = File.expand_path("..", __dir__)
+target = File.join(repo_root, "test", "fixtures", "dynamic-worker-registry-v0.1")
+mode = ARGV.shift || "--check"
+source = File.expand_path(
+  ARGV.shift || File.join(repo_root, "..", "workload-orchestrator", "contracts",
+                          "dynamic-worker-registry", "v0.1")
+)
+abort "usage: #{File.basename($PROGRAM_NAME)} --check|--refresh [WLO_CONTRACT_DIR]" unless ARGV.empty?
+abort "unsupported mode #{mode.inspect}" unless %w[--check --refresh].include?(mode)
+
+def verified_files(root)
+  manifest = File.join(root, "SHA256SUMS")
+  abort "missing WLO contract manifest: #{manifest}" unless File.file?(manifest)
+
+  rows = File.readlines(manifest, chomp: true).to_h do |line|
+    digest, relative = line.split(/\s+/, 2)
+    abort "malformed contract manifest line: #{line.inspect}" unless digest && relative
+
+    [relative, digest]
+  end
+  rows.each do |relative, expected|
+    path = File.join(root, relative)
+    abort "missing contract file: #{path}" unless File.file?(path)
+    abort "contract checksum mismatch: #{relative}" unless Digest::SHA256.file(path).hexdigest == expected
+  end
+  rows.keys.sort + ["SHA256SUMS"]
+end
+
+source_files = verified_files(source)
+
+if mode == "--refresh"
+  Dir.mktmpdir("dynamic-worker-registry-v0.1-") do |tmp|
+    staged = File.join(tmp, "v0.1")
+    FileUtils.cp_r(source, staged)
+    abort "staged contract copy is incomplete" unless verified_files(staged) == source_files
+
+    FileUtils.rm_rf(target)
+    FileUtils.mkdir_p(File.dirname(target))
+    FileUtils.mv(staged, target)
+  end
+end
+
+target_files = verified_files(target)
+abort "contract copy file set differs from WLO" unless target_files == source_files
+source_files.each do |relative|
+  source_path = File.join(source, relative)
+  target_path = File.join(target, relative)
+  abort "contract copy differs from WLO: #{relative}" unless File.binread(source_path) == File.binread(target_path)
+end
+
+puts "dynamic-worker-registry/v0.1 copy matches WLO"

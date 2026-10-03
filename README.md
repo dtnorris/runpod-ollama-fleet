@@ -81,6 +81,24 @@ discovery seam for consumers such as WLO; consumers do not read RPOF fleet,
 bootstrap, tunnel, or provider state directly. Only records marked `READY` are
 eligible for new work.
 
+WLO owns the public contract and standalone conformance implementation at
+`contracts/dynamic-worker-registry/v0.1`. RPOF retains a byte-identical,
+explicitly non-authoritative copy under
+`test/fixtures/dynamic-worker-registry-v0.1`, including WLO's SHA-256
+manifest. RPOF's ordinary tests run from this checkout alone and load no WLO
+runtime code for provider conformance. Optionally compare or refresh the copy
+from a sibling WLO checkout with:
+
+```bash
+script/sync-dynamic-worker-registry-contract --check
+script/sync-dynamic-worker-registry-contract --refresh
+```
+
+RPOF and LOW are independent publishers of the same WLO API. RPOF has no LOW
+runtime or test dependency. Once RPOF-owned generation and capability evidence
+exists, ordinary publication requires no AdventureFinder state, batch handle,
+alias resolution, or AF production root.
+
 `RPOF_STATE_ROOT` and `RPOF_STATE_REPO_ROOT` select the same state namespace
 for `workers --json` and `status --all` (also single-fleet status).
 

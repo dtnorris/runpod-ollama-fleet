@@ -1,0 +1,7 @@
+invalid/bad-contract-version.json	contract must be dynamic-worker-registry/v0.1
+invalid/bad-endpoint.json	must be an HTTP(S) origin
+invalid/bad-fingerprint.json	capability_fingerprint does not match capabilities
+invalid/bad-publication-window.json	expires_at must follow published_at
+invalid/bad-state.json	state must be one of READY, NOT_READY, UNAVAILABLE
+invalid/duplicate-worker-id.json	duplicate worker_id
+invalid/missing-generation.json	missing fields: generation_id

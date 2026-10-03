@@ -1,25 +1,62 @@
 # frozen_string_literal: true
 
 require "json"
+require "rbconfig"
 require "time"
 
 mode = ARGV.shift
 
 if mode == "wlo"
-  wlo_root, registry_path, ready_path, workdir, output_dir, now_text = ARGV
-  $LOAD_PATH.unshift(File.join(wlo_root, "lib"))
+  wlo_root, registry_path, ready_path, workdir, output_dir, _now_text = ARGV
   require "fileutils"
-  require "stringio"
-  require "workload_orchestrator"
 
-  now = Time.iso8601(now_text)
-  registry_bytes = File.binread(registry_path)
-  source = WorkloadOrchestrator::StaticWorkerSource.new(registry_bytes)
-  registry = WorkloadOrchestrator::DynamicWorkerRegistry.new(registry_bytes, now:)
-  worker = registry.schedulable_workers.fetch(0)
-  model = worker.capabilities.dig("ollama", "models", 0)
-  plan = WorkloadOrchestrator::Plan.new(JSON.generate(
-    "contract_version" => WorkloadOrchestrator::Plan::PRIORITY_CONTRACT_VERSION,
+  registry = JSON.parse(File.binread(registry_path))
+  worker = registry.fetch("workers").fetch(0)
+  model = worker.dig("capabilities", "ollama", "models", 0)
+  FileUtils.mkdir_p(workdir)
+  cli_registry_path = File.join(workdir, "registry.json")
+  published_at = Time.now.utc
+  File.write(cli_registry_path, JSON.generate(
+    registry.merge(
+      "published_at" => published_at.iso8601,
+      "expires_at" => (published_at + 7200).iso8601
+    )
+  ) + "\n")
+
+  job_path = File.join(workdir, "dw31_job.rb")
+  File.write(job_path, <<~'RUBY')
+    # frozen_string_literal: true
+
+    require "json"
+
+    registry_path, ready_path, workdir = ARGV
+    registry = JSON.parse(File.binread(registry_path))
+    worker = registry.fetch("workers").fetch(0)
+    document = {
+      "pid" => Process.ppid,
+      "registry_id" => registry.fetch("registry_id"),
+      "worker_id" => worker.fetch("worker_id"),
+      "endpoint" => ENV.fetch("AF_OLLAMA_BASE_URL"),
+      "argv" => ARGV,
+      "workdir" => workdir,
+      "provider_lifecycle_features" => $LOADED_FEATURES.grep(
+        %r{/(?:rpof|paid_budget|pool_fulfillment|execution_pool_plan|worker_admission|legacy_rpof)}
+      ).sort
+    }
+    File.write(ready_path, JSON.generate(document) + "\n")
+    sleep 3600
+  RUBY
+
+  source_path = File.join(workdir, "worker_source.rb")
+  File.write(source_path, <<~'RUBY')
+    # frozen_string_literal: true
+
+    $stdout.write(File.binread(ARGV.fetch(0)))
+  RUBY
+
+  plan_path = File.join(workdir, "plan.json")
+  File.write(plan_path, JSON.generate(
+    "contract_version" => "wlo-execution-plan/v0.3",
     "plan_id" => "dw31-killable-wlo",
     "failure_policy" => { "max_consecutive_failures" => 2, "max_total_failures" => 2 },
     "pools" => [{
@@ -31,46 +68,27 @@ if mode == "wlo"
           "expected_digest" => model.fetch("digest"),
           "required_context_length" => model.fetch("context_length"),
           "require_fully_gpu_resident" => true,
-          "required_gpu_id" => worker.capabilities.fetch("gpu_id")
+          "required_gpu_id" => worker.dig("capabilities", "gpu_id")
         }
       }
     }],
     "jobs" => [{
       "job_id" => "hold-open",
       "pool_id" => "dw31-pool",
-      "argv" => ["dw31-fixture"]
+      "argv" => [RbConfig.ruby, job_path, cli_registry_path, ready_path, workdir]
     }]
-  ))
-  FileUtils.mkdir_p(workdir)
-  executor = lambda do |environment, *argv, chdir:|
-    document = {
-      "pid" => Process.pid,
-      "registry_id" => registry.registry_id,
-      "worker_id" => worker.worker_id,
-      "endpoint" => environment.fetch("AF_OLLAMA_BASE_URL"),
-      "argv" => argv,
-      "workdir" => chdir,
-      "provider_lifecycle_features" => $LOADED_FEATURES.grep(
-        %r{/(?:rpof|paid_budget|pool_fulfillment|execution_pool_plan|worker_admission|legacy_rpof)}
-      ).sort
-    }
-    File.write(ready_path, JSON.generate(document) + "\n")
-    sleep 3600
-  end
-  runner = WorkloadOrchestrator::Runner.new(
-    plan:,
-    workers: WorkloadOrchestrator::WorkerSet.new({}),
-    workdir:,
-    output_dir:,
-    out: StringIO.new,
-    worker_source: source,
-    worker_registry_clock: -> { now },
-    worker_registry_sleeper: ->(*) { sleep 0.01 },
-    worker_poll_interval: 0.01,
-    command_executor: executor
+  ) + "\n")
+  exec(
+    RbConfig.ruby,
+    File.join(wlo_root, "bin", "wlo"),
+    "run",
+    plan_path,
+    "--workdir", workdir,
+    "--output", output_dir,
+    "--worker-source-command", RbConfig.ruby,
+    "--worker-source-arg", source_path,
+    "--worker-source-arg", cli_registry_path
   )
-  runner.run
-  exit
 end
 
 unless mode == "guardian"

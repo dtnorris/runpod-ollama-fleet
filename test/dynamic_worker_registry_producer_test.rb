@@ -5,6 +5,7 @@ require "open3"
 require "rbconfig"
 require "time"
 require_relative "../lib/runpod_ollama_fleet/dynamic_worker_registry"
+require_relative "fixtures/dynamic-worker-registry-v0.1/conformance"
 
 class DynamicWorkerRegistryProducerTest < Minitest::Test
   DIGEST = "a" * 64
@@ -118,6 +119,7 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     }], worker.dig("capabilities", "ollama", "models")
     assert_equal RunpodOllamaFleet::DynamicWorkerRegistry.capability_fingerprint(worker),
                  worker.fetch("capability_fingerprint")
+    assert_equal snapshot, DynamicWorkerRegistryV01::Conformance.validate_document!(snapshot, now: @now)
   end
 
   def test_generation_bound_gate_is_authoritative_for_ready_publication
@@ -309,8 +311,23 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
     ))
   end
 
+  def test_publication_changes_only_its_durable_revision_state
+    before = provider_owned_files
+
+    snapshot = registry.snapshot
+
+    assert_equal before, provider_owned_files
+    assert_equal "READY", snapshot.dig("workers", 0, "state")
+    assert File.file?(File.join(
+      @publisher_root,
+      RunpodOllamaFleet::DynamicWorkerRegistry::PUBLISHER_STATE_FILE
+    ))
+  end
+
   def test_canonical_dw01_fixture_uses_the_producer_fingerprint
-    fixture = JSON.parse(File.read(File.join(__dir__, "fixtures", "dynamic-worker-registry-v0.1.json")))
+    fixture = JSON.parse(File.read(File.join(
+      __dir__, "fixtures", "dynamic-worker-registry-v0.1", "minimal-valid.json"
+    )))
     worker = fixture.fetch("workers").first
 
     assert_equal worker.fetch("capability_fingerprint"),
@@ -395,6 +412,16 @@ class DynamicWorkerRegistryProducerTest < Minitest::Test
   end
 
   private
+
+  def provider_owned_files
+    publisher_prefix = "#{File.expand_path(@publisher_root)}/"
+    Dir[File.join(@tmp, "**", "*")].select { |path| File.file?(path) }.filter_map do |path|
+      expanded = File.expand_path(path)
+      next if expanded.start_with?(publisher_prefix)
+
+      [expanded.delete_prefix("#{File.expand_path(@tmp)}/"), Digest::SHA256.file(expanded).hexdigest]
+    end.to_h
+  end
 
   def identity(index, generation)
     {

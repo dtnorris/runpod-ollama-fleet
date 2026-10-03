@@ -5,41 +5,33 @@ require "digest"
 require "time"
 require "uri"
 require_relative "../lib/runpod_ollama_fleet/dynamic_worker_registry"
+require_relative "fixtures/dynamic-worker-registry-v0.1/conformance"
 
 class DynamicWorkerRegistryContractTest < Minitest::Test
-  FIXTURE = File.expand_path("fixtures/dynamic-worker-registry-v0.1.json", __dir__)
-  INVALID_ROOT = File.expand_path("fixtures/dynamic-worker-registry-v0.1-invalid", __dir__)
-  AUTHORITATIVE_SHA256 = {
-    "fixtures/dynamic-worker-registry-v0.1.json" =>
-      "58c8f7e79b61bb454948ee045a6f7df89453a7805b54ed438df8d8b8dcb2ba26",
-    "fixtures/dynamic-worker-registry-v0.1-invalid/bad-contract-version.json" =>
-      "2d2d1de94283ac2694b717b5a21817c4be02292296321660d4616fadf1630f45",
-    "fixtures/dynamic-worker-registry-v0.1-invalid/bad-endpoint.json" =>
-      "06c53db11ff489ba30f49fa24d444aadd82c5b64f4fffb4ec092b9c7b000f4bd",
-    "fixtures/dynamic-worker-registry-v0.1-invalid/bad-fingerprint.json" =>
-      "7d9afb6834594fbc85dab591a09ed4bca82735e6856c0060fdc732dcdeedf417",
-    "fixtures/dynamic-worker-registry-v0.1-invalid/bad-publication-window.json" =>
-      "833b303395e8cd46329d40ac63c52922ded9239f9d352a7c392efdbb98e59b1c",
-    "fixtures/dynamic-worker-registry-v0.1-invalid/bad-state.json" =>
-      "e90a4ed6e4907595479c231467a723aee4e35c7d872a6fbe507f03c7ea2a6127",
-    "fixtures/dynamic-worker-registry-v0.1-invalid/duplicate-worker-id.json" =>
-      "fb334f5f996a0e6f16bb4880303b027443cfa16ce9f9f1693e96aced65816dbb",
-    "fixtures/dynamic-worker-registry-v0.1-invalid/missing-generation.json" =>
-      "c0d0b86037813f05e08df80789d00152d0e086d9fd403aca9b200ab789aa8ddf"
-  }.freeze
+  FIXTURE_ROOT = File.expand_path("fixtures/dynamic-worker-registry-v0.1", __dir__)
+  FIXTURE = File.join(FIXTURE_ROOT, "minimal-valid.json")
+  INVALID_ROOT = File.join(FIXTURE_ROOT, "invalid")
+  NOW = Time.iso8601("2030-01-01T00:01:00Z")
 
   def test_fixture_bytes_match_the_authoritative_contract
-    actual_paths = [FIXTURE] + Dir[File.join(INVALID_ROOT, "*.json")]
-    expected_paths = AUTHORITATIVE_SHA256.keys.map { |path| File.expand_path(path, __dir__) }
+    manifest = File.readlines(File.join(FIXTURE_ROOT, "SHA256SUMS"), chomp: true)
+    manifest_paths = manifest.to_h do |line|
+      expected, relative = line.split(/\s+/, 2)
+      [relative, expected]
+    end
+    copied_paths = Dir[File.join(FIXTURE_ROOT, "**", "*")].select { |path| File.file?(path) }
+    copied_paths = copied_paths.reject { |path| path.end_with?("SHA256SUMS") }
+    copied_paths.map! { |path| path.delete_prefix("#{FIXTURE_ROOT}/") }
 
-    assert_equal expected_paths.sort, actual_paths.sort
-    AUTHORITATIVE_SHA256.each do |path, expected_hash|
-      assert_equal expected_hash, Digest::SHA256.file(File.expand_path(path, __dir__)).hexdigest
+    assert_equal copied_paths.sort, manifest_paths.keys.sort
+    manifest_paths.each do |relative, expected|
+      assert_equal expected, Digest::SHA256.file(File.join(FIXTURE_ROOT, relative)).hexdigest, relative
     end
   end
 
   def test_canonical_fixture_identity_publication_and_capabilities
     document = fixture
+    assert_same document, DynamicWorkerRegistryV01::Conformance.validate_document!(document, now: NOW)
     worker = document.fetch("workers").first
     model = worker.dig("capabilities", "ollama", "models").first
 
@@ -72,27 +64,15 @@ class DynamicWorkerRegistryContractTest < Minitest::Test
                  worker.fetch("capability_fingerprint")
   end
 
-  def test_invalid_fixtures_cover_required_fail_closed_cases
-    version = invalid_fixture("bad-contract-version.json")
-    missing = invalid_fixture("missing-generation.json").fetch("workers").first
-    endpoint = URI.parse(invalid_fixture("bad-endpoint.json").dig("workers", 0, "endpoint"))
-    bad_fingerprint = invalid_fixture("bad-fingerprint.json").fetch("workers").first
-    publication = invalid_fixture("bad-publication-window.json")
-    state = invalid_fixture("bad-state.json").dig("workers", 0, "state")
-    duplicate_ids = invalid_fixture("duplicate-worker-id.json").fetch("workers").map do |worker|
-      worker.fetch("worker_id")
+  def test_invalid_fixtures_fail_closed_for_the_intended_reason
+    invalid_expectations.each do |relative, expected_message|
+      error = assert_raises(DynamicWorkerRegistryV01::Conformance::Error, relative) do
+        DynamicWorkerRegistryV01::Conformance.validate_bytes!(
+          File.binread(File.join(FIXTURE_ROOT, relative)), now: NOW
+        )
+      end
+      assert_includes error.message, expected_message
     end
-
-    refute_equal "dynamic-worker-registry/v0.1", version.fetch("contract_version")
-    refute missing.key?("generation_id")
-    refute_nil endpoint.userinfo
-    refute_nil endpoint.query
-    refute_equal RunpodOllamaFleet::DynamicWorkerRegistry.capability_fingerprint(bad_fingerprint),
-                 bad_fingerprint.fetch("capability_fingerprint")
-    refute_operator Time.iso8601(publication.fetch("expires_at")), :>,
-                    Time.iso8601(publication.fetch("published_at"))
-    refute_includes %w[READY NOT_READY UNAVAILABLE], state
-    refute_equal duplicate_ids.uniq, duplicate_ids
   end
 
   def test_every_capability_change_invalidates_the_fingerprint
@@ -162,12 +142,13 @@ class DynamicWorkerRegistryContractTest < Minitest::Test
 
   private
 
-  def fixture
-    JSON.parse(File.read(FIXTURE))
+  def invalid_expectations
+    path = File.join(FIXTURE_ROOT, "INVALID_EXPECTATIONS.tsv")
+    File.readlines(path, chomp: true).to_h { |line| line.split("\t", 2) }
   end
 
-  def invalid_fixture(name)
-    JSON.parse(File.read(File.join(INVALID_ROOT, name)))
+  def fixture
+    JSON.parse(File.read(FIXTURE))
   end
 
   def deep_copy(value)
