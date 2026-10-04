@@ -1,0 +1,52 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "optparse"
+require "dotenv"
+ROOT = File.expand_path("..", __dir__)
+Dotenv.load(File.join(ROOT, ".env"))
+require_relative "../lib/runpod_ollama_fleet/capacity_planning_evidence"
+
+options = { hardware: File.join(ROOT, "config/execution_pool_hardware.yml") }
+parser = OptionParser.new do |o|
+  o.banner = "Usage: bin/rpof planning-evidence --campaign FILE --budget FILE --state-root DIR " \
+             "--profile-id ID --capability-request FILE --proposed-workers N [--hardware FILE]"
+  o.on("--campaign FILE") { |v| options[:campaign] = v }
+  o.on("--budget FILE") { |v| options[:budget] = v }
+  o.on("--state-root DIR") { |v| options[:state_root] = v }
+  o.on("--profile-id ID") { |v| options[:profile_id] = v }
+  o.on("--capability-request FILE") { |v| options[:capability_request] = v }
+  o.on("--proposed-workers N", Integer) { |v| options[:proposed_workers] = v }
+  o.on("--hardware FILE") { |v| options[:hardware] = v }
+  o.on("--json", "Always emits the versioned JSON evidence contract") {}
+  o.separator "Read-only catalog observation and advisory preview. No provider capacity or authority is changed."
+end
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::InvalidArgument, "unexpected arguments" unless ARGV.empty?
+  %i[campaign budget state_root profile_id capability_request proposed_workers].each do |key|
+    raise OptionParser::MissingArgument, "--#{key.to_s.tr('_', '-')}" if options[key].nil?
+  end
+  hardware = RunpodOllamaFleet::ExecutionPoolHardware.new(path: options.fetch(:hardware))
+  campaign = RunpodOllamaFleet::CapacityCampaign.load(path: options.fetch(:campaign), hardware:)
+  binding = RunpodOllamaFleet::CampaignBudgetBinding.new(
+    root: options.fetch(:state_root), repo_root: ROOT, campaign:,
+    declaration: JSON.parse(File.binread(options.fetch(:budget)))
+  )
+  request = RunpodOllamaFleet::OllamaCapabilityRequest.load(options.fetch(:capability_request))
+  evidence = RunpodOllamaFleet::CapacityPlanningEvidence.new(
+    binding:, profile_id: options.fetch(:profile_id), capability_request: request,
+    client: LocalModelEvaluation::RunpodClient.new(api_key: ENV.fetch("RUNPOD_API_KEY", ""))
+  ).document(proposed_workers: options.fetch(:proposed_workers))
+  puts JSON.pretty_generate(evidence)
+rescue OptionParser::ParseError, JSON::ParserError, SystemCallError, ArgumentError, KeyError,
+       RunpodOllamaFleet::CapacityPlanningEvidence::Error,
+       RunpodOllamaFleet::CampaignBudgetBinding::Error,
+       RunpodOllamaFleet::CapacityCampaign::Error,
+       RunpodOllamaFleet::ExecutionPoolHardware::Error,
+       RunpodOllamaFleet::OllamaCapabilityRequest::Error,
+       LocalModelEvaluation::RunpodClient::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end

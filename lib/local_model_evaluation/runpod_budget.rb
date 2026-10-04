@@ -117,7 +117,7 @@ module LocalModelEvaluation
 
     def verify_limits!(budget)
       normalized = normalize_budget(budget)
-      with_lock do
+      with_read_lock do
         document = load_state!
         verify_immutable_budget!(document, normalized)
         true
@@ -151,7 +151,7 @@ module LocalModelEvaluation
     end
 
     def status
-      with_lock do
+      with_read_lock do
         document = load_state!
         snapshot(document, now: utc_now)
       end
@@ -733,6 +733,17 @@ module LocalModelEvaluation
       document
     rescue JSON::ParserError, SystemCallError => e
       raise Error, "budget state is unreadable: #{e.message}"
+    end
+
+    def with_read_lock
+      File.open(@lock_path, File::RDONLY) do |lock|
+        lock.flock(File::LOCK_SH)
+        yield
+      ensure
+        lock.flock(File::LOCK_UN) rescue nil
+      end
+    rescue SystemCallError => e
+      raise Error, "retained authority is unavailable: #{e.message}"
     end
 
     def with_lock

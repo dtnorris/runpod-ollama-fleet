@@ -135,7 +135,7 @@ module LocalModelEvaluation
 
     def positive_float(value, label)
       number = Float(value)
-      raise ArgumentError unless number.positive?
+      raise ArgumentError unless number.positive? && number.finite?
       number
     rescue ArgumentError, TypeError
       raise Error, "#{label} must be a positive number"

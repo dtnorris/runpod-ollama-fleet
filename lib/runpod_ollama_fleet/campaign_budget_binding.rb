@@ -159,7 +159,7 @@ module RunpodOllamaFleet
 
     # Read-only evidence for operators, including ambiguous ARMING outcomes.
     def inspect_authority
-      binding = with_lock { binding_snapshot(load_state!) }
+      binding = with_read_lock { binding_snapshot(load_state!) }
       ledger = safe_parent_status
       guardian = safe_guardian_status
       binding.merge(
@@ -170,7 +170,7 @@ module RunpodOllamaFleet
     end
 
     def status
-      binding = with_lock { binding_snapshot(load_state!) }
+      binding = with_read_lock { binding_snapshot(load_state!) }
       unless binding.fetch("phase") == "ARMED"
         raise Error, "campaign budget is #{binding.fetch('phase')}; it is not armed"
       end
@@ -192,11 +192,23 @@ module RunpodOllamaFleet
       raise Error, e.message
     end
 
+    # Verified retained authority even when the independent guardian cannot be
+    # observed. This does not evaluate or persist a mutation decision.
+    def planning_authority
+      binding = with_read_lock { binding_snapshot(load_state!) }
+      ledger = @parent_budget.status
+      verify_ledger!(ledger)
+      verify_original_times!(binding, ledger)
+      binding.merge("parent_budget" => ledger)
+    rescue LocalModelEvaluation::RunpodBudget::Error, KeyError, ArgumentError, TypeError => e
+      raise Error, e.message
+    end
+
     # Authoritative, read-only paid-start proof. The calculation consumes the
     # same durable ledger and guardian evidence used by live mutation admission;
     # it neither refreshes a heartbeat nor changes budget state.
     def safety_report(projected_workers:, projected_hourly_rate_usd:)
-      binding = with_lock { binding_snapshot(load_state!) }
+      binding = with_read_lock { binding_snapshot(load_state!) }
       ledger = @parent_budget.status
       verify_ledger!(ledger)
       verify_original_times!(binding, ledger)
@@ -883,6 +895,17 @@ module RunpodOllamaFleet
 
     def binding_snapshot(document)
       Marshal.load(Marshal.dump(document))
+    end
+
+    def with_read_lock
+      File.open(@lock_path, File::RDONLY) do |lock|
+        lock.flock(File::LOCK_SH)
+        yield
+      ensure
+        lock.flock(File::LOCK_UN) rescue nil
+      end
+    rescue SystemCallError => e
+      raise Error, "retained authority is unavailable: #{e.message}"
     end
 
     def with_lock

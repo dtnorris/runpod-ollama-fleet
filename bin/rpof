@@ -16,6 +16,8 @@ when "capability-check"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-capability-check"), *ARGV
 when "capacity"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-capacity"), *ARGV
+when "planning-evidence"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-planning-evidence"), *ARGV
 when "campaign"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-campaign"), *ARGV
 when "bounded-fleet"
@@ -61,6 +63,7 @@ else
       capacity
       campaign
       bounded-fleet
+      planning-evidence
       fulfill
       runtime-alias
       workers
@@ -91,6 +94,8 @@ else
       campaign desired-set
         CONTROL REQUEST. It updates revisioned desired state without contacting
         the provider. A running matching controller consumes the accepted revision.
+      planning-evidence
+        ONE-SHOT READ-ONLY catalog evidence and admission preview; never mutation permission.
       bounded-fleet preview
         ONE-SHOT INSPECTION. It validates and displays bounded intent without
         retaining authority or mutating provider, guardian, controller, or registry state.
