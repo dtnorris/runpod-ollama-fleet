@@ -1,0 +1,43 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "optparse"
+
+ROOT = File.expand_path("..", __dir__)
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "runpod_ollama_fleet"
+
+options = {
+  state_root: File.join(ROOT, "output", "runpod-fleets"),
+  bringup_root: nil, budget_id: nil, plan_sha256: nil,
+  desired_workers: nil, registry: nil
+}
+parser = OptionParser.new do |o|
+  o.banner = "Usage: bin/rpof-measurements --budget-id ID --plan-sha256 SHA [options]"
+  o.on("--state-root DIR", "RPOF budget state root") { |v| options[:state_root] = v }
+  o.on("--bringup-root DIR", "FO-11 bring-up state root (defaults to state root)") { |v| options[:bringup_root] = v }
+  o.on("--budget-id ID", "Tracked budget identity") { |v| options[:budget_id] = v }
+  o.on("--plan-sha256 SHA", "Tracked budget plan/binding SHA-256") { |v| options[:plan_sha256] = v }
+  o.on("--desired-workers N", Integer, "Optional associated desired-capacity count") { |v| options[:desired_workers] = v }
+  o.on("--registry FILE", "Optional public dynamic-worker-registry JSON snapshot") { |v| options[:registry] = v }
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+  raise OptionParser::MissingArgument, "--budget-id" if options[:budget_id].to_s.empty?
+  raise OptionParser::MissingArgument, "--plan-sha256" if options[:plan_sha256].to_s.empty?
+  registry = options[:registry] && JSON.parse(File.binread(File.expand_path(options[:registry])))
+  result = RunpodOllamaFleet::ProviderMeasurements.from_root(
+    root: options.fetch(:state_root),
+    bringup_root: options[:bringup_root] || options.fetch(:state_root),
+    budget_id: options.fetch(:budget_id), plan_sha256: options.fetch(:plan_sha256),
+    desired_workers: options[:desired_workers], registry:
+  ).document
+  puts JSON.pretty_generate(result)
+rescue JSON::ParserError, SystemCallError, OptionParser::ParseError,
+       RunpodOllamaFleet::ProviderMeasurements::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end
