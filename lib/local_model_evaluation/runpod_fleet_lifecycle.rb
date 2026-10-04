@@ -306,6 +306,9 @@ module LocalModelEvaluation
             raise Error, "burst_#{index} cannot be retired from state #{worker.fetch('status').inspect}"
           end
 
+          if worker["lifecycle"] && worker.dig("lifecycle", "phase") != "retired"
+            raise Error, "selected lifecycle worker must use campaign remove"
+          end
           reject_unexpected_replacement_name!(worker)
           delete_scaled_worker_pod(worker)
           if @capacity_admission
@@ -339,6 +342,9 @@ module LocalModelEvaluation
         raise Error, "current fleet no longer contains burst_#{index}" unless old_worker
         unless old_worker.fetch("pod_id").to_s == preflight.current_worker.fetch("pod_id").to_s
           raise Error, "burst_#{index} changed since replacement preflight; run preflight again"
+        end
+        if old_worker["lifecycle"] && old_worker.dig("lifecycle", "phase") != "retired"
+          raise Error, "selected lifecycle worker cannot be replaced before verified retirement"
         end
         reject_unexpected_replacement_name!(old_worker)
 
@@ -425,7 +431,92 @@ module LocalModelEvaluation
       end
     end
 
+    def select_worker!(operation:, fleet_id:, worker_id:, generation_id:, pod_id:,
+                       expected_revision:, reason:, registry:, confirm: false)
+      with_lifecycle_lock(fleet_id) do
+        fleet = lifecycle_fleet!(expected_fleet_id: fleet_id, enforce_lease: false)
+        require_matching_campaign_admission!(fleet)
+        worker = exact_selected_worker!(fleet, worker_id:, generation_id:, pod_id:)
+        phase = worker.dig("lifecycle", "phase")
+        revision = worker.dig("lifecycle", "revision") || 0
+        unless expected_revision == revision
+          raise Error, "stale worker lifecycle revision: expected #{expected_revision}, current #{revision}"
+        end
+        raise Error, "reason is required" if reason.to_s.strip.empty?
+        identity = { fleet_id:, worker_id:, generation_id:, pod_id: }
+        case operation
+        when "drain"
+          return worker.fetch("lifecycle") if phase
+          raise Error, "only an active worker can drain" unless worker["status"] == "active"
+          registry.with_publication_lock do
+            retained = registry.retained_worker(worker)
+            @fleet_state.transition_worker_lifecycle!(**identity, phase: "draining", reason:, registry_worker: retained)
+          end
+        when "remove"
+          raise Error, "remove requires explicit --confirm-remove; RPOF does not infer execution completion" unless confirm
+          raise Error, "drain exact generation before remove" unless phase
+          return worker.fetch("lifecycle") unless phase == "draining"
+          @fleet_state.transition_worker_lifecycle!(**identity, phase: "retirement_requested", reason:)
+        else
+          raise Error, "unknown selected-worker operation"
+        end
+      end
+    end
+
+    def reconcile_retirements!
+      fleet = @fleet_state.current
+      return [] unless fleet && fleet["status"] == "active"
+
+      with_lifecycle_lock(fleet.fetch("fleet_id")) do
+        fleet = lifecycle_fleet!(expected_fleet_id: fleet.fetch("fleet_id"), enforce_lease: false)
+        require_matching_campaign_admission!(fleet)
+        fleet.fetch("workers").filter_map do |worker|
+          lifecycle = worker["lifecycle"]
+          next unless lifecycle && %w[retirement_requested delete_in_progress delete_ambiguous retired].include?(lifecycle["phase"])
+          if lifecycle["phase"] == "retired"
+            mark_campaign_resource_absent!(worker.fetch("pod_id"))
+            remove_worker_env([worker.fetch("index")])
+            next lifecycle
+          end
+          identity = worker.slice("worker_id", "generation_id", "pod_id").transform_keys(&:to_sym)
+          identity[:fleet_id] = fleet.fetch("fleet_id")
+          reason = lifecycle.fetch("reason")
+          begin
+            if lifecycle["phase"] == "retirement_requested"
+              # Persist BEFORE the provider call. A restart only verifies absence;
+              # it never guesses whether an interrupted delete was sent.
+              @fleet_state.transition_worker_lifecycle!(**identity, phase: "delete_in_progress", reason:)
+              delete_scaled_worker_pod(worker)
+            end
+            verify_provider_absent!(worker.fetch("pod_id"))
+            # Keep the conservative active ledger entry until both local retirement
+            # evidence and remote absence are durable. A crash cannot allow reuse.
+            result = @fleet_state.transition_worker_lifecycle!(**identity, phase: "retired", reason:)
+            mark_campaign_resource_absent!(worker.fetch("pod_id"))
+            remove_worker_env([worker.fetch("index")])
+            result
+          rescue StandardError => e
+            current = @fleet_state.load(identity.fetch(:fleet_id)).fetch("workers").find do |row|
+              row["worker_id"] == identity.fetch(:worker_id)
+            end
+            unless current.dig("lifecycle", "phase") == "retired"
+              @fleet_state.transition_worker_lifecycle!(**identity, phase: "delete_ambiguous", reason:, error: e.message)
+            end
+            raise Error, "selected retirement incomplete: #{e.message}"
+          end
+        end
+      end
+    end
+
     private
+
+    def exact_selected_worker!(fleet, worker_id:, generation_id:, pod_id:)
+      worker = fleet.fetch("workers").find { |row| row["worker_id"] == worker_id }
+      unless worker && worker["generation_id"] == generation_id && worker["pod_id"] == pod_id
+        raise Error, "selected worker generation/provider identity changed"
+      end
+      worker
+    end
 
     def assert_durable_worker_identity!
       @fleet_state.assert_durable_worker_identity!

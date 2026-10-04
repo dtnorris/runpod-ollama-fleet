@@ -1,0 +1,37 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Optional, external composition harness. RPOF production never loads WLO.
+# Usage: bundle exec ruby script/test-fo14-wlo-drain /path/to/pinned/workload-orchestrator
+wlo = File.expand_path(ARGV.shift || abort("supply a WLO checkout"))
+ARGV.replace(["--name", "test_fo14_real_drain_preserves_running_attempt"])
+require File.join(wlo, "test", "dynamic_worker_loss_test.rb")
+require_relative "../test/support/selected_worker_fixture"
+
+class DynamicWorkerLossTest
+  def test_fo14_real_drain_preserves_running_attempt
+    fixture = SelectedWorkerFixture.new
+    fixture.now = NOW - 2
+    before = fixture.registry.snapshot
+    poller = poller_for(JSON.generate(before))
+    poller.poll_once
+    attempt = start_attempt(poller.ready_workers.fetch(0))
+    persisted = File.binread(File.join(@output, "runs/job-1/metadata.json"))
+    fixture.select("drain")
+    fixture.now += 1
+    drained = fixture.registry.snapshot
+    resumed = poller_for(JSON.generate(drained))
+    resumed.poll_once
+    assert_empty resumed.ready_workers
+    assert_empty reconciler_for.reconcile!(resumed)
+    assert_equal "running", metadata_for.fetch("status")
+    assert_equal persisted, File.binread(File.join(@output, "runs/job-1/metadata.json"))
+    assert_equal attempt.worker_binding.tuple, resumed.current_workers.fetch(0).execution_identity
+    assert_equal before.fetch("workers").first.merge("state" => "UNAVAILABLE"), drained.fetch("workers").first
+    assert_empty fixture.client.deleted
+    @store.record_dynamic_terminal!(attempt: attempt, status: "complete", exit_status: 0)
+    assert_equal "complete", metadata_for.fetch("status")
+  ensure
+    fixture&.close
+  end
+end

@@ -158,6 +158,35 @@ class RpofCampaignCliTest < Minitest::Test
     assert_includes stderr, "--expected-revision"
   end
 
+  def test_add_routes_absolute_target_and_revision_to_existing_campaign
+    received = nil
+    result = { "command" => "campaign add", "provider_mutations" => 0 }
+    stdout, stderr, status = with_stubbed_campaign(:add, result, argument_sink: ->(args) { received = args }) do
+      run_cli("add", "--profile", "qwen35=2", "--expected-revision", "3", "--reason", "add", "--json")
+    end
+    assert status.success?, stderr
+    assert_equal result, JSON.parse(stdout)
+    assert_equal({ profile_counts: { "qwen35" => 2 }, expected_revision: 3, reason: "add" }, received)
+  end
+
+  def test_selected_control_passes_exact_identity_confirmation_and_revision
+    received = nil
+    result = { "command" => "campaign remove", "provider_mutations" => 0 }
+    stdout, stderr, status = with_stubbed_campaign(:select_worker, result, argument_sink: ->(args) { received = args }) do
+      run_cli("remove", "--profile-id", "qwen35", "--fleet-id", "fleet-1", "--worker-id", "worker-1",
+              "--generation-id", "generation-1", "--pod-id", "pod-1", "--expected-revision", "1",
+              "--reason", "operator confirmed", "--confirm-remove", "--json")
+    end
+    assert status.success?, stderr
+    assert_equal result, JSON.parse(stdout)
+    assert_equal({ operation: "remove", profile_id: "qwen35", fleet_id: "fleet-1", worker_id: "worker-1",
+                   generation_id: "generation-1", pod_id: "pod-1", expected_revision: 1,
+                   reason: "operator confirmed", confirm: true }, received)
+    _stdout, stderr, status = run_cli("drain", "--profile-id", "qwen35")
+    refute status.success?
+    assert_includes stderr, "--fleet-id"
+  end
+
   private
 
   def with_stubbed_campaign(action, result, argument_sink: nil)

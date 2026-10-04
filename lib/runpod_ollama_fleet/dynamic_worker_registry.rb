@@ -40,6 +40,29 @@ module RunpodOllamaFleet
     end
 
     def snapshot
+      with_publication_lock { snapshot_locked }
+    end
+
+    def with_publication_lock
+      FileUtils.mkdir_p(@state_root)
+      File.open(File.join(@state_root, PUBLISHER_LOCK_FILE), File::RDWR | File::CREAT, 0o600) do |lock|
+        lock.flock(File::LOCK_EX)
+        yield
+      end
+    end
+
+    # Called while holding the publication lock, before drain is persisted.
+    def retained_worker(worker)
+      state = load_publisher_state
+      row = state&.dig("snapshot", "workers")&.find { |item| item["worker_id"] == worker["worker_id"] }
+      return nil unless row
+      unless row["generation_id"] == worker["generation_id"] && row["endpoint"] == worker["local_ollama_url"]
+        raise Error, "published worker identity differs from selected generation"
+      end
+      Marshal.load(Marshal.dump(row)).merge("state" => "UNAVAILABLE")
+    end
+
+    def snapshot_locked
       workers = sources.flat_map { |source| workers_for(source) }
                        .sort_by { |worker| worker.fetch("worker_id") }
       identities = workers.map { |worker| worker.fetch("worker_id") }
@@ -191,6 +214,11 @@ module RunpodOllamaFleet
     end
 
     def build_worker(fleet_key:, state:, fleet:, worker:, bootstrap:, runtime_aliases:, tunnels:)
+      lifecycle = worker["lifecycle"]
+      if lifecycle
+        return nil if lifecycle.fetch("phase") == "retired"
+        return lifecycle["registry_worker"]
+      end
       index = positive_integer(worker.fetch("index"), "worker index")
       pod_id = nonempty(worker.fetch("pod_id"), "worker pod identity")
       gpu_id = worker_gpu_id(fleet, worker)
@@ -417,9 +445,7 @@ module RunpodOllamaFleet
 
     def publish_snapshot(workers, observed_at)
       published_at = Time.at(observed_at.to_i).utc
-      FileUtils.mkdir_p(@state_root)
-      File.open(File.join(@state_root, PUBLISHER_LOCK_FILE), File::RDWR | File::CREAT, 0o600) do |lock|
-        lock.flock(File::LOCK_EX)
+      begin
         state = load_publisher_state
         registry_id = state ? state.fetch("registry_id") : @id_generator.call.to_s
         raise Error, "publisher registry_id is invalid" unless registry_id.is_a?(String) && registry_id.match?(ID)
@@ -434,7 +460,12 @@ module RunpodOllamaFleet
           previous = state.fetch("snapshot")
           previous_time = Time.iso8601(previous.fetch("published_at"))
           raise Error, "publisher clock moved backwards" if published_at < previous_time
-          return previous if published_at == previous_time
+          if published_at == previous_time
+            if previous.fetch("workers") != workers
+              raise Error, "worker state changed within publication second; retry next second"
+            end
+            return previous
+          end
         end
 
         revision = state ? Integer(state.fetch("revision")) + 1 : 1

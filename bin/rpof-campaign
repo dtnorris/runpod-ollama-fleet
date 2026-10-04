@@ -25,7 +25,7 @@ options = {
 }
 
 parser = OptionParser.new do |o|
-  o.banner = "Usage: bin/rpof campaign plan|start|status|stop|desired|desired-set " \
+  o.banner = "Usage: bin/rpof campaign plan|start|status|stop|desired|desired-set|add|drain|remove " \
              "--campaign FILE --budget FILE [options]"
   o.on("--campaign FILE", "DW-04 campaign declaration") { |v| options[:campaign] = v }
   o.on("--budget FILE", "DW-05 campaign budget declaration") { |v| options[:budget] = v }
@@ -36,12 +36,18 @@ parser = OptionParser.new do |o|
     options[:capability_requests] << v
   end
   o.on("--authorize-paid", "Explicitly authorize provider creation (start only)") { options[:authorize_paid] = true }
-  o.on("--profile ID=COUNT", "Desired profile count (desired-set; repeatable)") do |v|
+  o.on("--profile ID=COUNT", "Absolute desired count (desired-set/add; repeatable)") do |v|
     options[:desired_profiles] << v
   end
-  o.on("--expected-revision N", Integer, "Compare-and-set desired revision") do |v|
+  o.on("--expected-revision N", Integer, "Compare-and-set desired revision, or selected worker lifecycle revision") do |v|
     options[:expected_revision] = v
   end
+  o.on("--profile-id ID", "Selected worker's retained campaign profile") { |v| options[:profile_id] = v }
+  o.on("--fleet-id ID", "Exact retained fleet identity") { |v| options[:fleet_id] = v }
+  o.on("--worker-id ID", "Exact retained logical worker identity") { |v| options[:worker_id] = v }
+  o.on("--generation-id ID", "Exact generation to drain/remove") { |v| options[:generation_id] = v }
+  o.on("--pod-id ID", "Exact retained provider resource") { |v| options[:pod_id] = v }
+  o.on("--confirm-remove", "Operator confirms retirement; RPOF does not infer busy/idle") { options[:confirm] = true }
   o.on("--reason TEXT", "Mutation reason (desired-set) or teardown reason (stop)") { |v| options[:reason] = v }
   o.on("--json", "Emit machine-readable JSON") { options[:json] = true }
   o.separator ""
@@ -127,8 +133,13 @@ def render_human(command, result)
         puts "    candidates: #{order.join(' -> ')}"
         puts "    fallback stop: #{fallback['stop_reason']}" if fallback["stop_reason"]
       end
+      Array(row["worker_lifecycle"]).each do |worker|
+        puts "    worker=#{worker['worker_id']} generation=#{worker['generation_id']} pod=#{worker['pod_id']} " \
+             "phase=#{worker['phase']} revision=#{worker['revision']} mutation=#{worker['mutation_id'] || '-'}"
+        puts "      error=#{worker['error'] || '-'} next=#{worker['next_action']}"
+      end
     end
-  when "desired", "desired-set"
+  when "desired", "desired-set", "add"
     state = result.fetch("desired_capacity")
     action = command == "desired" ? "READ-ONLY desired capacity" : "Desired capacity update"
     puts "#{action}: #{result.dig('campaign', 'campaign_id')}"
@@ -137,8 +148,15 @@ def render_human(command, result)
     result.fetch("profiles").each do |row|
       puts "  #{row.fetch('profile_id')}: desired=#{row.fetch('desired_workers')} max=#{row.fetch('max_workers')}"
     end
-    puts "Updated=#{result.fetch('updated')}" if command == "desired-set"
-    puts "THIS REQUEST CONTACTED NO PROVIDER; A RUNNING CONTROLLER MAY RECONCILE THE REVISION"
+    puts "Updated=#{result.fetch('updated')}" unless command == "desired"
+    if command == "add"
+      puts "DESIRED TARGET REQUESTED; PROVIDER CREATION REMAINS SUPERVISED AND ADMISSION-GATED"
+    else
+      puts "THIS REQUEST CONTACTED NO PROVIDER; A RUNNING CONTROLLER MAY RECONCILE THE REVISION"
+    end
+  when "drain", "remove"
+    puts JSON.pretty_generate(result)
+    puts "Intent retained. Drain takes effect on the next fresh registry snapshot; remove is controller-owned."
   when "stop"
     puts "Campaign stop: budget=#{result.fetch('budget_state')} absence_verified=#{result.fetch('provider_absence_verified')}"
     puts result.fetch("message")
@@ -182,19 +200,24 @@ end
 begin
   parser.parse!(ARGV)
   raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
-  commands = %w[plan start status stop desired desired-set]
+  commands = %w[plan start status stop desired desired-set add drain remove]
   raise OptionParser::InvalidArgument, "command must be #{commands.join(', ')}" unless commands.include?(command)
   raise OptionParser::MissingArgument, "--campaign" unless options[:campaign]
   raise OptionParser::MissingArgument, "--budget" unless options[:budget]
   if options[:authorize_paid] && command != "start"
     raise OptionParser::InvalidArgument, "--authorize-paid is valid only for campaign start"
   end
-  if command == "desired-set"
+  if %w[desired-set add].include?(command)
     raise OptionParser::MissingArgument, "--expected-revision" if options[:expected_revision].nil?
     raise OptionParser::MissingArgument, "--profile" if options[:desired_profiles].empty?
     raise OptionParser::MissingArgument, "--reason" unless options[:reason]
+  elsif %w[drain remove].include?(command)
+    %i[profile_id fleet_id worker_id generation_id pod_id expected_revision reason].each do |key|
+      raise OptionParser::MissingArgument, "--#{key.to_s.tr('_', '-')}" if options[key].nil?
+    end
+    raise OptionParser::InvalidArgument, "--profile is only for desired-set/add" unless options[:desired_profiles].empty?
   elsif !options[:desired_profiles].empty? || !options[:expected_revision].nil?
-    raise OptionParser::InvalidArgument, "--profile and --expected-revision are valid only for desired-set"
+    raise OptionParser::InvalidArgument, "--profile/--expected-revision require desired-set, add, drain, or remove"
   end
 
   desired_profiles = options[:desired_profiles].each_with_object({}) do |value, counts|
@@ -290,9 +313,15 @@ begin
              )
            when "status" then lifecycle.status
            when "stop" then lifecycle.stop(reason: options[:reason] || "operator requested campaign stop")
+           when "drain", "remove"
+             lifecycle.select_worker(
+               operation: command,
+               **options.slice(:profile_id, :fleet_id, :worker_id, :generation_id, :pod_id,
+                               :expected_revision, :reason, :confirm)
+             )
            when "desired" then lifecycle.desired
-           when "desired-set"
-             lifecycle.set_desired(
+           when "desired-set", "add"
+             lifecycle.public_send(command == "add" ? :add : :set_desired,
                profile_counts: desired_profiles,
                expected_revision: options[:expected_revision],
                reason: options[:reason]

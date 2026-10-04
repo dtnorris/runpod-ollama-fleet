@@ -294,7 +294,56 @@ module LocalModelEvaluation
       raise Error, "could not complete replacement: #{e.message}"
     end
 
+    # Caller holds the existing fleet lifecycle lock. Identity is checked again
+    # at each durable transition, including recovery after an uncertain delete.
+    def transition_worker_lifecycle!(fleet_id:, worker_id:, generation_id:, pod_id:,
+                                     phase:, reason:, registry_worker: nil, error: nil)
+      record = load(fleet_id)
+      worker = record.fetch("workers").find { |row| row["worker_id"] == worker_id }
+      unless worker && worker["generation_id"] == generation_id && worker["pod_id"] == pod_id
+        raise Error, "selected worker generation/provider identity changed"
+      end
+      previous = worker["lifecycle"] || {}
+      allowed = {
+        nil => %w[draining], "draining" => %w[retirement_requested],
+        "retirement_requested" => %w[delete_in_progress],
+        "delete_in_progress" => %w[delete_ambiguous retired],
+        "delete_ambiguous" => %w[delete_ambiguous retired], "retired" => []
+      }
+      unless allowed.fetch(previous["phase"]).include?(phase)
+        raise Error, "invalid worker lifecycle transition #{previous['phase'].inspect} -> #{phase}"
+      end
+      lifecycle = previous.merge(
+        "worker_id" => worker_id, "generation_id" => generation_id, "pod_id" => pod_id,
+        "phase" => phase, "revision" => previous.fetch("revision", 0) + 1,
+        "mutation_id" => previous["mutation_id"] || "retire-#{Digest::SHA256.hexdigest(generation_id)}",
+        "reason" => reason, "updated_at_utc" => utc_now.iso8601, "error" => error
+      )
+      lifecycle["registry_worker"] = registry_worker if registry_worker
+      lifecycle["history"] = Array(previous["history"]) + [lifecycle.except("history", "registry_worker")]
+      if phase == "retired"
+        lifecycle["provider_absence_verified_at_utc"] = utc_now.iso8601
+        worker["status"] = "destroyed"
+        worker["destroyed_at_utc"] ||= utc_now.iso8601
+      end
+      worker["lifecycle"] = lifecycle
+      refresh_fleet_totals!(record)
+      write_record(record)
+      lifecycle
+    end
+
     def mark_destroyed(indices, reason: nil)
+      id = current_id
+      return nil unless id
+      File.open(File.join(fleet_dir(id), ".lifecycle.lock"), File::RDWR | File::CREAT, 0o600) do |lock|
+        unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+          raise Error, "fleet lifecycle mutation is running; retry destruction state reconciliation"
+        end
+        mark_destroyed_locked(indices, reason:)
+      end
+    end
+
+    def mark_destroyed_locked(indices, reason: nil)
       record = current
       return nil unless record
 
@@ -409,7 +458,11 @@ module LocalModelEvaluation
     def atomic_write(path, content)
       FileUtils.mkdir_p(File.dirname(path))
       tmp = "#{path}.tmp.#{$$}.#{Thread.current.object_id}"
-      File.write(tmp, content)
+      File.open(tmp, File::WRONLY | File::CREAT | File::TRUNC, 0o600) do |file|
+        file.write(content)
+        file.flush
+        file.fsync
+      end
       File.rename(tmp, path)
     ensure
       File.delete(tmp) if defined?(tmp) && tmp && File.exist?(tmp)
@@ -504,7 +557,7 @@ module LocalModelEvaluation
     def historical_worker(worker)
       %w[
         generation worker_id generation_id name pod_id host ssh_port hourly_rate_usd gpu_id
-        created_at_utc destroyed_at_utc
+        created_at_utc destroyed_at_utc lifecycle
       ].each_with_object({}) do |key, out|
         out[key] = worker[key] if worker.key?(key)
       end
@@ -699,6 +752,22 @@ module LocalModelEvaluation
         parse_time(worker["created_at_utc"], "worker created_at_utc") if worker["created_at_utc"]
         if worker["status"] == "destroyed" && worker["destroyed_at_utc"]
           parse_time(worker.fetch("destroyed_at_utc"), "worker destroyed_at_utc")
+        end
+        if (lifecycle = worker["lifecycle"])
+          unless lifecycle.slice("worker_id", "generation_id", "pod_id") ==
+                 worker.slice("worker_id", "generation_id", "pod_id") &&
+                 %w[draining retirement_requested delete_in_progress delete_ambiguous retired].include?(lifecycle["phase"]) &&
+                 lifecycle["revision"].is_a?(Integer) && lifecycle["revision"].positive?
+            raise Error, "invalid generation-bound worker lifecycle"
+          end
+          retained = lifecycle["registry_worker"]
+          if retained && (retained.slice("worker_id", "generation_id") != worker.slice("worker_id", "generation_id") ||
+                          retained["endpoint"] != worker["local_ollama_url"] || retained["state"] != "UNAVAILABLE")
+            raise Error, "retained drain publication conflicts with worker identity"
+          end
+          if lifecycle["phase"] == "retired" && !lifecycle["provider_absence_verified_at_utc"]
+            raise Error, "retired worker lacks provider absence evidence"
+          end
         end
         Array(worker["history"]).each do |prior|
           prior_generation = Integer(prior.fetch("generation", 1))

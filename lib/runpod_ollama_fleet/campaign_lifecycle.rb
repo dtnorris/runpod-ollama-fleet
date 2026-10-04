@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "time"
+require "fileutils"
 require_relative "campaign_capacity_admission"
 require_relative "desired_capacity"
 require_relative "dynamic_worker_registry"
@@ -200,6 +201,59 @@ module RunpodOllamaFleet
       raise Error, e.message
     end
 
+    # Absolute target counts retain FO-13 CAS/idempotence semantics; admission
+    # still governs every later provider create. No new budget or runtime horizon.
+    def add(profile_counts:, expected_revision:, reason:)
+      authority = @binding.status
+      verify_started_authority!(authority)
+      current = @desired_capacity.current
+      unless current.fetch("revision") == expected_revision
+        raise Error, "stale desired-capacity revision"
+      end
+      counts = current.fetch("profiles").to_h { |row| [row.fetch("profile_id"), row.fetch("desired_workers")] }
+      profile_counts.each do |id, count|
+        raise Error, "add cannot lower desired capacity" if counts.key?(id) && count < counts.fetch(id)
+      end
+      proposed = current.merge("profiles" => counts.merge(profile_counts).map do |id, count|
+        { "profile_id" => id, "desired_workers" => count }
+      end)
+      prepared = prepare_start(authority, profiles: profiles_for(proposed))
+      @binding.assert_safety_gate!(
+        projected_workers: prepared.fetch("projected_workers"),
+        projected_hourly_rate_usd: prepared.fetch("projected_hourly_rate_usd")
+      )
+      set_desired(profile_counts:, expected_revision:, reason:).merge("command" => "campaign add")
+    rescue CampaignBudgetBinding::Error, DesiredCapacity::Error => e
+      raise Error, e.message
+    end
+
+    def select_worker(**options)
+      with_capacity_control_lock { select_worker_locked(**options) }
+    end
+
+    def select_worker_locked(operation:, profile_id:, **options)
+      authority = existing_authority
+      raise Error, "campaign has not been bound" unless authority
+      verify_started_authority!(authority)
+      profile = profiles_for(@desired_capacity.current).find { |row| row["profile_id"] == profile_id }
+      raise Error, "unknown campaign profile" unless profile
+      admission = CampaignCapacityAdmission.new(binding: @binding, profile_id:)
+      runtime = @runtime_factory.call(profile, hardware_for(profile), admission)
+      if operation == "remove" && profile.fetch("desired_workers") >= runtime.current_worker_count
+        # Removal is not a desired-capacity update. Explicitly lower FO-13 intent
+        # first so the controller cannot immediately replenish removed capacity.
+        target = runtime.status.fetch("worker_lifecycle").find { |row| row["worker_id"] == options[:worker_id] }
+        unless target && %w[retirement_requested delete_in_progress delete_ambiguous retired].include?(target["phase"])
+          raise Error, "lower desired capacity before requesting selected removal"
+        end
+      end
+      result = runtime.select_worker!(operation:, **options)
+      { "command" => "campaign #{operation}", "profile_id" => profile_id,
+        "provider_mutations" => 0, "worker_lifecycle" => result }
+    rescue CampaignRunpodRuntime::Error, CampaignBudgetBinding::Error, DesiredCapacity::Error => e
+      raise Error, e.message
+    end
+
     def stop(reason: "operator requested campaign stop")
       authority = existing_authority
       raise Error, "campaign has not been bound" unless authority
@@ -232,10 +286,21 @@ module RunpodOllamaFleet
     # One controller-owned reconciliation pass. Each pass reads FO-13's current
     # identity-bound desired-capacity revision before calculating admission.
     def reconcile_once(ssh_public_key_path:)
+      with_capacity_control_lock { reconcile_once_locked(ssh_public_key_path:) }
+    end
+
+    def reconcile_once_locked(ssh_public_key_path:)
       authority = @binding.status
       verify_started_authority!(authority)
       desired_state = @desired_capacity.current
       profiles = profiles_for(desired_state)
+      profiles.each do |profile|
+        admission = CampaignCapacityAdmission.new(binding: @binding, profile_id: profile.fetch("profile_id"))
+        runtime = @runtime_factory.call(profile, hardware_for(profile), admission)
+        runtime.reconcile_retirements! if runtime.respond_to?(:reconcile_retirements!)
+      end
+      authority = @binding.status
+      verify_started_authority!(authority)
       prepared = prepare_start(authority, profiles:)
       safety_report = @binding.assert_safety_gate!(
         projected_workers: prepared.fetch("projected_workers"),
@@ -253,11 +318,26 @@ module RunpodOllamaFleet
       }
     rescue CampaignBudgetBinding::Error, CampaignCapacityAdmission::Error, DesiredCapacity::Error => e
       raise Error, e.message
+    rescue CampaignRunpodRuntime::Error => e
+      raise TransientReconciliationError, e.message
     rescue DynamicWorkerRegistry::Error => e
       raise TransientReconciliationError, "dynamic worker registry publication failed: #{e.message}"
     end
 
     private
+
+    # Covers the complete supervised pass, including FO-15 candidate cleanup.
+    # DesiredCapacity retains its separate public CAS; it cannot mutate providers.
+    def with_capacity_control_lock
+      directory = File.dirname(@binding.state_path)
+      FileUtils.mkdir_p(directory)
+      File.open(File.join(directory, ".capacity-control.lock"), File::RDWR | File::CREAT, 0o600) do |lock|
+        unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+          raise TransientReconciliationError, "campaign capacity reconciliation is running; retry control request"
+        end
+        yield
+      end
+    end
 
     def reconcile_profile(row, authority, ssh_public_key_path)
       profile = row.fetch("profile")

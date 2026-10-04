@@ -439,6 +439,39 @@ class AvailabilityFallbackTest < Minitest::Test
     assert_equal 1, @binding.status.dig("authority", "committed_workers_by_profile", "qwen35")
   end
 
+  def test_selected_drain_and_retired_slot_reuse_preserve_appended_candidate_fallback
+    provider = Provider.new([gpu(A40, 0.49), gpu(BLACKWELL, 2.09)])
+    runtime = runtime(provider:, bringup: PassingBringup.new)
+    runtime.ensure_workers!(**ensure_arguments)
+    state = LocalModelEvaluation::RunpodFleetState.new(root: File.join(@tmp, "fleets", "qwen35"))
+    worker = state.current.fetch("workers").first
+    identity = worker.slice("worker_id", "generation_id", "pod_id").transform_keys(&:to_sym)
+    identity[:fleet_id] = state.current.fetch("fleet_id")
+    assert_raises(RunpodOllamaFleet::CampaignRunpodRuntime::Error) do
+      runtime.select_worker!(operation: "drain", **identity, expected_revision: 0, reason: "unproven candidate")
+    end
+    runtime.reconcile_bringup!(desired_workers: 1, transition_guard: -> {})
+    runtime.select_worker!(operation: "drain", **identity, expected_revision: 0, reason: "operator drain")
+    runtime.ensure_workers!(**ensure_arguments.merge(desired_workers: 2))
+    runtime.reconcile_bringup!(desired_workers: 2, transition_guard: -> {})
+    assert_equal "accepted", runtime.status.dig("availability_fallback", "state")
+    runtime.select_worker!(operation: "remove", **identity, expected_revision: 1, reason: "operator removal", confirm: true)
+    runtime.reconcile_retirements!
+    assert_equal [worker.fetch("pod_id")], provider.deleted_ids
+    accepted = runtime.status.fetch("availability_fallback")
+    runtime.ensure_workers!(**ensure_arguments.merge(desired_workers: 2))
+    assert_equal accepted, runtime.status.fetch("availability_fallback")
+    assert_equal 2, state.current.fetch("workers").first.fetch("generation")
+    assert_equal 2, runtime.current_worker_count
+    runtime.ensure_workers!(**ensure_arguments.merge(desired_workers: 3))
+    runtime.reconcile_bringup!(desired_workers: 3, transition_guard: -> {})
+    assert_equal "accepted", runtime.status.dig("availability_fallback", "state")
+    assert_equal 2, runtime.status.dig("availability_fallback", "from_workers")
+    assert_equal 3, runtime.status.dig("availability_fallback", "target_workers")
+    assert_equal [worker.fetch("pod_id")], provider.deleted_ids
+    assert_equal @deadline, @binding.status.fetch("deadline_at_utc")
+  end
+
   private
 
   def runtime(provider:, required_gpu_id: nil, bringup: nil)

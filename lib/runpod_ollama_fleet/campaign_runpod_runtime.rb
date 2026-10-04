@@ -46,7 +46,8 @@ module RunpodOllamaFleet
 
     def current_worker_count
       record = current_record
-      record && record["status"] == "active" ? Integer(record.fetch("worker_count")) : 0
+      return 0 unless record && record["status"] == "active"
+      record.fetch("workers").count { |worker| worker.dig("lifecycle", "phase") != "retired" }
     end
 
     def status
@@ -73,6 +74,20 @@ module RunpodOllamaFleet
         "registry_error" => readiness["error"],
         "fleet_id" => record && record["fleet_id"],
         "fleet_status" => record && record["status"],
+        "worker_lifecycle" => workers.map do |worker|
+          lifecycle = worker["lifecycle"] || { "phase" => "active", "revision" => 0 }
+          worker.slice("index", "worker_id", "generation_id", "pod_id").merge(
+            lifecycle.except("registry_worker").merge(
+              "next_action" => case lifecycle["phase"]
+                               when "active" then "drain exact generation before removal"
+                               when "draining" then "lower desired capacity, then explicitly confirm remove"
+                               when "retired" then "none; provider absence verified"
+                               when "delete_ambiguous", "delete_in_progress" then "verify provider absence; campaign stop delegates unresolved teardown to guardian"
+                               else "wait for supervised retirement; inspect campaign status"
+                               end
+            )
+          )
+        end,
         "worker_readiness" => workers.group_by { |row| row.fetch("status") }.transform_values(&:length)
       }
       fallback = @availability_fallback&.current
@@ -84,6 +99,8 @@ module RunpodOllamaFleet
                         max_hourly_rate_usd:)
       raise Error, "campaign provider client is unavailable" unless @client
       raise Error, "campaign admission is required for a paid mutation" unless @admission
+      restore_retired_workers!(desired_workers:, ssh_public_key_path:, max_hourly_rate_usd:)
+      return true if current_worker_count >= desired_workers
       return ensure_workers_with_fallback!(
         desired_workers:, ssh_public_key_path:, original_deadline_at_utc:, max_hourly_rate_usd:
       ) if @availability_fallback
@@ -99,6 +116,24 @@ module RunpodOllamaFleet
            LocalModelEvaluation::RunpodFleetLifecycle::Error,
            LocalModelEvaluation::RunpodFleetNamespace::Error,
            AvailabilityFallback::Error => e
+      raise Error, e.message
+    end
+
+    def select_worker!(**options)
+      assert_selected_candidate_settled!(options.fetch(:worker_id), options.fetch(:operation))
+      provider_lifecycle.select_worker!(
+        **options,
+        registry: DynamicWorkerRegistry.new(state_root: @root, repo_root: @repo_root)
+      )
+    rescue LocalModelEvaluation::RunpodFleetLifecycle::Error,
+           LocalModelEvaluation::RunpodFleetState::Error, DynamicWorkerRegistry::Error => e
+      raise Error, e.message
+    end
+
+    def reconcile_retirements!
+      provider_lifecycle.reconcile_retirements!
+    rescue LocalModelEvaluation::RunpodFleetLifecycle::Error,
+           LocalModelEvaluation::RunpodFleetState::Error => e
       raise Error, e.message
     end
 
@@ -121,9 +156,9 @@ module RunpodOllamaFleet
       fleet = current_record
       return [] unless fleet && fleet["status"] == "active"
       adopt_provisioned_fallback!(fleet)
-      workers = Array(fleet.fetch("workers")).select { |worker| worker["status"] == "active" }
-                                              .sort_by { |worker| Integer(worker.fetch("index")) }
-                                              .first(desired)
+      workers = Array(fleet.fetch("workers")).select do |worker|
+        worker["status"] == "active" && !worker["lifecycle"]
+      end.sort_by { |worker| Integer(worker.fetch("index")) }.first(desired)
       reconciler = bringup_reconciler(transition_guard)
       states = workers.map do |worker|
         reconciler.reconcile!(
@@ -426,6 +461,57 @@ module RunpodOllamaFleet
         nil
       end
       raise Error, "candidate cleanup failed; fallback is blocked: #{e.message}"
+    end
+
+    def provider_lifecycle
+      namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
+        root: @root, repo_root: @repo_root, fleet_key: profile_id
+      )
+      LocalModelEvaluation::RunpodFleetLifecycle.new(
+        client: @client, fleet_state: current_state, env_path: namespace.env_path,
+        fleet_key: profile_id, local_port_base: namespace.local_port_base,
+        capacity_admission: @admission, out: @out, wall_clock: @wall_clock
+      )
+    end
+
+    # A retired slot uses the existing exact-GPU replacement primitive. It is
+    # not an appended FO-15 candidate range and must not enter candidate cleanup.
+    def restore_retired_workers!(desired_workers:, ssh_public_key_path:, max_hourly_rate_usd:)
+      fleet = current_record
+      return unless fleet && fleet["status"] == "active"
+      missing = Integer(desired_workers) - current_worker_count
+      return unless missing.positive?
+      retired = fleet.fetch("workers").select { |worker| worker.dig("lifecycle", "phase") == "retired" }.first(missing)
+      return if retired.empty?
+      fallback = @availability_fallback&.current
+      if fallback && !%w[accepted exhausted].include?(fallback["state"])
+        raise Error, "resolve retained availability fallback before reusing retired slots"
+      end
+      namespace = LocalModelEvaluation::RunpodFleetNamespace.new(root: @root, repo_root: @repo_root, fleet_key: profile_id)
+      provider = LocalModelEvaluation::RunpodFleet.new(
+        client: @client, env_path: namespace.env_path, state_root: namespace.state_root,
+        fleet_key: profile_id, capacity_admission: @admission, out: @out
+      )
+      ssh_key = provider.read_ssh_public_key(ssh_public_key_path)
+      lifecycle = provider_lifecycle
+      retired.each do |worker|
+        preflight = lifecycle.preflight_replace(worker_index: worker.fetch("index"), max_fleet_hourly_usd: max_hourly_rate_usd)
+        lifecycle.replace(worker_index: worker.fetch("index"), ssh_public_key: ssh_key, preflight:,
+                          max_fleet_hourly_usd: max_hourly_rate_usd)
+      end
+    end
+
+    def assert_selected_candidate_settled!(worker_id, operation)
+      fallback = @availability_fallback&.current
+      return unless fallback && %w[active blocked].include?(fallback["state"])
+      if operation == "remove"
+        raise Error, "resolve retained availability fallback before selected removal, or stop campaign"
+      end
+      worker = current_record&.fetch("workers")&.find { |row| row["worker_id"] == worker_id }
+      return unless worker
+      if worker.fetch("index") > fallback.fetch("from_workers") && worker.fetch("index") <= fallback.fetch("target_workers")
+        raise Error, "selected worker belongs to an unresolved FO-15 candidate; resolve candidate or stop campaign"
+      end
     end
 
     def readiness_status

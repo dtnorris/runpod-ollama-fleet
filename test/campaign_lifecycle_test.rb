@@ -263,6 +263,83 @@ class CampaignLifecycleTest < Minitest::Test
     FileUtils.remove_entry(@tmp) if @tmp && File.exist?(@tmp)
   end
 
+  def test_add_is_fo13_cas_and_reuses_original_authority
+    @lifecycle.set_desired(profile_counts: { "qwen35" => 1 }, expected_revision: 0, reason: "initial smaller fleet")
+    @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
+    before = @binding.status.slice("deadline_at_utc", "armed_at_utc", "binding_sha256")
+    creates = @events.count("provider_create")
+    result = @lifecycle.add(profile_counts: { "qwen35" => 2 }, expected_revision: 1, reason: "operator add")
+    assert result.fetch("updated")
+    assert_equal creates, @events.count("provider_create")
+    repeated = @lifecycle.add(profile_counts: { "qwen35" => 2 }, expected_revision: 2, reason: "repeat")
+    refute repeated.fetch("updated")
+    assert_raises(RunpodOllamaFleet::CampaignLifecycle::Error) do
+      @lifecycle.add(profile_counts: { "qwen35" => 2 }, expected_revision: 1, reason: "stale")
+    end
+    @controller.reconcile!(binding: @binding, ssh_public_key_path: "unused")
+    @controller.reconcile!(binding: @binding, ssh_public_key_path: "unused")
+    assert_equal creates + 1, @events.count("provider_create")
+    assert_equal before, @binding.status.slice("deadline_at_utc", "armed_at_utc", "binding_sha256")
+    assert_equal "batch039-parent", result.dig("desired_capacity", "budget_id")
+  end
+
+  def test_add_rejects_profile_campaign_hourly_deadline_and_stopped_authority
+    @lifecycle.set_desired(profile_counts: { "qwen35" => 1 }, expected_revision: 0, reason: "initial smaller fleet")
+    @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
+    [{ "qwen27" => 2 }, { "qwen35" => 7 }].each do |counts|
+      assert_raises(RunpodOllamaFleet::CampaignLifecycle::Error) do
+        @lifecycle.add(profile_counts: counts, expected_revision: 1, reason: "over maximum")
+      end
+    end
+    @lifecycle.instance_variable_set(:@price_resolver, ->(*) { 100.0 })
+    assert_raises(RunpodOllamaFleet::CampaignLifecycle::Error) do
+      @lifecycle.add(profile_counts: { "qwen35" => 2 }, expected_revision: 1, reason: "over hourly cap")
+    end
+    assert_equal 1, @lifecycle.desired.dig("desired_capacity", "revision")
+    @now += 6000
+    assert_raises(RunpodOllamaFleet::CampaignLifecycle::Error) do
+      @lifecycle.add(profile_counts: { "qwen35" => 2 }, expected_revision: 1, reason: "expired")
+    end
+    @lifecycle.stop
+    assert_raises(RunpodOllamaFleet::CampaignLifecycle::Error) do
+      @lifecycle.add(profile_counts: { "qwen35" => 2 }, expected_revision: 1, reason: "stopped")
+    end
+  end
+
+  def test_two_add_terminals_only_commit_one_desired_revision
+    @lifecycle.set_desired(profile_counts: { "qwen35" => 1 }, expected_revision: 0, reason: "initial smaller fleet")
+    @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
+    creates = @events.count("provider_create")
+    outcomes = 2.times.map do
+      Thread.new do
+        @lifecycle.add(profile_counts: { "qwen35" => 2 }, expected_revision: 1, reason: "concurrent add")
+        :updated
+      rescue RunpodOllamaFleet::CampaignLifecycle::Error
+        :stale
+      end
+    end.map(&:value)
+    assert_equal %i[stale updated], outcomes.sort
+    assert_equal 2, @lifecycle.desired.dig("desired_capacity", "revision")
+    @controller.reconcile!(binding: @binding, ssh_public_key_path: "unused")
+    assert_equal creates + 1, @events.count("provider_create")
+  end
+
+  def test_selected_control_and_full_controller_pass_share_campaign_lock
+    @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
+    path = File.join(File.dirname(@binding.state_path), ".capacity-control.lock")
+    File.open(path, File::RDWR) do |lock|
+      lock.flock(File::LOCK_EX)
+      assert_raises(RunpodOllamaFleet::CampaignLifecycle::TransientReconciliationError) do
+        @lifecycle.select_worker(operation: "drain", profile_id: "qwen35")
+      end
+      assert_raises(RunpodOllamaFleet::CampaignLifecycle::TransientReconciliationError) do
+        @lifecycle.reconcile_once(ssh_public_key_path: "unused")
+      end
+      # The guardian's independent stop authority must not wait on this lock.
+      assert_equal "TEARDOWN_REQUIRED", @lifecycle.stop.fetch("budget_state")
+    end
+  end
+
   def test_plan_is_read_only_and_reports_exact_campaign_and_budget_intent
     result = @lifecycle.plan
 
@@ -555,6 +632,48 @@ class CampaignLifecycleTest < Minitest::Test
     assert_equal 2, provider.create_calls
     assert_equal 2, @binding.status.dig("authority", "committed_workers")
     assert_equal 2, runtime.status.fetch("ready_workers")
+  end
+
+  def test_runtime_drains_retires_and_reuses_selected_slot_under_the_same_budget
+    @binding.arm!
+    profile = @campaign.profiles.find { |row| row.fetch("profile_id") == "qwen35" }
+    hardware = @campaign.hardware_bindings.find { |row| row.fetch("profile_id") == "qwen35" }
+    provider = Provider.new
+    admission = RunpodOllamaFleet::CampaignCapacityAdmission.new(binding: @binding, profile_id: "qwen35")
+    runtime = RunpodOllamaFleet::CampaignRunpodRuntime.new(
+      root: @tmp, repo_root: @tmp, profile:, hardware:, client: provider,
+      admission:, out: StringIO.new, wall_clock: -> { @now }
+    )
+    key_path = File.join(@tmp, "campaign.pub")
+    File.write(key_path, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEexamplecampaignkey operator@example\n")
+    deadline = @binding.status.fetch("deadline_at_utc")
+    runtime.ensure_workers!(desired_workers: 2, ssh_public_key_path: key_path,
+                            original_deadline_at_utc: deadline, max_hourly_rate_usd: 6.0)
+    state = LocalModelEvaluation::RunpodFleetState.new(root: File.join(@tmp, "fleets", "qwen35"))
+    old = state.current.fetch("workers").first
+    identity = old.slice("worker_id", "generation_id", "pod_id").transform_keys(&:to_sym)
+    identity[:fleet_id] = state.current.fetch("fleet_id")
+    runtime.select_worker!(operation: "drain", **identity, expected_revision: 0, reason: "operator drain")
+    assert_equal 2, runtime.current_worker_count
+    assert_equal "draining", runtime.status.dig("worker_lifecycle", 0, "phase")
+    runtime.select_worker!(operation: "remove", **identity, expected_revision: 1, reason: "operator remove", confirm: true)
+    runtime.reconcile_retirements!
+    assert_equal 1, runtime.current_worker_count
+    assert_equal 1, @binding.status.dig("authority", "committed_workers")
+    assert_equal "retired", runtime.status.dig("worker_lifecycle", 0, "phase")
+    runtime.ensure_workers!(desired_workers: 2, ssh_public_key_path: key_path,
+                            original_deadline_at_utc: deadline, max_hourly_rate_usd: 6.0)
+    replacement = state.current.fetch("workers").first
+    assert_equal old.fetch("worker_id"), replacement.fetch("worker_id")
+    refute_equal old.fetch("generation_id"), replacement.fetch("generation_id")
+    assert_equal 2, replacement.fetch("generation")
+    assert_equal 3, provider.create_calls
+    refute replacement.key?("lifecycle")
+    assert_equal 2, @binding.status.dig("authority", "committed_workers")
+    assert_equal deadline, @binding.status.fetch("deadline_at_utc")
+    assert_raises(RunpodOllamaFleet::CampaignRunpodRuntime::Error) do
+      runtime.select_worker!(operation: "remove", **identity, expected_revision: 4, reason: "stale", confirm: true)
+    end
   end
 
   def test_initial_campaign_rollback_releases_only_verified_absent_created_worker
