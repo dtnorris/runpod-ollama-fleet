@@ -192,6 +192,11 @@ failure domain instead of claiming a provider-side hard total-spend cap. See
 
 ## Versioned desired capacity
 
+The normative [desired-capacity contract](contracts/rpof-desired-capacity/v0.1/README.md)
+is owned here. The specification-repository path is now a composition reference.
+
+
+
 `rpof-capacity-campaign/v0.1` remains frozen: its positive `min_workers`,
 `desired_workers` and `max_workers` validation and identity hashing are
 unchanged. RPOF overlays explicit mutable intent with

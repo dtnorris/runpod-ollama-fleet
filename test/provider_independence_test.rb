@@ -6,6 +6,11 @@ class ProviderIndependenceTest < Minitest::Test
   REPO_ROOT = File.expand_path("..", __dir__)
   RUBY_ROOTS = %w[bin lib test].freeze
 
+  def test_loaded_features_contain_no_sibling_implementation
+    forbidden = $LOADED_FEATURES.grep(/(?:adventure[_-]finder|af[_-]workloads|workload[_-]orchestrator|local[_-]ollama[_-]workers)/i)
+    assert_empty forbidden
+  end
+
   def test_ruby_dependency_graph_has_no_low_implementation_import
     violations = imports.select { |_path, required| required.include?("local_ollama_workers") }
     assert_empty violations

@@ -146,7 +146,7 @@ class Dw31WloDeathSafetyTest < Minitest::Test
   end
 
   def teardown
-    @wlo_pids.each { |pid| kill_process(pid) }
+    @wlo_pids&.each { |pid| kill_process(pid) }
     @guardian&.stop
     FileUtils.remove_entry(@tmp) if @tmp && File.exist?(@tmp)
   end
