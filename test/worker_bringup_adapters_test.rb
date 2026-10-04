@@ -87,7 +87,7 @@ class WorkerBringupAdaptersTest < Minitest::Test
     @state = State.new(@tmp, @fleet)
     @identity = RunpodOllamaFleet::WorkerBringupIdentity.new(
       campaign_identity_sha256: CAMPAIGN_SHA, profile:, worker: @worker,
-      generation_id: "generation-1", requirement: @requirement
+      generation_id: "generation-1", capability_request: @requirement
     ).document
     @attempt = { "attempt_id" => "attempt-1", "launch_identity" => nil,
                  "created_at_utc" => "2030-01-01T00:00:00Z" }
@@ -135,7 +135,7 @@ class WorkerBringupAdaptersTest < Minitest::Test
     )
     second_identity = RunpodOllamaFleet::WorkerBringupIdentity.new(
       campaign_identity_sha256: CAMPAIGN_SHA, profile:, worker: second_worker,
-      generation_id: "generation-2", requirement: @requirement
+      generation_id: "generation-2", capability_request: @requirement
     ).document
 
     result = adapter.start!(

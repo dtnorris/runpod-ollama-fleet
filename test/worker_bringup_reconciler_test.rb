@@ -167,8 +167,8 @@ class WorkerBringupReconcilerTest < Minitest::Test
     assert result.fetch("readiness_prerequisites_satisfied")
     assert_equal %w[passed passed passed],
                  %w[tunnel bootstrap capability].map { |stage| result.dig(stage, "status") }
-    assert_equal requirement.fingerprint, result.dig("identity", "model_requirement_sha256")
-    assert_equal requirement.document, result.fetch("model_requirement")
+    assert_equal capability_request.fingerprint, result.dig("identity", "model_requirement_sha256")
+    assert_equal capability_request.document, result.fetch("model_requirement")
     assert_equal 1, @tunnel.ensures
     assert_equal 1, @bootstrap.starts
     assert_equal 1, @capability.verifications
@@ -228,27 +228,48 @@ class WorkerBringupReconcilerTest < Minitest::Test
     assert_includes error.message, "superseded"
   end
 
-  def test_same_generation_with_different_exact_requirement_fails_closed
+  def test_same_generation_with_different_exact_capability_fails_closed
     reconciler.reconcile!(**arguments)
-    changed = requirement_document
+    changed = capability_request_document
     changed["ollama"]["expected_digest"] = "d" * 64
-    changed_requirement = RunpodOllamaFleet::ModelRequirement.new(changed)
+    changed_request = RunpodOllamaFleet::OllamaCapabilityRequest.new(JSON.generate(changed))
     changed_profile = profile.merge("expected_digest" => "d" * 64)
 
     error = assert_raises(RunpodOllamaFleet::WorkerBringupReconciler::Error) do
-      reconciler.reconcile!(**arguments(profile: changed_profile, requirement: changed_requirement))
+      reconciler.reconcile!(**arguments(profile: changed_profile, capability_request: changed_request))
     end
 
     assert_includes error.message, "conflicts"
   end
 
-  def test_generation_and_requirement_mismatches_are_rejected_before_adapters
+  def test_generation_mismatches_are_rejected_before_adapters
     error = assert_raises(RunpodOllamaFleet::WorkerBringupReconciler::Error) do
       reconciler.reconcile!(**arguments(generation_id: "generation-other"))
     end
 
     assert_includes error.message, "requested generation"
     assert_equal 0, @tunnel.ensures
+  end
+
+  def test_residency_evidence_is_compared_to_the_exact_generic_boolean
+    document = capability_request_document
+    document["ollama"]["require_fully_gpu_resident"] = false
+    request = RunpodOllamaFleet::OllamaCapabilityRequest.new(JSON.generate(document))
+    changed_profile = profile.merge("require_fully_gpu_resident" => false)
+
+    result = reconciler.reconcile!(**arguments(profile: changed_profile, capability_request: request))
+
+    assert_equal "failed_terminal", result.fetch("overall_status")
+    assert_includes result.dig("bootstrap", "error"), "fully_gpu_resident"
+  end
+
+  def test_historical_model_requirement_remains_an_explicit_compatibility_input
+    legacy = RunpodOllamaFleet::ModelRequirement.new(legacy_requirement_document)
+
+    result = reconciler.reconcile!(**arguments(capability_request: legacy))
+
+    assert_equal legacy.fingerprint, result.dig("identity", "model_requirement_sha256")
+    assert_equal legacy.document, result.fetch("model_requirement")
   end
 
   private
@@ -271,7 +292,7 @@ class WorkerBringupReconcilerTest < Minitest::Test
       profile:,
       worker:,
       generation_id: worker.fetch("generation_id"),
-      requirement:
+      capability_request:
     }.merge(overrides)
   end
 
@@ -299,13 +320,28 @@ class WorkerBringupReconcilerTest < Minitest::Test
     }
   end
 
-  def requirement
-    @requirement ||= RunpodOllamaFleet::ModelRequirement.new(requirement_document)
+  def capability_request
+    @capability_request ||= RunpodOllamaFleet::OllamaCapabilityRequest.new(
+      JSON.generate(capability_request_document)
+    )
   end
 
-  def requirement_document
+  def capability_request_document
     {
-      "contract_version" => "adventurefinder-model-requirement/v0.1",
+      "contract_version" => RunpodOllamaFleet::OllamaCapabilityRequest::CONTRACT_VERSION,
+      "ollama" => {
+        "model" => "qualified-model:latest",
+        "expected_digest" => DIGEST,
+        "required_context_length" => 131_072,
+        "require_fully_gpu_resident" => true,
+        "required_gpu_id" => "NVIDIA A40"
+      }
+    }
+  end
+
+  def legacy_requirement_document
+    {
+      "contract_version" => RunpodOllamaFleet::ModelRequirement::CONTRACT_VERSION,
       "batch_handle" => "39",
       "production_batch_id" => "production-batch-039",
       "plan_id" => "production-batch-039",

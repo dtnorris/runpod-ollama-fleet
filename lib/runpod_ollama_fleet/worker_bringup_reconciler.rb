@@ -24,10 +24,10 @@ module RunpodOllamaFleet
       @attempt_id_generator = attempt_id_generator || -> { SecureRandom.uuid }
     end
 
-    def reconcile!(campaign_identity_sha256:, profile:, worker:, generation_id:, requirement:,
+    def reconcile!(campaign_identity_sha256:, profile:, worker:, generation_id:, capability_request:,
                    retry_bootstrap: false)
       identity = WorkerBringupIdentity.new(
-        campaign_identity_sha256:, profile:, worker:, generation_id:, requirement:
+        campaign_identity_sha256:, profile:, worker:, generation_id:, capability_request:
       )
       @state.with_current(identity) do |document, checkpoint|
         reconcile_tunnel(identity, document, checkpoint)
@@ -165,7 +165,7 @@ module RunpodOllamaFleet
     def validate_capability_evidence!(evidence, identity)
       raise TerminalTransitionError, "capability evidence is missing" unless evidence.is_a?(Hash)
       bringup = identity.document
-      required = identity.requirement.ollama
+      required = identity.capability_request.ollama
       comparisons = {
         "worker_id" => bringup.fetch("worker_id"),
         "generation_id" => bringup.fetch("generation_id"),
@@ -173,12 +173,12 @@ module RunpodOllamaFleet
         "model" => required.fetch("model"),
         "digest" => required.fetch("expected_digest"),
         "context_length" => required.fetch("required_context_length"),
-        "fully_gpu_resident" => true
+        "fully_gpu_resident" => required.fetch("require_fully_gpu_resident")
       }
       comparisons["gpu_id"] = required.fetch("required_gpu_id") if required.key?("required_gpu_id")
       comparisons.each do |field, expected|
         next if evidence[field] == expected
-        raise TerminalTransitionError, "capability evidence #{field} does not match exact model requirement"
+        raise TerminalTransitionError, "capability evidence #{field} does not match exact capability request"
       end
     end
 

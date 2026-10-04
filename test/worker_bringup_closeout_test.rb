@@ -222,7 +222,7 @@ class WorkerBringupCloseoutTest < Minitest::Test
         )
         reconciler.reconcile!(
           campaign_identity_sha256: @campaign_sha, profile: @profile, worker:,
-          generation_id: worker.fetch("generation_id"), requirement: @requirement,
+          generation_id: worker.fetch("generation_id"), capability_request: @requirement,
           retry_bootstrap: true
         )
       end
@@ -642,7 +642,7 @@ class WorkerBringupCloseoutTest < Minitest::Test
       profile: profile,
       worker:,
       generation_id: worker.fetch("generation_id"),
-      requirement: @requirement,
+      capability_request: @requirement,
       retry_bootstrap: true
     }
   end
@@ -652,7 +652,8 @@ class WorkerBringupCloseoutTest < Minitest::Test
     RunpodOllamaFleet::WorkerBringupIdentity.new(
       campaign_identity_sha256: values.fetch(:campaign_identity_sha256),
       profile: values.fetch(:profile), worker: values.fetch(:worker),
-      generation_id: values.fetch(:generation_id), requirement: values.fetch(:requirement)
+      generation_id: values.fetch(:generation_id),
+      capability_request: values.fetch(:capability_request)
     ).document
   end
 

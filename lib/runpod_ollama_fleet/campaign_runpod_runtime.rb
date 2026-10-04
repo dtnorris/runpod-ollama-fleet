@@ -146,7 +146,7 @@ module RunpodOllamaFleet
           profile: @profile,
           worker:,
           generation_id: worker.fetch("generation_id"),
-          requirement: @capability_request,
+          capability_request: @capability_request,
           retry_bootstrap: true
         )
       end

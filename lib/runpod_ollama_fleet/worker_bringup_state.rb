@@ -108,7 +108,9 @@ module RunpodOllamaFleet
         "contract_version" => CONTRACT_VERSION,
         "identity_sha256" => identity.sha256,
         "identity" => identity.document,
-        "model_requirement" => identity.requirement.document,
+        # Historical v0.1 field name. The nested contract_version identifies
+        # whether these exact retained bytes are generic or legacy.
+        "model_requirement" => identity.capability_request.document,
         "overall_status" => "not_started",
         "readiness_prerequisites_satisfied" => false,
         "created_at_utc" => now,
@@ -124,7 +126,7 @@ module RunpodOllamaFleet
       state = JSON.parse(File.binread(path))
       validate_shape!(state)
       unless state.fetch("identity_sha256") == identity.sha256 && state.fetch("identity") == identity.document &&
-             state.fetch("model_requirement") == identity.requirement.document
+             state.fetch("model_requirement") == identity.capability_request.document
         raise Error, "retained worker bring-up state identity does not match requested generation"
       end
       state

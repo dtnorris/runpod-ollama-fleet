@@ -14,12 +14,12 @@ module RunpodOllamaFleet
     def initialize(root:, campaign_identity_sha256:, requirements:)
       @state = WorkerBringupState.new(root:)
       @campaign_identity_sha256 = campaign_identity_sha256.to_s
-      @requirements = requirements.to_h.transform_keys(&:to_s)
+      @capability_requests = requirements.to_h.transform_keys(&:to_s)
     end
 
     def satisfied?(fleet_key:, worker:)
-      requirement = @requirements.fetch(fleet_key.to_s) do
-        raise Error, "no exact model requirement is bound to profile #{fleet_key.inspect}"
+      capability_request = @capability_requests.fetch(fleet_key.to_s) do
+        raise Error, "no exact capability request is bound to profile #{fleet_key.inspect}"
       end
       document = @state.read_current(worker_id: worker.fetch("worker_id"))
       return false unless document
@@ -34,13 +34,14 @@ module RunpodOllamaFleet
         "provider_resource_id" => worker.fetch("pod_id").to_s,
         "worker_id" => worker.fetch("worker_id").to_s,
         "generation_id" => worker.fetch("generation_id").to_s,
-        "model_requirement_sha256" => requirement.fingerprint
+        # Historical v0.1 field name; generic bring-up binds the WLO semantic fingerprint.
+        "model_requirement_sha256" => capability_request.fingerprint
       }
       expected.each { |field, value| return false unless identity[field] == value }
       return false unless identity.dig("tunnel_target", "host") == worker.fetch("host").to_s
       return false unless identity.dig("tunnel_target", "ssh_port") == Integer(worker.fetch("ssh_port"))
       return false unless identity.dig("tunnel_target", "ollama_endpoint") == endpoint(worker.fetch("local_ollama_url"))
-      return false unless document.fetch("model_requirement") == requirement.document
+      return false unless document.fetch("model_requirement") == capability_request.document
       return false unless document.fetch("readiness_prerequisites_satisfied") == true
       return false unless document.fetch("overall_status") == "prerequisites_passed"
 

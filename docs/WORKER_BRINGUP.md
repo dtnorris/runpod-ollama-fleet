@@ -8,10 +8,21 @@ possible only when the durable state says `readiness_prerequisites_satisfied`.
 
 The durable identity binds the campaign identity SHA, profile, logical worker
 slot, provider resource, worker ID, monotonically increasing worker generation,
-generation ID, tunnel target, and exact Ollama capability fingerprint. A
+generation ID, tunnel target, and exact generic Ollama capability fingerprint.
+AdventureFinder provenance is neither accepted by the generic request nor an
+input to the bring-up identity. Two generic requests with the same normalized
+runtime semantics therefore bind to the same capability fingerprint. A
 different generation or exact capability receives a different identity and
 cannot reuse retained evidence. Advancing the worker generation marks every
 stage of the prior identity stale and prevents it from becoming current again.
+
+The identity and state contracts remain v0.1. Their retained
+`model_requirement_sha256` and `model_requirement` keys are compatibility names:
+for new state they contain the WLO semantic capability fingerprint and the exact
+`ollama-capability-request/v0.1` document. The nested document contract version
+distinguishes new generic state from historical AF-shaped state. Historical
+records are read byte-for-byte under their original identity and are not
+recomputed, reinterpreted as generic requests, or rewritten in place.
 
 State is stored below `worker-bringup-v0.1/<worker-id>/`. Each identity has an
 immutable-name JSON record, while a locked and atomically replaced `current`
