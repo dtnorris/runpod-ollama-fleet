@@ -20,6 +20,10 @@ class OperatorProcessOwnershipTest < Minitest::Test
     assert_includes stderr, "Ctrl-C interrupts only this request"
     assert_includes stderr, "complete until campaign status reports CLOSED"
     assert_includes stderr, "WLO pause and RPOF teardown are separate lifecycle actions"
+    assert_includes stderr, "bounded-fleet preview"
+    assert_includes stderr, "retaining authority or mutating provider"
+    assert_includes stderr, "bounded-fleet view"
+    assert_includes stderr, "Ctrl-C stops only the view"
     assert_empty stdout
   end
 

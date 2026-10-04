@@ -18,6 +18,8 @@ when "capacity"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-capacity"), *ARGV
 when "campaign"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-campaign"), *ARGV
+when "bounded-fleet"
+  exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-bounded-fleet"), *ARGV
 when "fulfill"
   exec RbConfig.ruby, File.join(ROOT, "bin", "rpof-fulfill"), *ARGV
 when "runtime-alias"
@@ -58,6 +60,7 @@ else
       version
       capacity
       campaign
+      bounded-fleet
       fulfill
       runtime-alias
       workers
@@ -88,6 +91,16 @@ else
       campaign desired-set
         CONTROL REQUEST. It updates revisioned desired state without contacting
         the provider. A running matching controller consumes the accepted revision.
+      bounded-fleet preview
+        ONE-SHOT INSPECTION. It validates and displays bounded intent without
+        retaining authority or mutating provider, guardian, controller, or registry state.
+      bounded-fleet start
+        AUTHORITY COMPOSITION + DETACHED/SUPERVISED CONTROLLER LAUNCHER. It
+        retains exact existing campaign/budget/capability artifacts, then delegates
+        to campaign start; no second lifecycle or budget authority is created.
+      bounded-fleet view
+        ATTACHED READ-ONLY VIEW. Ctrl-C stops only the view; capacity, guardian,
+        controller, desired state, registry state, and WLO are unchanged.
       campaign start
         DETACHED/SUPERVISED CONTROLLER LAUNCHER. This initiating CLI is short-lived.
         One launchd controller continues reconciliation after CLI, WLO, shell, or

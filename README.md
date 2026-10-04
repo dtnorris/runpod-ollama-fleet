@@ -58,6 +58,7 @@ only if that checkout contains the exact frozen commit.
 
 ```text
 bin/rpof campaign plan|start|status|stop|desired|desired-set ...
+bin/rpof bounded-fleet preview|start|view ...
 bin/rpof workers --json
 bin/rpof create ...
 bin/rpof destroy ...
@@ -154,6 +155,9 @@ separate facts. The classifications below describe the invoking process:
 
 | Command | Classification | What remains after return | Ctrl-C / terminal loss | Correct lifecycle command |
 | --- | --- | --- | --- | --- |
+| `bounded-fleet preview` | ONE-SHOT INSPECTION | Existing resources remain unchanged; no authority artifacts, guardian, controller, tunnel, registry revision, or paid resource is created. | Interrupts only the preview. | Use explicit `bounded-fleet start --authorize-paid` only after reviewing the authority. |
+| `bounded-fleet start` | AUTHORITY COMPOSITION + DETACHED/SUPERVISED CONTROLLER LAUNCHER | Exact existing campaign/budget/capability artifacts are retained, then the existing `campaign start` guardian, safety-gate, and controller path owns operation. | After delegation, Ctrl-C does not imply rollback or teardown. | `campaign stop`, then status until `CLOSED` with provider absence verified. |
+| `bounded-fleet view` | ATTACHED READ-ONLY VIEW | Campaign capacity, guardian, controller, tunnels, registry state, desired state, and WLO continue. | Stops only the view. It does not clear desired state or stop any lifecycle owner. | `campaign stop` tears down capacity; WLO remains separate. |
 | `campaign plan`, `campaign status`, `campaign desired` | ONE-SHOT INSPECTION | Existing guardian, provider resources, tunnels and WLO execution continue. | Interrupts only the request/view. | `wlo pause` pauses work; `campaign stop` requests paid teardown. |
 | `campaign desired-set` | CONTROL REQUEST | Revisioned desired state changes; the request itself makes no provider call. A running matching controller reads the accepted revision on its next pass. The original budget/deadline, guardian and WLO execution remain unchanged. | May leave either the prior complete revision or the new complete revision; interrupting it never implies provider rollback or teardown. | Inspect with `campaign desired`; use `campaign start` to ensure continuing reconciliation is supervised. |
 | `campaign start` | DETACHED/SUPERVISED CONTROLLER LAUNCHER | One identity-bound launchd controller owns ordinary heartbeat, desired-capacity reconciliation, generation-bound tunnel/bootstrap/capability bring-up, and dynamic-registry publication after the CLI, WLO, shell, or terminal exits. The independent guardian remains the safety enforcer. | After launch, Ctrl-C affects only the initiating output/view; it does not stop the controller or capacity. | `campaign stop`, then status until `CLOSED` with provider absence verified. |
@@ -189,6 +193,11 @@ cap covers recorded RunPod pod compute only—not storage, Global Volume,
 network/egress, or other provider charges—and the report states the host/network/provider
 failure domain instead of claiming a provider-side hard total-spend cap. See
 [`docs/PAID_START_SAFETY.md`](docs/PAID_START_SAFETY.md).
+
+The ordinary single-capability bounded-start workflow is documented in
+[`docs/BOUNDED_FLEET.md`](docs/BOUNDED_FLEET.md). It derives the frozen campaign
+and budget declarations from explicit CLI intent; those existing contracts and
+their original budget/deadline remain the only authority.
 
 ## Versioned desired capacity
 

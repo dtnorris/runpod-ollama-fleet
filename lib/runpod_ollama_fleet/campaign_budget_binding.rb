@@ -307,6 +307,36 @@ module RunpodOllamaFleet
       raise Error, "paid campaign start safety gate failed: #{report.fetch('refusal_reasons').join(', ')}"
     end
 
+    # Read-only immutable-authority summary for an operator preview before a
+    # guardian or ledger exists. Live paid admission remains safety_report.
+    def authority_preview
+      limits = declaration.slice(
+        "max_cumulative_compute_usd", "max_aggregate_hourly_rate_usd", "max_workers",
+        "max_runtime_seconds", "guardian_poll_seconds",
+        "orchestrator_heartbeat_timeout_seconds", "teardown_reserve_seconds"
+      )
+      hourly = declaration.fetch("max_aggregate_hourly_rate_usd")
+      {
+        "budget_id" => declaration.fetch("budget_id"),
+        "limits" => limits,
+        "deadline" => {
+          "derivation" => "armed_at_utc + max_runtime_seconds",
+          "absolute_value" => "established once by the existing parent budget at first arm"
+        },
+        "crash_liability" => {
+          "horizon_seconds" => LocalModelEvaluation::RunpodBudget.crash_horizon_seconds(limits),
+          "maximum_additional_compute_usd_at_hourly_ceiling" =>
+            LocalModelEvaluation::RunpodBudget.maximum_additional_compute_liability_usd(
+              hourly_rate_usd: hourly, limits:
+            ).round(6)
+        },
+        "billing_scope" => billing_scope_evidence,
+        "paid_start_gate" => "not evaluated until retained authority and guardian evidence exist"
+      }.freeze
+    rescue LocalModelEvaluation::RunpodBudget::Error, KeyError, ArgumentError, TypeError => e
+      raise Error, e.message
+    end
+
     # Returns the last report evaluated by paid-start admission. Reading this
     # artifact never refreshes guardian/provider state and never recomputes the
     # FO-08 liability proof.

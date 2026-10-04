@@ -1,0 +1,229 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require "open3"
+require "optparse"
+require "rbconfig"
+require "dotenv"
+
+ROOT = File.expand_path("..", __dir__)
+Dotenv.load(File.join(ROOT, ".env"))
+$LOAD_PATH.unshift File.join(ROOT, "lib")
+require "runpod_ollama_fleet"
+
+options = {
+  hardware: File.join(ROOT, "config", "execution_pool_hardware.yml"),
+  state_root: File.join(ROOT, "output", "runpod-fleets"),
+  ssh_public_key: ENV.fetch("RUNPOD_SSH_PUBLIC_KEY_PATH", "~/.ssh/id_ed25519.pub"),
+  authorize_paid: false,
+  json: false,
+  once: false,
+  interval: 5.0
+}
+
+parser = OptionParser.new do |o|
+  o.banner = "Usage: bin/rpof bounded-fleet preview|start|view [bounded options]"
+  o.on("--campaign-id ID", "Durable RPOF campaign identity") { |v| options[:campaign_id] = v }
+  o.on("--profile-id ID", "RPOF campaign profile identity") { |v| options[:profile_id] = v }
+  o.on("--capability-request FILE", "Exact ollama-capability-request/v0.1") do |v|
+    options[:capability_request] = v
+  end
+  o.on("--desired-workers N", Integer, "Initial desired worker count") { |v| options[:desired_workers] = v }
+  o.on("--max-workers N", Integer, "Immutable worker ceiling") { |v| options[:max_workers] = v }
+  o.on("--max-hourly-rate-usd N", Float, "Aggregate hourly compute ceiling") do |v|
+    options[:max_hourly_rate_usd] = v
+  end
+  o.on("--max-cumulative-compute-usd N", Float, "Cumulative pod-compute cap") do |v|
+    options[:max_cumulative_compute_usd] = v
+  end
+  o.on("--max-runtime-seconds N", Float, "Runtime used for the original deadline") do |v|
+    options[:max_runtime_seconds] = v
+  end
+  o.on("--guardian-poll-seconds N", Float, "Independent guardian cadence") do |v|
+    options[:guardian_poll_seconds] = v
+  end
+  o.on("--heartbeat-timeout-seconds N", Float, "Controller heartbeat timeout") do |v|
+    options[:orchestrator_heartbeat_timeout_seconds] = v
+  end
+  o.on("--teardown-reserve-seconds N", Float, "Conservative teardown reserve") do |v|
+    options[:teardown_reserve_seconds] = v
+  end
+  o.on("--hardware FILE", "RPOF hardware qualification registry") { |v| options[:hardware] = v }
+  o.on("--state-root DIR", "Durable RPOF state root") { |v| options[:state_root] = v }
+  o.on("--ssh-public-key FILE", "OpenSSH public key for authorized start") do |v|
+    options[:ssh_public_key] = v
+  end
+  o.on("--authorize-paid", "Explicitly authorize paid campaign start") { options[:authorize_paid] = true }
+  o.on("--interval SECONDS", Float, "Attached-view refresh interval") do |v|
+    options[:interval] = v
+    options[:interval_given] = true
+  end
+  o.on("--once", "Render one observational view and exit") { options[:once] = true }
+  o.on("--json", "Emit machine-readable JSON") { options[:json] = true }
+  o.separator ""
+  o.separator "Preview is read-only. Start delegates to the existing campaign safety/controller path."
+  o.separator "View is observational; Ctrl-C stops only the view, never capacity or WLO."
+end
+
+command = ARGV.shift unless %w[--help -h].include?(ARGV.first)
+
+def require_option!(options, key, switch)
+  raise OptionParser::MissingArgument, switch unless options.key?(key)
+end
+
+def bounded_intent(options)
+  hardware = RunpodOllamaFleet::ExecutionPoolHardware.new(path: options.fetch(:hardware))
+  capability = RunpodOllamaFleet::OllamaCapabilityRequest.load(options.fetch(:capability_request))
+  RunpodOllamaFleet::BoundedFleetIntent.new(
+    state_root: options.fetch(:state_root), repo_root: ROOT, hardware:, capability_request: capability,
+    campaign_id: options.fetch(:campaign_id), profile_id: options.fetch(:profile_id),
+    desired_workers: options.fetch(:desired_workers), max_workers: options.fetch(:max_workers),
+    max_hourly_rate_usd: options.fetch(:max_hourly_rate_usd),
+    max_cumulative_compute_usd: options.fetch(:max_cumulative_compute_usd),
+    max_runtime_seconds: options.fetch(:max_runtime_seconds),
+    guardian_poll_seconds: options.fetch(:guardian_poll_seconds),
+    orchestrator_heartbeat_timeout_seconds: options.fetch(:orchestrator_heartbeat_timeout_seconds),
+    teardown_reserve_seconds: options.fetch(:teardown_reserve_seconds)
+  )
+end
+
+def campaign_argv(command, options, paths, profile_id:)
+  argv = [
+    RbConfig.ruby, File.join(ROOT, "bin", "rpof-campaign"), command,
+    "--campaign", paths.fetch(:campaign), "--budget", paths.fetch(:budget),
+    "--hardware", options.fetch(:hardware), "--state-root", options.fetch(:state_root),
+    "--capability-request", "#{profile_id}=#{paths.fetch(:capability_request)}"
+  ]
+  argv.concat(["--ssh-public-key", options.fetch(:ssh_public_key)]) if command == "start"
+  argv << "--authorize-paid" if options[:authorize_paid]
+  argv << "--json" if options[:json]
+  argv
+end
+
+def render_preview(result)
+  capability = result.fetch("capability")
+  profile = result.fetch("profile")
+  authority = result.fetch("authority")
+  limits = authority.fetch("limits")
+  crash = authority.fetch("crash_liability")
+  puts "READ-ONLY bounded fleet preview: #{result.dig('campaign', 'campaign_id')}"
+  puts "Campaign identity: #{result.dig('campaign', 'identity_sha256')}"
+  puts "Capability fingerprint: #{capability.fetch('fingerprint')}"
+  puts "Profile: #{profile.fetch('profile_id')} model=#{profile.fetch('model')} " \
+       "desired=#{profile.fetch('desired_workers')} max=#{profile.fetch('max_workers')}"
+  puts "Hardware: cloud=#{profile.fetch('cloud')} qualified=#{profile.fetch('qualified_gpu_ids').join(',')}"
+  puts "Limits: rate=$#{limits.fetch('max_aggregate_hourly_rate_usd')}/hr " \
+       "cumulative=$#{limits.fetch('max_cumulative_compute_usd')} " \
+       "runtime=#{limits.fetch('max_runtime_seconds')}s"
+  puts "Deadline: #{authority.dig('deadline', 'derivation')}"
+  puts "Crash horizon: #{crash.fetch('horizon_seconds')}s; maximum additional pod compute at ceiling=" \
+       "$#{crash.fetch('maximum_additional_compute_usd_at_hourly_ceiling')}"
+  puts "Billing scope: #{authority.dig('billing_scope', 'label')}; charges outside cap=" \
+       "#{authority.dig('billing_scope', 'charges_may_continue_outside_cap')}"
+  puts "Static validation: #{result.dig('validation', 'bounded_intent')}; paid-start gate: " \
+       "#{result.dig('validation', 'paid_start_gate')}"
+  puts "NO AUTHORITY ARTIFACTS OR PAID RESOURCES WERE CREATED"
+end
+
+def render_view(result)
+  puts "ATTACHED READ-ONLY fleet view: #{result.dig('campaign', 'campaign_id')}"
+  puts "Desired=#{result.dig('desired_capacity', 'profiles', 0, 'desired_workers')} " \
+       "provider-active=#{result.fetch('active_workers')} pending=#{result.fetch('pending_workers')}"
+  puts "Budget=#{result['budget_state']} guardian=#{result['guardian_healthy'] ? 'HEALTHY' : 'UNHEALTHY'} " \
+       "deadline=#{result['deadline_at_utc'] || '-'}"
+  puts "Rate=$#{result.fetch('active_plus_pending_hourly_rate_usd')}/hr / " \
+       "$#{result.fetch('max_aggregate_hourly_rate_usd')}/hr; liability=" \
+       "$#{result.fetch('reserved_maximum_liability_usd')} / $#{result.fetch('max_cumulative_compute_usd')}"
+  controller = result["controller"] || {}
+  puts "Controller=#{controller['state'] || 'UNAVAILABLE'} pid=#{controller['pid'] || '-'}"
+  result.fetch("profiles").each do |profile|
+    ready = profile["registry_ready_workers"].nil? ? "UNAVAILABLE" : profile["registry_ready_workers"]
+    puts "  #{profile.fetch('profile_id')}: provider-active=#{profile.fetch('provider_active_workers')} " \
+         "bootstrap=#{profile['bootstrap_passed_workers'] || '-'} tunnel=#{profile['tunnel_established_workers'] || '-'} " \
+         "registry-ready=#{ready} desired=#{profile.fetch('desired_workers')}"
+  end
+  puts "Teardown=#{result['teardown_reason'] || 'not requested'} " \
+       "provider-absence=#{result['provider_absence_verified_at_utc'] || 'not verified'}"
+end
+
+begin
+  parser.parse!(ARGV)
+  raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
+  unless %w[preview start view].include?(command)
+    raise OptionParser::InvalidArgument, "command must be preview, start, or view"
+  end
+  require_option!(options, :campaign_id, "--campaign-id")
+
+  if command == "view"
+    if options[:authorize_paid]
+      raise OptionParser::InvalidArgument, "--authorize-paid is valid only for bounded-fleet start"
+    end
+    unless options.fetch(:interval).finite? && options.fetch(:interval).positive?
+      raise OptionParser::InvalidArgument, "--interval must be positive and finite"
+    end
+    bounded_only = %i[
+      profile_id capability_request desired_workers max_workers max_hourly_rate_usd
+      max_cumulative_compute_usd max_runtime_seconds guardian_poll_seconds
+      orchestrator_heartbeat_timeout_seconds teardown_reserve_seconds
+    ].select { |key| options.key?(key) }
+    unless bounded_only.empty?
+      raise OptionParser::InvalidArgument,
+            "bounded intent options are valid only for preview/start: #{bounded_only.join(', ')}"
+    end
+    paths = RunpodOllamaFleet::BoundedFleetIntent.artifact_paths(
+      state_root: options.fetch(:state_root), campaign_id: options.fetch(:campaign_id)
+    )
+    campaign = RunpodOllamaFleet::CapacityCampaign.load(
+      path: paths.fetch(:campaign),
+      hardware: RunpodOllamaFleet::ExecutionPoolHardware.new(path: options.fetch(:hardware))
+    )
+    raise ArgumentError, "bounded fleet must contain exactly one profile" unless campaign.profiles.length == 1
+    argv = campaign_argv("status", options, paths, profile_id: campaign.profiles.fetch(0).fetch("profile_id"))
+    loop do
+      stdout, stderr, status = Open3.capture3(*argv)
+      raise "campaign status failed: #{stderr.strip}" unless status.success?
+      result = JSON.parse(stdout)
+      options[:json] ? puts(JSON.generate(result)) : render_view(result)
+      break if options[:once]
+      sleep(options.fetch(:interval))
+    end
+  else
+    %i[
+      profile_id capability_request desired_workers max_workers max_hourly_rate_usd
+      max_cumulative_compute_usd max_runtime_seconds guardian_poll_seconds
+      orchestrator_heartbeat_timeout_seconds teardown_reserve_seconds
+    ].each do |key|
+      require_option!(options, key, "--#{key.to_s.tr('_', '-')}")
+    end
+    if options[:once] || options[:interval_given]
+      raise OptionParser::InvalidArgument, "--once and --interval are valid only for bounded-fleet view"
+    end
+    intent = bounded_intent(options)
+    if command == "preview"
+      if options[:authorize_paid]
+        raise OptionParser::InvalidArgument, "--authorize-paid is valid only for bounded-fleet start"
+      end
+      result = intent.preview
+      options[:json] ? puts(JSON.pretty_generate(result)) : render_preview(result)
+    else
+      raise OptionParser::MissingArgument, "--authorize-paid" unless options[:authorize_paid]
+      paths = intent.persist!
+      warn "Attached view after successful start: bin/rpof bounded-fleet view --campaign-id " \
+           "#{intent.campaign.campaign_id} --state-root #{options.fetch(:state_root)}"
+      warn "Explicit teardown: bin/rpof campaign stop --campaign #{paths.fetch(:campaign)} " \
+           "--budget #{paths.fetch(:budget)} --hardware #{options.fetch(:hardware)} " \
+           "--state-root #{options.fetch(:state_root)}"
+      exec(*campaign_argv("start", options, paths, profile_id: intent.profile_id))
+    end
+  end
+rescue Interrupt
+  warn "View detached; campaign capacity, controller, guardian, desired state, and WLO were not changed."
+  exit 0
+rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError, OptionParser::ParseError,
+       RunpodOllamaFleet::BoundedFleetIntent::Error,
+       RunpodOllamaFleet::CapacityCampaign::Error,
+       RunpodOllamaFleet::OllamaCapabilityRequest::Error => e
+  warn "ERROR: #{e.message}"
+  exit 1
+end
