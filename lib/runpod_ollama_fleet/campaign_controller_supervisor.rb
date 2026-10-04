@@ -8,17 +8,19 @@ require "rbconfig"
 require "securerandom"
 require "time"
 require_relative "model_requirement"
+require_relative "ollama_capability_request"
 
 module RunpodOllamaFleet
   # Per-user launchd supervision for the continuing campaign controller. This
   # owns process liveness only; CampaignBudgetBinding remains the sole authority.
   class CampaignControllerSupervisor
-    REQUEST_CONTRACT_VERSION = "rpof-campaign-controller-request/v0.2"
+    REQUEST_CONTRACT_VERSION = "rpof-campaign-controller-request/v0.3"
+    LEGACY_REQUEST_CONTRACT_VERSION = "rpof-campaign-controller-request/v0.2"
 
     class Error < StandardError; end
 
     def initialize(root:, repo_root:, campaign_path:, budget_path:, hardware_path:,
-                   model_requirement_paths: {},
+                   capability_request_paths: {},
                    command_runner: nil, sleeper: nil, monotonic_clock: nil,
                    wall_clock: nil, platform: RUBY_PLATFORM)
       @root = File.expand_path(root)
@@ -26,7 +28,7 @@ module RunpodOllamaFleet
       @campaign_path = File.expand_path(campaign_path)
       @budget_path = File.expand_path(budget_path)
       @hardware_path = File.expand_path(hardware_path)
-      @model_requirement_paths = model_requirement_paths.to_h.transform_keys(&:to_s).transform_values do |path|
+      @capability_request_paths = capability_request_paths.to_h.transform_keys(&:to_s).transform_values do |path|
         File.expand_path(path)
       end
       @command_runner = command_runner || lambda do |argv|
@@ -47,13 +49,29 @@ module RunpodOllamaFleet
       existing = status(binding:)
       return existing if existing.fetch("state") == "RUNNING"
 
-      generation = SecureRandom.uuid
-      heartbeat = [[Float(heartbeat_timeout_seconds) / 3.0, 10.0].min, 1.0].max
-      request = request_document(
-        binding:, generation:, heartbeat_seconds: heartbeat,
-        ssh_public_key_path: File.expand_path(ssh_public_key_path)
-      )
-      write_json_atomic(paths.fetch(:request_path), request)
+      retained = read_json(paths.fetch(:request_path))
+      if retained && retained.fetch("contract_version") == LEGACY_REQUEST_CONTRACT_VERSION
+        request = retained
+      else
+        generation = SecureRandom.uuid
+        heartbeat = [[Float(heartbeat_timeout_seconds) / 3.0, 10.0].min, 1.0].max
+        original = @capability_request_paths
+        if retained && @capability_request_paths.empty?
+          @capability_request_paths = retained.fetch("capability_requests").to_h do |row|
+            [row.fetch("profile_id"), File.expand_path(row.fetch("path"))]
+          end
+        end
+        begin
+          request = request_document(
+            binding:, generation:, heartbeat_seconds: heartbeat,
+            ssh_public_key_path: File.expand_path(ssh_public_key_path)
+          )
+        ensure
+          @capability_request_paths = original
+        end
+        write_json_atomic(paths.fetch(:request_path), request)
+      end
+      generation = request.fetch("generation_id")
       File.write(paths.fetch(:enabled_path), "enabled\n")
       File.chmod(0o600, paths.fetch(:enabled_path))
       prepared = true
@@ -70,36 +88,43 @@ module RunpodOllamaFleet
     end
 
     def validate_requirements!(binding:)
-      model_requirement_bindings(binding, require_all: true)
+      request = read_json(paths_for(binding).fetch(:request_path))
+      if @capability_request_paths.empty?
+        raise Error, "exact Ollama capability request is required for every campaign profile" unless request
+
+        validate_retained_request!(request, binding)
+      else
+        capability_request_bindings(binding, require_all: true)
+        validate_retained_request!(request, binding) if request
+      end
       true
-    rescue ModelRequirement::Error, KeyError, ArgumentError, TypeError, SystemCallError => e
-      raise Error, "campaign model requirements are invalid: #{e.message}"
+    rescue ModelRequirement::Error, OllamaCapabilityRequest::Error, KeyError, ArgumentError,
+           TypeError, SystemCallError => e
+      raise Error, "campaign capability requests are invalid: #{e.message}"
     end
 
     # Read-only resolution for campaign status after the initiating CLI has
     # exited. With no explicitly supplied paths, reuse only the exact artifact
     # bindings already retained in the supervised controller request.
-    def resolved_model_requirements(binding:, require_all: false)
-      paths = @model_requirement_paths
+    def resolved_capability_requests(binding:, require_all: false)
+      original = @capability_request_paths
+      paths = @capability_request_paths
       if paths.empty?
         request = read_json(paths_for(binding).fetch(:request_path))
         return {} unless request
 
-        validate_retained_requirements!(request, binding)
-        paths = request.fetch("model_requirements").to_h do |row|
-          [row.fetch("profile_id"), File.expand_path(row.fetch("path"))]
-        end
+        validate_retained_request!(request, binding)
+        return load_retained_requests(request)
       end
-      original = @model_requirement_paths
-      @model_requirement_paths = paths
-      model_requirement_bindings(binding, require_all:).to_h do |row|
-        [row.fetch("profile_id"), ModelRequirement.load(row.fetch("path"))]
+      @capability_request_paths = paths
+      capability_request_bindings(binding, require_all:).to_h do |row|
+        [row.fetch("profile_id"), OllamaCapabilityRequest.load(row.fetch("path"))]
       end
-    rescue ModelRequirement::Error, KeyError, ArgumentError, TypeError, SystemCallError,
-           JSON::ParserError => e
-      raise Error, "campaign model requirements are invalid: #{e.message}"
+    rescue ModelRequirement::Error, OllamaCapabilityRequest::Error, KeyError, ArgumentError,
+           TypeError, SystemCallError, JSON::ParserError => e
+      raise Error, "campaign capability requests are invalid: #{e.message}"
     ensure
-      @model_requirement_paths = original if defined?(original)
+      @capability_request_paths = original
     end
 
     def status(binding:)
@@ -178,7 +203,7 @@ module RunpodOllamaFleet
         "budget_sha256" => Digest::SHA256.file(@budget_path).hexdigest,
         "hardware_path" => @hardware_path,
         "hardware_sha256" => Digest::SHA256.file(@hardware_path).hexdigest,
-        "model_requirements" => model_requirement_bindings(binding, require_all: true),
+        "capability_requests" => capability_request_bindings(binding, require_all: true),
         "controller_executable_sha256" => Digest::SHA256.file(
           File.join(@repo_root, "bin", "rpof-campaign-controller")
         ).hexdigest,
@@ -199,71 +224,130 @@ module RunpodOllamaFleet
           raise Error, "retained campaign controller identity does not match requested authority"
         end
       end
-      validate_retained_requirements!(request, binding) if request
+      validate_retained_request!(request, binding) if request
     end
 
-    def model_requirement_bindings(binding, require_all:)
+    def capability_request_bindings(binding, require_all:)
       profiles = binding.campaign.profiles
       profile_ids = profiles.map { |profile| profile.fetch("profile_id") }
-      supplied = @model_requirement_paths.keys
+      supplied = @capability_request_paths.keys
       unknown = supplied - profile_ids
-      raise Error, "model requirements name unknown profile(s): #{unknown.sort.join(', ')}" unless unknown.empty?
+      raise Error, "capability requests name unknown profile(s): #{unknown.sort.join(', ')}" unless unknown.empty?
       missing = profile_ids - supplied
       if require_all && !missing.empty?
-        raise Error, "exact model requirement required for profile(s): #{missing.sort.join(', ')}"
+        raise Error, "exact capability request required for profile(s): #{missing.sort.join(', ')}"
       end
 
       profiles.filter_map do |profile|
         profile_id = profile.fetch("profile_id")
-        path = @model_requirement_paths[profile_id]
+        path = @capability_request_paths[profile_id]
         next unless path
 
         hardware = binding.campaign.hardware_bindings.find { |row| row.fetch("profile_id") == profile_id }
         raise Error, "campaign profile #{profile_id.inspect} has no hardware qualification" unless hardware
-        requirement = ModelRequirement.load(path)
-        requirement.validate_profile!(profile:, hardware:)
+        capability = OllamaCapabilityRequest.load(path)
+        capability.validate_profile!(profile:, hardware:)
         {
           "profile_id" => profile_id,
           "path" => path,
           "artifact_sha256" => Digest::SHA256.file(path).hexdigest,
-          "requirement_sha256" => requirement.fingerprint
+          "capability_fingerprint" => capability.fingerprint
         }
       end
     end
 
-    def validate_retained_requirements!(request, binding)
-      unless request["contract_version"] == REQUEST_CONTRACT_VERSION
-        raise Error, "retained campaign controller request predates exact model-requirement binding"
+    def validate_retained_request!(request, binding)
+      case request["contract_version"]
+      when REQUEST_CONTRACT_VERSION
+        validate_retained_capability_requests!(request, binding)
+      when LEGACY_REQUEST_CONTRACT_VERSION
+        unless @capability_request_paths.empty?
+          raise Error, "new capability-request input cannot use the legacy retained-state reader"
+        end
+        validate_legacy_retained_model_requirements!(request, binding)
+      else
+        raise Error, "unsupported retained campaign controller request contract"
       end
-      rows = request.fetch("model_requirements")
-      raise Error, "retained model requirements must be an array" unless rows.is_a?(Array)
+    end
+
+    def validate_retained_capability_requests!(request, binding)
+      rows = request.fetch("capability_requests")
+      raise Error, "retained capability requests must be an array" unless rows.is_a?(Array)
       paths = rows.to_h do |row|
+        expected_keys = %w[profile_id path artifact_sha256 capability_fingerprint]
+        unless row.is_a?(Hash) && row.keys.sort == expected_keys.sort
+          raise Error, "retained capability request binding fields are invalid"
+        end
+        path = File.expand_path(row.fetch("path"))
+        capability = OllamaCapabilityRequest.load(path)
+        unless Digest::SHA256.file(path).hexdigest == row.fetch("artifact_sha256") &&
+               capability.fingerprint == row.fetch("capability_fingerprint")
+          raise Error, "retained capability request artifact changed"
+        end
+        [row.fetch("profile_id"), path]
+      end
+      raise Error, "retained capability request profile identities are not unique" unless paths.length == rows.length
+
+      configured = @capability_request_paths
+      unless configured.empty? || configured == paths
+        raise Error, "retained capability request paths do not match requested artifacts"
+      end
+      original = @capability_request_paths
+      @capability_request_paths = paths
+      expected = capability_request_bindings(binding, require_all: true)
+      unless rows == expected
+        raise Error, "retained capability request bindings do not match campaign profiles"
+      end
+    ensure
+      @capability_request_paths = original if defined?(original)
+    end
+
+    # Historical v0.2 controller requests are readable only when no new generic
+    # input was supplied. This preserves their exact AF-shaped artifact and
+    # authority interpretation without admitting that shape to new campaigns.
+    def validate_legacy_retained_model_requirements!(request, binding)
+      rows = request.fetch("model_requirements")
+      raise Error, "legacy retained model requirements must be an array" unless rows.is_a?(Array)
+      requirements = rows.to_h do |row|
         expected_keys = %w[profile_id path artifact_sha256 requirement_sha256]
         unless row.is_a?(Hash) && row.keys.sort == expected_keys.sort
-          raise Error, "retained model requirement binding fields are invalid"
+          raise Error, "legacy retained model requirement binding fields are invalid"
         end
         path = File.expand_path(row.fetch("path"))
         requirement = ModelRequirement.load(path)
         unless Digest::SHA256.file(path).hexdigest == row.fetch("artifact_sha256") &&
                requirement.fingerprint == row.fetch("requirement_sha256")
-          raise Error, "retained model requirement artifact changed"
+          raise Error, "legacy retained model requirement artifact changed"
         end
-        [row.fetch("profile_id"), path]
+        [row.fetch("profile_id"), requirement]
       end
-      raise Error, "retained model requirement profile identities are not unique" unless paths.length == rows.length
+      if requirements.length != rows.length
+        raise Error, "legacy retained model requirement profile identities are not unique"
+      end
+      validate_request_set!(requirements, binding)
+    end
 
-      configured = @model_requirement_paths
-      unless configured.empty? || configured == paths
-        raise Error, "retained model requirement paths do not match requested artifacts"
+    def load_retained_requests(request)
+      rows, loader = if request.fetch("contract_version") == REQUEST_CONTRACT_VERSION
+                       [request.fetch("capability_requests"), OllamaCapabilityRequest]
+                     else
+                       [request.fetch("model_requirements"), ModelRequirement]
+                     end
+      rows.to_h { |row| [row.fetch("profile_id"), loader.load(row.fetch("path"))] }
+    end
+
+    def validate_request_set!(requests, binding)
+      profile_ids = binding.campaign.profiles.map { |profile| profile.fetch("profile_id") }
+      unless requests.keys.sort == profile_ids.sort
+        raise Error, "retained runtime requests do not cover exact campaign profiles"
       end
-      original = @model_requirement_paths
-      @model_requirement_paths = paths
-      expected = model_requirement_bindings(binding, require_all: true)
-      unless rows == expected
-        raise Error, "retained model requirement bindings do not match campaign profiles"
+      binding.campaign.profiles.each do |profile|
+        profile_id = profile.fetch("profile_id")
+        hardware = binding.campaign.hardware_bindings.find { |row| row.fetch("profile_id") == profile_id }
+        raise Error, "campaign profile #{profile_id.inspect} has no hardware qualification" unless hardware
+
+        requests.fetch(profile_id).validate_profile!(profile:, hardware:)
       end
-    ensure
-      @model_requirement_paths = original if defined?(original)
     end
 
     def verify_runtime_identity!(row, binding)

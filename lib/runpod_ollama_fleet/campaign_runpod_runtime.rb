@@ -9,7 +9,7 @@ require_relative "../local_model_evaluation/runpod_bootstrap"
 require_relative "../local_model_evaluation/runpod_tunnels"
 require_relative "capability_check"
 require_relative "dynamic_worker_registry"
-require_relative "model_requirement"
+require_relative "ollama_capability_request"
 require_relative "worker_bringup_adapters"
 require_relative "worker_bringup_reconciler"
 
@@ -20,7 +20,7 @@ module RunpodOllamaFleet
     class Error < StandardError; end
 
     def initialize(root:, repo_root:, profile:, hardware:, client:, admission: nil, out: $stdout,
-                   wall_clock: nil, readiness_observer: nil, model_requirement: nil,
+                   wall_clock: nil, readiness_observer: nil, capability_request: nil,
                    campaign_identity_sha256: nil, readiness_gate: nil,
                    bringup_reconciler_factory: nil)
       @root = File.expand_path(root)
@@ -32,11 +32,11 @@ module RunpodOllamaFleet
       @out = out
       @wall_clock = wall_clock
       @readiness_observer = readiness_observer
-      @model_requirement = model_requirement
+      @capability_request = capability_request
       @campaign_identity_sha256 = campaign_identity_sha256
       @readiness_gate = readiness_gate
       @bringup_reconciler_factory = bringup_reconciler_factory
-      @model_requirement&.validate_profile!(profile: @profile, hardware: @hardware)
+      @capability_request&.validate_profile!(profile: @profile, hardware: @hardware)
     end
 
     def current_worker_count
@@ -129,7 +129,7 @@ module RunpodOllamaFleet
     def reconcile_bringup!(desired_workers:, transition_guard:)
       desired = Integer(desired_workers)
       return [] if desired.zero?
-      raise Error, "exact model requirement is required for automatic bring-up" unless @model_requirement
+      raise Error, "exact Ollama capability request is required for automatic bring-up" unless @capability_request
       unless @campaign_identity_sha256.to_s.match?(/\A[0-9a-f]{64}\z/)
         raise Error, "campaign identity is required for automatic bring-up"
       end
@@ -146,7 +146,7 @@ module RunpodOllamaFleet
           profile: @profile,
           worker:,
           generation_id: worker.fetch("generation_id"),
-          requirement: @model_requirement,
+          requirement: @capability_request,
           retry_bootstrap: true
         )
       end
@@ -199,7 +199,7 @@ module RunpodOllamaFleet
     end
 
     def required_gpu_ids
-      required = @model_requirement&.required_gpu_id
+      required = @capability_request&.required_gpu_id
       required ? [required] : @hardware.fetch("qualified_gpu_ids")
     end
 
@@ -214,19 +214,19 @@ module RunpodOllamaFleet
       WorkerBringupReconciler.new(
         root: @root,
         tunnel: WorkerBringupAdapters::Tunnel.new(
-          tunnels:, requirement: @model_requirement, transition_guard:
+          tunnels:, requirement: @capability_request, transition_guard:
         ),
         bootstrap: WorkerBringupAdapters::Bootstrap.new(
           root: @root, repo_root: @repo_root, fleet_state: state,
           shared_store_path: @hardware.fetch("ollama_store_path"),
-          process_supervisor: process, requirement: @model_requirement,
+          process_supervisor: process, requirement: @capability_request,
           transition_guard:, clock: @wall_clock
         ),
         capability: WorkerBringupAdapters::Capability.new(
           checker: CapabilityCheck.new(
             fleet_state: state, fleet_key: profile_id, wall_clock: @wall_clock
           ),
-          requirement: @model_requirement, transition_guard:
+          requirement: @capability_request, transition_guard:
         ),
         process_inspector: process,
         clock: @wall_clock

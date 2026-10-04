@@ -3,6 +3,8 @@
 require "digest"
 require "json"
 require "uri"
+require_relative "model_requirement"
+require_relative "ollama_capability_request"
 
 module RunpodOllamaFleet
   # Immutable identity for one concrete worker bring-up. Every piece of
@@ -30,15 +32,15 @@ module RunpodOllamaFleet
     private
 
     def validate_requirement!(profile, worker)
-      unless requirement.is_a?(ModelRequirement)
-        raise Error, "worker bring-up requires an exact ModelRequirement"
+      unless requirement.is_a?(OllamaCapabilityRequest) || requirement.is_a?(ModelRequirement)
+        raise Error, "worker bring-up requires an exact Ollama capability request"
       end
       gpu_id = nonempty(worker.fetch("gpu_id"), "worker GPU identity")
       requirement.validate_profile!(
         profile:,
         hardware: { "qualified_gpu_ids" => [gpu_id] }
       )
-    rescue ModelRequirement::Error => e
+    rescue ModelRequirement::Error, OllamaCapabilityRequest::Error => e
       raise Error, e.message
     end
 

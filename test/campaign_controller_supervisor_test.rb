@@ -16,8 +16,8 @@ class CampaignControllerSupervisorTest < Minitest::Test
     @campaign_path = artifact("campaign.json")
     @budget_path = artifact("budget.json")
     @hardware_path = artifact("hardware.yml")
-    @requirement_path = File.join(@tmp, "model-requirement.json")
-    File.write(@requirement_path, JSON.generate(model_requirement_document))
+    @capability_path = File.join(@tmp, "ollama-capability-request.json")
+    File.write(@capability_path, JSON.generate(capability_request_document))
     binding_dir = File.join(@tmp, "campaign-budgets", "binding")
     FileUtils.mkdir_p(binding_dir)
     @binding = Binding.new(
@@ -79,25 +79,26 @@ class CampaignControllerSupervisorTest < Minitest::Test
     assert @commands.any? { |argv| argv.include?("bootout") }
   end
 
-  def test_request_binds_exact_model_requirement_artifact_and_fingerprint
+  def test_request_binds_exact_capability_artifact_and_fingerprint
     supervisor = build_supervisor
     supervisor.ensure_running!(
       binding: @binding, ssh_public_key_path: "fixture.pub", heartbeat_timeout_seconds: 30
     )
 
     request = JSON.parse(File.binread(controller_path("request.json")))
-    row = request.fetch("model_requirements").fetch(0)
-    requirement = RunpodOllamaFleet::ModelRequirement.load(@requirement_path)
+    row = request.fetch("capability_requests").fetch(0)
+    capability = RunpodOllamaFleet::OllamaCapabilityRequest.load(@capability_path)
     assert_equal RunpodOllamaFleet::CampaignControllerSupervisor::REQUEST_CONTRACT_VERSION,
                  request.fetch("contract_version")
     assert_equal "profile-1", row.fetch("profile_id")
-    assert_equal Digest::SHA256.file(@requirement_path).hexdigest, row.fetch("artifact_sha256")
-    assert_equal requirement.fingerprint, row.fetch("requirement_sha256")
+    assert_equal Digest::SHA256.file(@capability_path).hexdigest, row.fetch("artifact_sha256")
+    assert_equal capability.fingerprint, row.fetch("capability_fingerprint")
+    refute request.key?("model_requirements")
   end
 
   def test_requirement_validation_fails_before_controller_launch
-    File.write(@requirement_path, JSON.generate(model_requirement_document.merge(
-      "ollama" => model_requirement_document.fetch("ollama").merge("expected_digest" => "d" * 64)
+    File.write(@capability_path, JSON.generate(capability_request_document.merge(
+      "ollama" => capability_request_document.fetch("ollama").merge("expected_digest" => "d" * 64)
     )))
     supervisor = build_supervisor
 
@@ -109,17 +110,74 @@ class CampaignControllerSupervisorTest < Minitest::Test
     assert_empty @commands
   end
 
-  def test_status_can_resolve_exact_requirements_from_retained_request
+  def test_new_campaign_rejects_legacy_af_shaped_input_before_controller_launch
+    File.write(@capability_path, JSON.generate(model_requirement_document))
+    supervisor = build_supervisor
+
+    error = assert_raises(RunpodOllamaFleet::CampaignControllerSupervisor::Error) do
+      supervisor.validate_requirements!(binding: @binding)
+    end
+
+    assert_includes error.message, "unknown fields"
+    assert_empty @commands
+  end
+
+  def test_status_can_resolve_exact_capabilities_from_retained_request
     build_supervisor.ensure_running!(
       binding: @binding, ssh_public_key_path: "fixture.pub", heartbeat_timeout_seconds: 30
     )
-    restarted = build_supervisor(model_requirement_paths: {})
+    restarted = build_supervisor(capability_request_paths: {})
 
-    requirements = restarted.resolved_model_requirements(binding: @binding)
+    requests = restarted.resolved_capability_requests(binding: @binding)
 
-    assert_equal ["profile-1"], requirements.keys
-    assert_equal RunpodOllamaFleet::ModelRequirement.load(@requirement_path).fingerprint,
-                 requirements.fetch("profile-1").fingerprint
+    assert_equal ["profile-1"], requests.keys
+    assert_equal RunpodOllamaFleet::OllamaCapabilityRequest.load(@capability_path).fingerprint,
+                 requests.fetch("profile-1").fingerprint
+  end
+
+  def test_detached_restart_reloads_exact_generic_request_identity
+    supervisor = build_supervisor
+    supervisor.ensure_running!(
+      binding: @binding, ssh_public_key_path: "fixture.pub", heartbeat_timeout_seconds: 30
+    )
+    original_artifact = File.binread(@capability_path)
+    original_request = JSON.parse(File.binread(controller_path("request.json")))
+
+    supervisor.disable!(binding: @binding)
+    restarted = build_supervisor(capability_request_paths: {})
+    result = restarted.ensure_running!(
+      binding: @binding, ssh_public_key_path: "ignored.pub", heartbeat_timeout_seconds: 30
+    )
+
+    restarted_request = JSON.parse(File.binread(controller_path("request.json")))
+    assert_equal original_artifact, File.binread(@capability_path)
+    assert_equal original_request.fetch("capability_requests"), restarted_request.fetch("capability_requests")
+    refute_equal original_request.fetch("generation_id"), result.fetch("generation_id")
+  end
+
+  def test_legacy_retained_request_is_readable_and_not_rewritten
+    write_legacy_retained_request
+    original = File.binread(controller_path("request.json"))
+    supervisor = build_supervisor(capability_request_paths: {})
+
+    requests = supervisor.resolved_capability_requests(binding: @binding)
+    supervisor.ensure_running!(
+      binding: @binding, ssh_public_key_path: "ignored.pub", heartbeat_timeout_seconds: 30
+    )
+
+    assert_instance_of RunpodOllamaFleet::ModelRequirement, requests.fetch("profile-1")
+    assert_equal original, File.binread(controller_path("request.json"))
+    assert_equal "budget-1", JSON.parse(original).fetch("budget_id")
+  end
+
+  def test_new_generic_input_cannot_enter_legacy_retained_reader
+    write_legacy_retained_request
+    supervisor = build_supervisor
+
+    error = assert_raises(RunpodOllamaFleet::CampaignControllerSupervisor::Error) do
+      supervisor.validate_requirements!(binding: @binding)
+    end
+    assert_includes error.message, "cannot use the legacy retained-state reader"
   end
 
   private
@@ -134,7 +192,7 @@ class CampaignControllerSupervisorTest < Minitest::Test
     File.join(File.dirname(@binding.state_path), "controller", name)
   end
 
-  def build_supervisor(model_requirement_paths: { "profile-1" => @requirement_path })
+  def build_supervisor(capability_request_paths: { "profile-1" => @capability_path })
     runner = lambda do |argv|
       @commands << argv
       case argv[1]
@@ -159,7 +217,7 @@ class CampaignControllerSupervisorTest < Minitest::Test
     RunpodOllamaFleet::CampaignControllerSupervisor.new(
       root: @tmp, repo_root: @repo, campaign_path: @campaign_path,
       budget_path: @budget_path, hardware_path: @hardware_path,
-      model_requirement_paths:,
+      capability_request_paths:,
       command_runner: runner, sleeper: ->(*) {}, monotonic_clock: -> { 0 },
       wall_clock: -> { @now }, platform: "arm64-darwin"
     )
@@ -177,6 +235,19 @@ class CampaignControllerSupervisorTest < Minitest::Test
 
   def hardware_binding
     { "profile_id" => "profile-1", "qualified_gpu_ids" => ["NVIDIA A40"] }
+  end
+
+  def capability_request_document
+    {
+      "contract_version" => "ollama-capability-request/v0.1",
+      "ollama" => {
+        "model" => "qualified-model:latest",
+        "expected_digest" => "c" * 64,
+        "required_context_length" => 131_072,
+        "require_fully_gpu_resident" => true,
+        "required_gpu_id" => "NVIDIA A40"
+      }
+    }
   end
 
   def model_requirement_document
@@ -197,5 +268,37 @@ class CampaignControllerSupervisorTest < Minitest::Test
         "required_gpu_id" => "NVIDIA A40"
       }
     }
+  end
+
+  def write_legacy_retained_request
+    FileUtils.mkdir_p(File.dirname(controller_path("request.json")))
+    legacy_path = File.join(@tmp, "legacy-model-requirement.json")
+    File.write(legacy_path, JSON.generate(model_requirement_document))
+    requirement = RunpodOllamaFleet::ModelRequirement.load(legacy_path)
+    request = {
+      "contract_version" => RunpodOllamaFleet::CampaignControllerSupervisor::LEGACY_REQUEST_CONTRACT_VERSION,
+      "campaign_identity_sha256" => @binding.campaign.identity_sha256,
+      "binding_sha256" => @binding.binding_sha256,
+      "budget_id" => "budget-1",
+      "generation_id" => "legacy-generation",
+      "campaign_path" => @campaign_path,
+      "campaign_sha256" => Digest::SHA256.file(@campaign_path).hexdigest,
+      "budget_path" => @budget_path,
+      "budget_sha256" => Digest::SHA256.file(@budget_path).hexdigest,
+      "hardware_path" => @hardware_path,
+      "hardware_sha256" => Digest::SHA256.file(@hardware_path).hexdigest,
+      "model_requirements" => [{
+        "profile_id" => "profile-1",
+        "path" => legacy_path,
+        "artifact_sha256" => Digest::SHA256.file(legacy_path).hexdigest,
+        "requirement_sha256" => requirement.fingerprint
+      }],
+      "controller_executable_sha256" => "f" * 64,
+      "state_root" => @tmp,
+      "repo_root" => @repo,
+      "ssh_public_key_path" => "/tmp/legacy.pub",
+      "heartbeat_seconds" => 10.0
+    }
+    File.write(controller_path("request.json"), JSON.pretty_generate(request) + "\n")
   end
 end

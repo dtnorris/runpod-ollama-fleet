@@ -8,8 +8,8 @@ possible only when the durable state says `readiness_prerequisites_satisfied`.
 
 The durable identity binds the campaign identity SHA, profile, logical worker
 slot, provider resource, worker ID, monotonically increasing worker generation,
-generation ID, tunnel target, and exact `ModelRequirement` fingerprint. A
-different generation or exact requirement receives a different identity and
+generation ID, tunnel target, and exact Ollama capability fingerprint. A
+different generation or exact capability receives a different identity and
 cannot reuse retained evidence. Advancing the worker generation marks every
 stage of the prior identity stale and prevents it from becoming current again.
 
@@ -32,20 +32,21 @@ and is not silently relaunched.
 
 Passed bootstrap and capability evidence must match the worker generation and
 the exact model, digest, context, full-residency requirement, and constrained
-GPU when present. The human alias remains provenance only.
+GPU when present. No alias or other provenance enters the generic request.
 
-`campaign start` now accepts a repeatable exact-requirement binding:
+`campaign start` accepts a repeatable exact-capability binding:
 
 ```console
 bin/rpof campaign start --campaign CAMPAIGN.json --budget BUDGET.json \
-  --model-requirement PROFILE_ID=MODEL_REQUIREMENT.json
+  --capability-request PROFILE_ID=OLLAMA_CAPABILITY_REQUEST.json
 ```
 
 Every campaign profile requires one binding. The supervised controller request
-persists the artifact path, artifact SHA-256, and semantic requirement
+persists the artifact path, artifact SHA-256, and semantic capability
 fingerprint, and validates them before controller/provider startup and again in
-the restarted controller. A retained older controller request is rejected
-rather than adopted without this binding.
+the restarted controller. Historical v0.2 AF-shaped retained state is loaded
+only by the explicit compatibility reader, is never accepted as new input, and
+is not rewritten in place.
 
 Desired zero performs no provider or bring-up work. Lower desired counts do not
 drain already retained workers. Every tunnel launch, bootstrap launch,

@@ -196,8 +196,8 @@ begin
       out: log_path,
       err: log_path
     )
-    Process.detach(wlo_pid)
     wait_for_file(ready_path, pid: wlo_pid, log_path:)
+    Process.detach(wlo_pid)
     wlo = JSON.parse(File.read(ready_path)).merge("pid" => wlo_pid)
   end
 

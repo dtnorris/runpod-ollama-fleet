@@ -39,10 +39,10 @@ admission path. The independent guardian continues enforcing the original
 authority and owns teardown; it never creates replacement capacity. WLO remains
 only a consumer of published READY workers.
 
-Start also requires one exact AdventureFinder model-requirement artifact for
+Start also requires one exact `ollama-capability-request/v0.1` artifact for
 every campaign profile. The supervised request binds each artifact's bytes and
-semantic fingerprint so a restarted controller cannot reinterpret aliases or
-adopt bring-up evidence for a different requirement. See
+semantic fingerprint so a restarted controller cannot adopt bring-up evidence
+for a different runtime capability. See
 [`WORKER_BRINGUP.md`](WORKER_BRINGUP.md) for the generation-bound resumable
 workflow. The same supervised reconciliation pass now composes provider
 capacity, tunnel establishment, exact model bootstrap, capability verification,

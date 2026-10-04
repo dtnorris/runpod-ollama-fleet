@@ -216,17 +216,21 @@ service is available, but does not claim host-power, reboot, sleep, network, or
 provider availability. Its heartbeat cadence is the smaller of 10 seconds and
 one third of the frozen orchestrator-heartbeat timeout (never below one second).
 
-## Plan-derived model requirements
+## Ollama capability requests
 
-`RunpodOllamaFleet::ModelRequirement` consumes the exact JSON artifact emitted by
-AdventureFinder model preflight. `CampaignRunpodRuntime` can validate it against a
-campaign profile and hardware binding before any provider lookup or mutation. Model,
-full digest, context, residency, and optional GPU identity must match exactly; the
-human alias is retained only as provenance and is never translated by RPOF.
+`RunpodOllamaFleet::OllamaCapabilityRequest` independently implements WLO's
+public `ollama-capability-request/v0.1` contract. `CampaignRunpodRuntime`
+validates it against a campaign profile and hardware binding before any provider
+lookup or mutation. Model, full digest, context, residency, and optional GPU
+identity must match exactly. Unknown fields—including aliases, workload/batch,
+plan/pool, provenance, campaign, provider, budget, deadline, and lease fields—fail
+closed.
 
-`campaign start` requires one `--model-requirement PROFILE=FILE` binding per
-campaign profile. The supervised request binds the file SHA-256 and semantic
-requirement fingerprint across controller restarts. The generation-bound,
+`campaign start` requires one `--capability-request PROFILE=FILE` binding per
+campaign profile. The v0.3 supervised request binds the file SHA-256 and semantic
+capability fingerprint across controller restarts. Historical v0.2 retained
+requests remain readable through a separate legacy-state path; they cannot be
+supplied as new campaign input and are never rewritten in place. The generation-bound,
 durable tunnel/bootstrap/capability workflow is documented in
 [`docs/WORKER_BRINGUP.md`](docs/WORKER_BRINGUP.md). The FO-09 controller now
 composes it after existing provider-capacity reconciliation and publishes READY

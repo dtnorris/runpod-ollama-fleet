@@ -19,7 +19,7 @@ options = {
   authorize_paid: false,
   json: false,
   reason: nil,
-  model_requirements: [],
+  capability_requests: [],
   desired_profiles: [],
   expected_revision: nil
 }
@@ -32,8 +32,8 @@ parser = OptionParser.new do |o|
   o.on("--hardware FILE", "Hardware qualification registry") { |v| options[:hardware] = v }
   o.on("--state-root DIR", "Durable RPOF state root") { |v| options[:state_root] = v }
   o.on("--ssh-public-key FILE", "OpenSSH public key for authorized start") { |v| options[:ssh_public_key] = v }
-  o.on("--model-requirement PROFILE=FILE", "Exact FO-10 requirement for one campaign profile; repeatable") do |v|
-    options[:model_requirements] << v
+  o.on("--capability-request PROFILE=FILE", "Exact Ollama capability request for one profile; repeatable") do |v|
+    options[:capability_requests] << v
   end
   o.on("--authorize-paid", "Explicitly authorize provider creation (start only)") { options[:authorize_paid] = true }
   o.on("--profile ID=COUNT", "Desired profile count (desired-set; repeatable)") do |v|
@@ -195,18 +195,18 @@ begin
 
     counts[profile_id] = Integer(count, 10)
   end
-  model_requirement_paths = options[:model_requirements].each_with_object({}) do |value, paths|
+  capability_request_paths = options[:capability_requests].each_with_object({}) do |value, paths|
     profile_id, separator, path = value.partition("=")
     if separator.empty? || profile_id.empty? || path.empty?
-      raise OptionParser::InvalidArgument, "--model-requirement must be PROFILE=FILE"
+      raise OptionParser::InvalidArgument, "--capability-request must be PROFILE=FILE"
     end
     if paths.key?(profile_id)
-      raise OptionParser::InvalidArgument, "duplicate --model-requirement #{profile_id.inspect}"
+      raise OptionParser::InvalidArgument, "duplicate --capability-request #{profile_id.inspect}"
     end
     paths[profile_id] = File.expand_path(path)
   end
-  model_requirements = model_requirement_paths.transform_values do |path|
-    RunpodOllamaFleet::ModelRequirement.load(path)
+  capability_requests = capability_request_paths.transform_values do |path|
+    RunpodOllamaFleet::OllamaCapabilityRequest.load(path)
   end
 
   hardware = RunpodOllamaFleet::ExecutionPoolHardware.new(path: options[:hardware])
@@ -219,15 +219,15 @@ begin
   controller_supervisor = RunpodOllamaFleet::CampaignControllerSupervisor.new(
     root: options[:state_root], repo_root: ROOT,
     campaign_path: options.fetch(:campaign), budget_path: options.fetch(:budget),
-    hardware_path: options.fetch(:hardware), model_requirement_paths:
+    hardware_path: options.fetch(:hardware), capability_request_paths:
   )
-  if !profile_ids.empty? && model_requirements.empty?
-    model_requirements = controller_supervisor.resolved_model_requirements(binding:)
+  if !profile_ids.empty? && capability_requests.empty?
+    capability_requests = controller_supervisor.resolved_capability_requests(binding:)
   end
-  readiness_gate = if !profile_ids.empty? && model_requirements.keys.sort == profile_ids.sort
+  readiness_gate = if !profile_ids.empty? && capability_requests.keys.sort == profile_ids.sort
                      RunpodOllamaFleet::WorkerBringupReadinessGate.new(
                        root: options[:state_root], campaign_identity_sha256: campaign.identity_sha256,
-                       requirements: model_requirements
+                       requirements: capability_requests
                      )
                    end
 
@@ -255,7 +255,7 @@ begin
   runtime_factory = lambda do |profile, qualification, admission|
     RunpodOllamaFleet::CampaignRunpodRuntime.new(
       root: options[:state_root], repo_root: ROOT, profile:, hardware: qualification,
-      client:, admission:, model_requirement: model_requirements[profile.fetch("profile_id")],
+      client:, admission:, capability_request: capability_requests[profile.fetch("profile_id")],
       campaign_identity_sha256: campaign.identity_sha256, readiness_gate:
     )
   end
@@ -294,7 +294,7 @@ rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError, OptionParser
        RunpodOllamaFleet::CampaignBudgetBinding::Error,
        RunpodOllamaFleet::CampaignControllerSupervisor::Error,
        RunpodOllamaFleet::CampaignLifecycle::Error,
-       RunpodOllamaFleet::ModelRequirement::Error,
+       RunpodOllamaFleet::OllamaCapabilityRequest::Error,
        LocalModelEvaluation::RunpodClient::Error => e
   warn "ERROR: #{e.message}"
   exit 1

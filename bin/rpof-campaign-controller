@@ -19,12 +19,18 @@ end
 raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
 
 request = JSON.parse(File.read(options.fetch(:request)))
-expected_keys = %w[
+common_keys = %w[
   contract_version campaign_identity_sha256 binding_sha256 budget_id generation_id
   campaign_path campaign_sha256 budget_path budget_sha256 hardware_path hardware_sha256
-  model_requirements
   controller_executable_sha256 state_root repo_root ssh_public_key_path heartbeat_seconds
 ]
+request_version = request.fetch("contract_version")
+runtime_request_key = case request_version
+                      when "rpof-campaign-controller-request/v0.3" then "capability_requests"
+                      when "rpof-campaign-controller-request/v0.2" then "model_requirements"
+                      else raise "unsupported campaign controller request contract"
+                      end
+expected_keys = common_keys + [runtime_request_key]
 raise "campaign controller request fields are invalid" unless request.keys.sort == expected_keys.sort
 
 repo_root = File.expand_path(request.fetch("repo_root"))
@@ -32,13 +38,18 @@ Dotenv.load(File.join(repo_root, ".env"))
 $LOAD_PATH.unshift File.join(repo_root, "lib")
 require "runpod_ollama_fleet"
 
-controller_executable = File.join(repo_root, "bin", "rpof-campaign-controller")
-unless Digest::SHA256.file(controller_executable).hexdigest == request.fetch("controller_executable_sha256")
-  raise "campaign controller executable changed"
-end
-
-unless request.fetch("contract_version") == RunpodOllamaFleet::CampaignControllerSupervisor::REQUEST_CONTRACT_VERSION
+if request_version == RunpodOllamaFleet::CampaignControllerSupervisor::REQUEST_CONTRACT_VERSION
+  controller_executable = File.join(repo_root, "bin", "rpof-campaign-controller")
+  unless Digest::SHA256.file(controller_executable).hexdigest == request.fetch("controller_executable_sha256")
+    raise "campaign controller executable changed"
+  end
+elsif request_version != RunpodOllamaFleet::CampaignControllerSupervisor::LEGACY_REQUEST_CONTRACT_VERSION
   raise "unsupported campaign controller request contract"
+# A retained v0.2 request necessarily names the pre-migration executable. Its
+# immutable request and authority artifacts are validated below; rewriting the
+# historical executable identity in place would destroy retained evidence.
+elsif !request.fetch("controller_executable_sha256").to_s.match?(/\A[0-9a-f]{64}\z/)
+  raise "legacy campaign controller executable identity is invalid"
 end
 %w[campaign budget hardware].each do |name|
   path = File.expand_path(request.fetch("#{name}_path"))
@@ -58,37 +69,47 @@ unless campaign.identity_sha256 == request.fetch("campaign_identity_sha256") &&
   raise "campaign controller request does not match durable campaign authority"
 end
 
-model_requirements = request.fetch("model_requirements").to_h do |row|
-  expected = %w[profile_id path artifact_sha256 requirement_sha256]
-  raise "campaign controller model requirement fields are invalid" unless row.is_a?(Hash) && row.keys.sort == expected.sort
+legacy = request_version == RunpodOllamaFleet::CampaignControllerSupervisor::LEGACY_REQUEST_CONTRACT_VERSION
+runtime_requests = request.fetch(runtime_request_key).to_h do |row|
+  expected = if legacy
+               %w[profile_id path artifact_sha256 requirement_sha256]
+             else
+               %w[profile_id path artifact_sha256 capability_fingerprint]
+             end
+  raise "campaign controller runtime request fields are invalid" unless row.is_a?(Hash) && row.keys.sort == expected.sort
   path = File.expand_path(row.fetch("path"))
   unless Digest::SHA256.file(path).hexdigest == row.fetch("artifact_sha256")
-    raise "campaign controller model requirement artifact changed"
+    raise "campaign controller runtime request artifact changed"
   end
-  requirement = RunpodOllamaFleet::ModelRequirement.load(path)
-  unless requirement.fingerprint == row.fetch("requirement_sha256")
-    raise "campaign controller model requirement fingerprint changed"
+  runtime_request = if legacy
+                      RunpodOllamaFleet::ModelRequirement.load(path)
+                    else
+                      RunpodOllamaFleet::OllamaCapabilityRequest.load(path)
+                    end
+  fingerprint_key = legacy ? "requirement_sha256" : "capability_fingerprint"
+  unless runtime_request.fingerprint == row.fetch(fingerprint_key)
+    raise "campaign controller runtime request fingerprint changed"
   end
-  [row.fetch("profile_id"), requirement]
+  [row.fetch("profile_id"), runtime_request]
 end
-unless model_requirements.length == request.fetch("model_requirements").length
-  raise "campaign controller model requirement profile identities are not unique"
+unless runtime_requests.length == request.fetch(runtime_request_key).length
+  raise "campaign controller runtime request profile identities are not unique"
 end
 profile_ids = campaign.profiles.map { |profile| profile.fetch("profile_id") }
-unless model_requirements.keys.sort == profile_ids.sort
-  raise "campaign controller model requirements do not cover exact campaign profiles"
+unless runtime_requests.keys.sort == profile_ids.sort
+  raise "campaign controller runtime requests do not cover exact campaign profiles"
 end
 campaign.profiles.each do |profile|
   profile_id = profile.fetch("profile_id")
   qualification = campaign.hardware_bindings.find { |row| row.fetch("profile_id") == profile_id }
   raise "campaign controller profile has no hardware qualification" unless qualification
-  model_requirements.fetch(profile_id).validate_profile!(profile:, hardware: qualification)
+  runtime_requests.fetch(profile_id).validate_profile!(profile:, hardware: qualification)
 end
 
 readiness_gate = RunpodOllamaFleet::WorkerBringupReadinessGate.new(
   root: request.fetch("state_root"),
   campaign_identity_sha256: campaign.identity_sha256,
-  requirements: model_requirements
+  requirements: runtime_requests
 )
 registry_publisher = RunpodOllamaFleet::DynamicWorkerRegistry.new(
   state_root: request.fetch("state_root"), repo_root:, readiness_gate:
@@ -107,7 +128,7 @@ end
 runtime_factory = lambda do |profile, qualification, admission|
   RunpodOllamaFleet::CampaignRunpodRuntime.new(
     root: request.fetch("state_root"), repo_root:, profile:, hardware: qualification,
-    client:, admission:, model_requirement: model_requirements.fetch(profile.fetch("profile_id")),
+    client:, admission:, capability_request: runtime_requests.fetch(profile.fetch("profile_id")),
     campaign_identity_sha256: campaign.identity_sha256, readiness_gate:
   )
 end

@@ -3,6 +3,7 @@
 require_relative "runpod_ollama_fleet/version"
 require_relative "runpod_ollama_fleet/execution_pool_hardware"
 require_relative "runpod_ollama_fleet/model_requirement"
+require_relative "runpod_ollama_fleet/ollama_capability_request"
 require_relative "runpod_ollama_fleet/worker_bringup_identity"
 require_relative "runpod_ollama_fleet/worker_bringup_state"
 require_relative "runpod_ollama_fleet/worker_bringup_reconciler"

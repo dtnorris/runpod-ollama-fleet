@@ -2,6 +2,7 @@
 
 require_relative "test_helper"
 require "runpod_ollama_fleet/model_requirement"
+require "runpod_ollama_fleet/ollama_capability_request"
 require "runpod_ollama_fleet/campaign_runpod_runtime"
 
 class ModelRequirementTest < Minitest::Test
@@ -22,7 +23,7 @@ class ModelRequirementTest < Minitest::Test
     provider = Provider.new
     runtime = RunpodOllamaFleet::CampaignRunpodRuntime.new(
       root: Dir.tmpdir, repo_root: File.expand_path("..", __dir__), profile:, hardware:,
-      client: provider, model_requirement: RunpodOllamaFleet::ModelRequirement.new(document)
+      client: provider, capability_request: capability_request
     )
 
     assert_instance_of RunpodOllamaFleet::CampaignRunpodRuntime, runtime
@@ -41,10 +42,10 @@ class ModelRequirementTest < Minitest::Test
       provider = Provider.new
       changed = profile
       mutation.call(changed)
-      error = assert_raises(RunpodOllamaFleet::ModelRequirement::Error, field) do
+      error = assert_raises(RunpodOllamaFleet::OllamaCapabilityRequest::Error, field) do
         RunpodOllamaFleet::CampaignRunpodRuntime.new(
           root: Dir.tmpdir, repo_root: File.expand_path("..", __dir__), profile: changed,
-          hardware:, client: provider, model_requirement: RunpodOllamaFleet::ModelRequirement.new(document)
+          hardware:, client: provider, capability_request: capability_request
         )
       end
       assert_includes error.message, "mismatch", field
@@ -56,10 +57,10 @@ class ModelRequirementTest < Minitest::Test
     provider = Provider.new
     changed = hardware.merge("qualified_gpu_ids" => ["NVIDIA RTX 4090"])
 
-    error = assert_raises(RunpodOllamaFleet::ModelRequirement::Error) do
+    error = assert_raises(RunpodOllamaFleet::OllamaCapabilityRequest::Error) do
       RunpodOllamaFleet::CampaignRunpodRuntime.new(
         root: Dir.tmpdir, repo_root: File.expand_path("..", __dir__), profile:, hardware: changed,
-        client: provider, model_requirement: RunpodOllamaFleet::ModelRequirement.new(document)
+        client: provider, capability_request: capability_request
       )
     end
 
@@ -85,6 +86,14 @@ class ModelRequirementTest < Minitest::Test
   end
 
   private
+
+  def capability_request
+    value = {
+      "contract_version" => "ollama-capability-request/v0.1",
+      "ollama" => document.fetch("ollama")
+    }
+    RunpodOllamaFleet::OllamaCapabilityRequest.new(JSON.generate(value))
+  end
 
   def document
     {

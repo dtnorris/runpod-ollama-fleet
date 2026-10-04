@@ -277,7 +277,7 @@ class WorkerBringupCloseoutTest < Minitest::Test
 
   def setup
     @tmp = Dir.mktmpdir("fo11-closeout-")
-    @requirement = model_requirement
+    @requirement = capability_request
     @worker = worker
     @tunnel = Tunnel.new
     @bootstrap = Bootstrap.new(@requirement)
@@ -515,24 +515,24 @@ class WorkerBringupCloseoutTest < Minitest::Test
     )
     paths = campaign.profiles.to_h do |row|
       hardware = campaign.hardware_bindings.find { |item| item.fetch("profile_id") == row.fetch("profile_id") }
-      path = File.join(@tmp, "#{row.fetch('profile_id')}-requirement.json")
+      path = File.join(@tmp, "#{row.fetch('profile_id')}-capability.json")
       File.write(path, JSON.pretty_generate(requirement_for(row, hardware).document) + "\n")
       [row.fetch("profile_id"), path]
     end
     supervisor = RunpodOllamaFleet::CampaignControllerSupervisor.new(
       root: File.join(@tmp, "drift"), repo_root:, campaign_path:, budget_path:, hardware_path:,
-      model_requirement_paths: paths
+      capability_request_paths: paths
     )
     request = supervisor.send(
       :request_document, binding:, generation: "generation-1", heartbeat_seconds: 5,
       ssh_public_key_path: "/tmp/offline.pub"
     )
     changed = JSON.parse(File.binread(paths.fetch("qwen35")))
-    changed["alias"] = "changed-alias"
+    changed.fetch("ollama")["model"] = "changed:model"
     File.write(paths.fetch("qwen35"), JSON.pretty_generate(changed) + "\n")
 
     error = assert_raises(RunpodOllamaFleet::CampaignControllerSupervisor::Error) do
-      supervisor.send(:validate_retained_requirements!, request, binding)
+      supervisor.send(:validate_retained_request!, request, binding)
     end
     assert_includes error.message, "artifact changed"
   end
@@ -593,15 +593,16 @@ class WorkerBringupCloseoutTest < Minitest::Test
   end
 
   def requirement_for(row, hardware)
-    document = requirement_document
-    document["pool_id"] = row.fetch("profile_id")
-    document["ollama"] = {
+    document = {
+      "contract_version" => RunpodOllamaFleet::OllamaCapabilityRequest::CONTRACT_VERSION,
+      "ollama" => {
       "model" => row.fetch("model"), "expected_digest" => row.fetch("expected_digest"),
       "required_context_length" => row.fetch("required_context_length"),
       "require_fully_gpu_resident" => true,
       "required_gpu_id" => hardware.fetch("qualified_gpu_ids").first
+      }
     }
-    RunpodOllamaFleet::ModelRequirement.new(document)
+    RunpodOllamaFleet::OllamaCapabilityRequest.new(JSON.generate(document))
   end
 
   def guardian(now)
@@ -674,7 +675,7 @@ class WorkerBringupCloseoutTest < Minitest::Test
     end
     klass.new(
       root: @tmp, repo_root: File.expand_path("..", __dir__), profile:, hardware: hardware,
-      client: nil, model_requirement: @requirement, campaign_identity_sha256: CAMPAIGN_SHA,
+      client: nil, capability_request: @requirement, campaign_identity_sha256: CAMPAIGN_SHA,
       bringup_reconciler_factory: factory
     )
   end
@@ -737,8 +738,12 @@ class WorkerBringupCloseoutTest < Minitest::Test
     }
   end
 
-  def model_requirement
-    RunpodOllamaFleet::ModelRequirement.new(requirement_document)
+  def capability_request
+    document = {
+      "contract_version" => RunpodOllamaFleet::OllamaCapabilityRequest::CONTRACT_VERSION,
+      "ollama" => requirement_document.fetch("ollama")
+    }
+    RunpodOllamaFleet::OllamaCapabilityRequest.new(JSON.generate(document))
   end
 
   def requirement_document

@@ -36,11 +36,11 @@ if mode == "wlo"
       "pid" => Process.ppid,
       "registry_id" => registry.fetch("registry_id"),
       "worker_id" => worker.fetch("worker_id"),
-      "endpoint" => ENV.fetch("AF_OLLAMA_BASE_URL"),
+      "endpoint" => ENV.fetch("WLO_WORKER_ENDPOINT"),
       "argv" => ARGV,
       "workdir" => workdir,
       "provider_lifecycle_features" => $LOADED_FEATURES.grep(
-        %r{/(?:rpof|paid_budget|pool_fulfillment|execution_pool_plan|worker_admission|legacy_rpof)}
+        %r{/(?:rpof|paid_budget|pool_fulfillment|execution_pool_plan|worker_admission|legacy_rpof)[^/]*\z}
       ).sort
     }
     File.write(ready_path, JSON.generate(document) + "\n")
