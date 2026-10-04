@@ -4,6 +4,41 @@
 model profiles under one durable campaign identity. Parsing and validation are
 read-only: the contract does not authorize or provision provider resources.
 
+## Cheap-first availability fallback
+
+The supervised campaign controller fixes an ordered provider-candidate decision
+before entering a paid provisioning path. The candidate set is exactly the
+profile's hardware-qualified GPU IDs, narrowed to one ID when the bound
+`ollama-capability-request/v0.1` supplies `required_gpu_id`. Live provider
+inventory cannot add a GPU to that authority.
+
+Candidates are ordered by positive hourly-rate evidence and then exact GPU ID.
+Provider response order is irrelevant. Missing, unavailable, undersized, or
+otherwise unsuitable catalog rows remain visible as rejected authorized
+candidates; they are not replaced with arbitrary inventory.
+
+Progress is retained below the existing campaign-budget authority. Each
+candidate moves at most once through `not_attempted`, `in_progress`, and either
+`provisioned`, `accepted`, `rejected`, or `blocked`. A controller restart reuses
+that decision and refuses to repeat an unresolved attempt. The same campaign
+identity, binding, budget ID, original deadline, worker ceilings, hourly
+ceiling, cumulative-compute ceiling, and exact capability fingerprint remain
+authoritative throughout.
+
+Every candidate still uses ordinary campaign reservation and admission. A
+more-expensive candidate is rechecked against the original aggregate hourly,
+worker, cumulative-liability, deadline, and guardian limits. A provider
+mutation can fall through only after existing provider-absence verification has
+returned the profile to its pre-attempt committed worker count with no pending
+reservation. Unknown provider outcomes, failed cleanup, and unclassified FO-11
+terminal failures are retained as `blocked`; they do not advance.
+
+FO-11 remains the acceptance authority. Provisioned capacity is not the final
+selected candidate until generation-bound tunnel, bootstrap, and exact
+capability evidence pass. A classified exact-capability mismatch may trigger
+verified cleanup and the next retained candidate. Model, digest, context,
+residency, and required-GPU semantics are never changed for a retry.
+
 Required top-level fields are:
 
 - `contract_version`: exactly `rpof-capacity-campaign/v0.1`;

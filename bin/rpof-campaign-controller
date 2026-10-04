@@ -129,7 +129,7 @@ runtime_factory = lambda do |profile, qualification, admission|
   RunpodOllamaFleet::CampaignRunpodRuntime.new(
     root: request.fetch("state_root"), repo_root:, profile:, hardware: qualification,
     client:, admission:, capability_request: runtime_requests.fetch(profile.fetch("profile_id")),
-    campaign_identity_sha256: campaign.identity_sha256, readiness_gate:
+    campaign_identity_sha256: campaign.identity_sha256, readiness_gate:, binding:
   )
 end
 lifecycle = RunpodOllamaFleet::CampaignLifecycle.new(

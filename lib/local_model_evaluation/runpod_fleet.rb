@@ -340,7 +340,15 @@ module LocalModelEvaluation
             cloud:
           )
           campaign_handles[index] = handle if handle
-          pod = attempt_campaign_create(handle) { @client.create_pod(body) }
+          pod = begin
+            attempt_campaign_create(handle) { @client.create_pod(body) }
+          rescue StandardError => e
+            release_rejected_create_if_absent(
+              handle, error: e, expected_name: worker_name(index),
+              reason: "provider create rejected before returning an identity"
+            )
+            raise
+          end
           pod_id = pod["id"].to_s
           raise Error, "RunPod create response for #{worker_name(index)} did not include a pod id" if pod_id.empty?
 
@@ -441,6 +449,7 @@ module LocalModelEvaluation
           pod = resolve_pod_for_destroy(index, pod_id, live_pods)
           unless pod
             @out.puts "Already absent #{expected_name}"
+            mark_campaign_resource_absent!(pod_id) if verify_absent && @capacity_admission && !pod_id.empty?
             cleared << index
             next
           end
@@ -454,10 +463,12 @@ module LocalModelEvaluation
           @client.delete_pod(actual_id)
           @out.puts "Deleted #{expected_name}: #{actual_id}"
           verify_pod_absent!(actual_id, wait_seconds: verify_wait_seconds, poll_seconds: verify_poll_seconds) if verify_absent
+          mark_campaign_resource_absent!(actual_id) if verify_absent && @capacity_admission
           cleared << index
         rescue RunpodClient::Error => e
           if e.status == 404
             @out.puts "Already absent #{expected_name}: #{pod_id}"
+            mark_campaign_resource_absent!(pod_id) if verify_absent && @capacity_admission && !pod_id.empty?
             cleared << index
           else
             errors << "burst_#{index}: #{e.message}"
@@ -716,7 +727,7 @@ module LocalModelEvaluation
 
       required = %i[
         authority_identity profile_id reserve! attempt_provider_create! commit!
-        provider_absence_verified!
+        provider_absence_verified! mark_resource_absent!
       ]
       missing = required.reject { |name| @capacity_admission.respond_to?(name) }
       unless missing.empty?
@@ -762,6 +773,29 @@ module LocalModelEvaluation
       )
     rescue StandardError => e
       @out.puts "WARNING: could not release campaign liability for #{provider_resource_id}: #{e.message}"
+    end
+
+    def mark_campaign_resource_absent!(provider_resource_id)
+      @capacity_admission.mark_resource_absent!(provider_resource_id:)
+    rescue StandardError => e
+      raise Error, "could not release verified-absent campaign resource: #{e.message}"
+    end
+
+    def release_rejected_create_if_absent(handle, error:, expected_name:, reason:)
+      return unless handle
+      return unless error.is_a?(RunpodClient::Error) && [400, 409, 422].include?(error.status)
+      return unless error.message.match?(/(?:capacity|unavailable|hardware|gpu)/i)
+
+      matches = @client.list_pods.select { |pod| pod["name"] == expected_name }
+      return unless matches.empty?
+
+      record_campaign_absence(
+        handle,
+        provider_resource_id: "unassigned-#{expected_name}",
+        reason:
+      )
+    rescue StandardError => e
+      @out.puts "WARNING: could not prove rejected create absent for #{expected_name}: #{e.message}"
     end
 
     def resolve_pod_for_destroy(index, pod_id, live_pods)

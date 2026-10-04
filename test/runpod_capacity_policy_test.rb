@@ -54,6 +54,18 @@ class RunpodCapacityPolicyTest < Minitest::Test
     assert_includes ranking.rejections.first.reason, "catalog did not return"
   end
 
+  def test_retains_invalid_price_as_rejected_authorized_candidate_evidence
+    row = gpu("NVIDIA A40", 48, 0.49)
+    row["price"].delete("secure")
+    ranking = LocalModelEvaluation::RunpodCapacityPolicy.new(
+      client: FakeClient.new([row])
+    ).rank(gpu_ids: ["NVIDIA A40"], cloud: "SECURE")
+
+    assert_empty ranking.candidates
+    assert_nil ranking.rejections.first.hourly_rate_usd
+    assert_includes ranking.rejections.first.reason, "hourly rate must be a positive number"
+  end
+
   private
 
   def gpu(id, memory, rate, availability: "HIGH")

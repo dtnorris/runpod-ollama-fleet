@@ -7,6 +7,7 @@ require_relative "../local_model_evaluation/runpod_capacity_policy"
 require_relative "../local_model_evaluation/process_supervisor"
 require_relative "../local_model_evaluation/runpod_bootstrap"
 require_relative "../local_model_evaluation/runpod_tunnels"
+require_relative "availability_fallback"
 require_relative "capability_check"
 require_relative "dynamic_worker_registry"
 require_relative "ollama_capability_request"
@@ -21,7 +22,8 @@ module RunpodOllamaFleet
 
     def initialize(root:, repo_root:, profile:, hardware:, client:, admission: nil, out: $stdout,
                    wall_clock: nil, readiness_observer: nil, capability_request: nil,
-                   campaign_identity_sha256: nil, readiness_gate: nil,
+                   campaign_identity_sha256: nil, readiness_gate: nil, binding: nil,
+                   availability_fallback: nil,
                    bringup_reconciler_factory: nil)
       @root = File.expand_path(root)
       @repo_root = File.expand_path(repo_root)
@@ -36,6 +38,9 @@ module RunpodOllamaFleet
       @campaign_identity_sha256 = campaign_identity_sha256
       @readiness_gate = readiness_gate
       @bringup_reconciler_factory = bringup_reconciler_factory
+      @binding = binding
+      @availability_fallback = availability_fallback || build_availability_fallback
+      @fallback_retry_pending = false
       @capability_request&.validate_profile!(profile: @profile, hardware: @hardware)
     end
 
@@ -50,7 +55,7 @@ module RunpodOllamaFleet
       provider_active = workers.count { |row| row["status"] == "active" }
       readiness = readiness_status
       counts = readiness["counts"] || {}
-      {
+      result = {
         "current_workers" => workers.length,
         # Compatibility field: historically this meant active fleet-state rows,
         # not dynamic-worker-registry READY.
@@ -70,12 +75,140 @@ module RunpodOllamaFleet
         "fleet_status" => record && record["status"],
         "worker_readiness" => workers.group_by { |row| row.fetch("status") }.transform_values(&:length)
       }
+      fallback = @availability_fallback&.current
+      result["availability_fallback"] = fallback if fallback
+      result
     end
 
     def ensure_workers!(desired_workers:, ssh_public_key_path:, original_deadline_at_utc:,
                         max_hourly_rate_usd:)
       raise Error, "campaign provider client is unavailable" unless @client
       raise Error, "campaign admission is required for a paid mutation" unless @admission
+      return ensure_workers_with_fallback!(
+        desired_workers:, ssh_public_key_path:, original_deadline_at_utc:, max_hourly_rate_usd:
+      ) if @availability_fallback
+
+      provision_with_gpu!(
+        selected_gpu: qualified_gpu_id(
+          max_hourly_rate_usd: max_hourly_rate_usd,
+          desired_workers: desired_workers
+        ),
+        desired_workers:, ssh_public_key_path:, original_deadline_at_utc:, max_hourly_rate_usd:
+      )
+    rescue LocalModelEvaluation::RunpodFleet::Error,
+           LocalModelEvaluation::RunpodFleetLifecycle::Error,
+           LocalModelEvaluation::RunpodFleetNamespace::Error,
+           AvailabilityFallback::Error => e
+      raise Error, e.message
+    end
+
+    def fallback_retry_pending?
+      @fallback_retry_pending == true
+    end
+
+    def fallback_candidate_limit
+      required_gpu_ids.length
+    end
+
+    def reconcile_bringup!(desired_workers:, transition_guard:)
+      desired = Integer(desired_workers)
+      return [] if desired.zero?
+      raise Error, "exact Ollama capability request is required for automatic bring-up" unless @capability_request
+      unless @campaign_identity_sha256.to_s.match?(/\A[0-9a-f]{64}\z/)
+        raise Error, "campaign identity is required for automatic bring-up"
+      end
+
+      fleet = current_record
+      return [] unless fleet && fleet["status"] == "active"
+      adopt_provisioned_fallback!(fleet)
+      workers = Array(fleet.fetch("workers")).select { |worker| worker["status"] == "active" }
+                                              .sort_by { |worker| Integer(worker.fetch("index")) }
+                                              .first(desired)
+      reconciler = bringup_reconciler(transition_guard)
+      states = workers.map do |worker|
+        reconciler.reconcile!(
+          campaign_identity_sha256: @campaign_identity_sha256,
+          profile: @profile,
+          worker:,
+          generation_id: worker.fetch("generation_id"),
+          capability_request: @capability_request,
+          retry_bootstrap: true
+        )
+      end
+      reconcile_fallback_bringup!(fleet, states)
+      states
+    rescue WorkerBringupReconciler::Error, LocalModelEvaluation::RunpodFleetState::Error,
+           AvailabilityFallback::Error, KeyError, ArgumentError, TypeError => e
+      raise Error, e.message
+    end
+
+    private
+
+    def build_availability_fallback
+      return unless @binding && @capability_request
+
+      AvailabilityFallback.new(
+        binding: @binding, profile: @profile, hardware: @hardware,
+        capability_request: @capability_request, wall_clock: @wall_clock
+      )
+    end
+
+    def ensure_workers_with_fallback!(desired_workers:, ssh_public_key_path:,
+                                      original_deadline_at_utc:, max_hourly_rate_usd:)
+      desired = Integer(desired_workers)
+      from = current_worker_count
+      candidates = fallback_candidates
+      @availability_fallback.prepare!(
+        from_workers: from,
+        target_workers: desired,
+        original_deadline_at_utc:,
+        candidates:
+      )
+      @fallback_retry_pending = false
+
+      loop do
+        candidate = @availability_fallback.next_candidate!
+        unless candidate
+          raise Error, "authorized fallback candidate set is exhausted"
+        end
+        selected_gpu = candidate.fetch("gpu_id")
+        begin
+          # This transition is deliberately conservative: once the live
+          # provisioning path is entered, absence must be proved before a
+          # different candidate can be admitted.
+          @availability_fallback.mark_provider_mutation_started!
+          provision_with_gpu!(
+            selected_gpu:, desired_workers: desired, ssh_public_key_path:,
+            original_deadline_at_utc:, max_hourly_rate_usd:
+          )
+          @availability_fallback.mark_provisioned!
+          return true
+        rescue StandardError => e
+          safe = fallback_liability_matches_workers?(from)
+          retryable = retryable_capacity_failure?(e)
+          if retryable && safe
+            @availability_fallback.reject_current!(
+              reason: e.message,
+              cleanup_status: "verified_absent"
+            )
+            next
+          end
+
+          @availability_fallback.block_current!(
+            reason: retryable ?
+              "candidate cleanup or liability remains unresolved: #{e.message}" :
+              "non-retryable candidate failure: #{e.message}",
+            cleanup_status: safe ? "verified_absent" : "unresolved"
+          )
+          raise
+        end
+      end
+    rescue ArgumentError, TypeError => e
+      raise Error, e.message
+    end
+
+    def provision_with_gpu!(selected_gpu:, desired_workers:, ssh_public_key_path:,
+                            original_deadline_at_utc:, max_hourly_rate_usd:)
       namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
         root: @root, repo_root: @repo_root, fleet_key: profile_id, create: true
       )
@@ -83,10 +216,6 @@ module RunpodOllamaFleet
         client: @client, env_path: namespace.env_path, state_root: namespace.state_root,
         fleet_key: namespace.fleet_key, local_port_base: namespace.local_port_base,
         capacity_admission: @admission, out: @out, wall_clock: @wall_clock
-      )
-      selected_gpu = qualified_gpu_id(
-        max_hourly_rate_usd: max_hourly_rate_usd,
-        desired_workers: desired_workers
       )
       fleet.gpu_id = selected_gpu
       ssh_key = fleet.read_ssh_public_key(ssh_public_key_path)
@@ -120,42 +249,184 @@ module RunpodOllamaFleet
           min_ready_workers: desired_workers
         )
       end
-    rescue LocalModelEvaluation::RunpodFleet::Error,
-           LocalModelEvaluation::RunpodFleetLifecycle::Error,
-           LocalModelEvaluation::RunpodFleetNamespace::Error => e
-      raise Error, e.message
+      true
     end
 
-    def reconcile_bringup!(desired_workers:, transition_guard:)
-      desired = Integer(desired_workers)
-      return [] if desired.zero?
-      raise Error, "exact Ollama capability request is required for automatic bring-up" unless @capability_request
-      unless @campaign_identity_sha256.to_s.match?(/\A[0-9a-f]{64}\z/)
-        raise Error, "campaign identity is required for automatic bring-up"
+    def fallback_candidates
+      ranking = LocalModelEvaluation::RunpodCapacityPolicy.new(client: @client).rank(
+        gpu_ids: required_gpu_ids,
+        cloud: @hardware.fetch("cloud")
+      )
+      rows = ranking.candidates.map do |candidate|
+        {
+          "gpu_id" => candidate.gpu_id,
+          "cloud" => ranking.cloud,
+          "hourly_rate_usd" => candidate.hourly_rate_usd,
+          "eligible" => true,
+          "reason" => nil
+        }
       end
+      rows.concat(ranking.rejections.map do |rejection|
+        {
+          "gpu_id" => rejection.gpu_id,
+          "cloud" => ranking.cloud,
+          "hourly_rate_usd" => rejection.hourly_rate_usd,
+          "eligible" => false,
+          "reason" => rejection.reason
+        }
+      end)
+      rows.sort_by do |row|
+        [row["hourly_rate_usd"].nil? ? 1 : 0, row["hourly_rate_usd"] || 0.0, row.fetch("gpu_id")]
+      end
+    rescue LocalModelEvaluation::RunpodCapacityPolicy::Error, KeyError => e
+      raise Error, "could not fix authorized fallback candidates before provider mutation: #{e.message}"
+    end
 
-      fleet = current_record
-      return [] unless fleet && fleet["status"] == "active"
-      workers = Array(fleet.fetch("workers")).select { |worker| worker["status"] == "active" }
-                                              .sort_by { |worker| Integer(worker.fetch("index")) }
-                                              .first(desired)
-      reconciler = bringup_reconciler(transition_guard)
-      workers.map do |worker|
-        reconciler.reconcile!(
-          campaign_identity_sha256: @campaign_identity_sha256,
-          profile: @profile,
-          worker:,
-          generation_id: worker.fetch("generation_id"),
-          capability_request: @capability_request,
-          retry_bootstrap: true
+    def retryable_capacity_failure?(error)
+      message = error.message.to_s
+      return false if message.match?(
+        /(?:budget|deadline|guardian|binding|campaign identity|worker ceiling|profile .* ceiling|aggregate hourly|cumulative|safety cap|fleet cost|malformed|corrupt)/i
+      )
+
+      message.match?(
+        /(?:catalog did not return|not available on .* cloud|availability is (?:NONE|unknown)|capacity unavailable|insufficient capacity|requested hardware|GPU mismatch|cloud mismatch|entered terminal status|timed out waiting for RunPod SSH|readiness ended)/i
+      )
+    end
+
+    def fallback_liability_matches_workers?(expected_workers)
+      return false unless current_worker_count == Integer(expected_workers)
+
+      authority = @binding.status
+      committed = Integer(
+        authority.dig("authority", "committed_workers_by_profile", profile_id) || 0
+      )
+      pending = authority.fetch("parent_budget").fetch("reservations").values.count do |row|
+        row["fleet_key"] == profile_id && row["status"] == "pending"
+      end
+      committed == Integer(expected_workers) && pending.zero?
+    rescue CampaignBudgetBinding::Error, KeyError, ArgumentError, TypeError
+      false
+    end
+
+    def adopt_provisioned_fallback!(fleet)
+      document = @availability_fallback&.current
+      return unless document && document.fetch("state") == "active"
+      gpu_id = document["current_candidate"]
+      candidate = document.fetch("candidates").find { |row| row.fetch("gpu_id") == gpu_id }
+      return unless candidate && candidate.fetch("status") == "in_progress"
+      target = document.fetch("target_workers")
+      return unless Integer(fleet.fetch("worker_count")) == target
+      unless fallback_liability_matches_workers?(target)
+        @availability_fallback.block_current!(
+          reason: "retained provider capacity does not match parent budget liability",
+          cleanup_status: "unresolved"
         )
+        raise Error, "retained fallback provider capacity is ambiguous"
       end
-    rescue WorkerBringupReconciler::Error, LocalModelEvaluation::RunpodFleetState::Error,
-           KeyError, ArgumentError, TypeError => e
-      raise Error, e.message
+
+      @availability_fallback.mark_provisioned!
     end
 
-    private
+    def reconcile_fallback_bringup!(fleet, states)
+      @fallback_retry_pending = false
+      document = @availability_fallback&.current
+      return unless document && document.fetch("state") == "active"
+      gpu_id = document["current_candidate"]
+      candidate = document.fetch("candidates").find { |row| row.fetch("gpu_id") == gpu_id }
+      return unless candidate && candidate.fetch("status") == "provisioned"
+
+      indices = ((Integer(document.fetch("from_workers")) + 1)..Integer(document.fetch("target_workers"))).to_a
+      worker_ids = Array(fleet.fetch("workers")).filter_map do |worker|
+        worker.fetch("worker_id") if indices.include?(Integer(worker.fetch("index")))
+      end
+      acquired = states.select { |state| worker_ids.include?(state.dig("identity", "worker_id")) }
+      if worker_ids.length != indices.length || acquired.length != worker_ids.length
+        @availability_fallback.block_current!(
+          reason: "generation-bound bring-up evidence is incomplete for the current fallback candidate",
+          cleanup_status: "unresolved"
+        )
+        raise Error, "current fallback candidate has incomplete FO-11 bring-up evidence"
+      end
+
+      if acquired.all? { |state| state.fetch("readiness_prerequisites_satisfied") == true }
+        @availability_fallback.mark_accepted!
+        return
+      end
+
+      reason = retryable_bringup_failure(acquired)
+      terminal = acquired.any? { |state| state.fetch("overall_status") == "failed_terminal" }
+      return unless terminal
+
+      unless reason
+        @availability_fallback.block_current!(
+          reason: "FO-11 terminal failure is not a classified candidate-unsuitability condition",
+          cleanup_status: "unresolved"
+        )
+        raise Error, "FO-11 terminal failure is not eligible for automatic candidate fallback"
+      end
+
+      cleanup_current_candidate!(document, reason:)
+      @fallback_retry_pending = true
+    end
+
+    def retryable_bringup_failure(states)
+      states.each do |state|
+        capability = state.fetch("capability")
+        if capability.fetch("status") == "failed_terminal" &&
+           capability["error"].to_s.match?(/does not match exact capability request/i)
+          return capability.fetch("error")
+        end
+        %w[tunnel bootstrap capability].each do |stage|
+          row = state.fetch(stage)
+          next unless row.fetch("status") == "failed_terminal"
+          error = row["error"].to_s
+          return error if error.match?(/does not match exact capability request/i)
+          return error if error.match?(/provider resource.*(?:unavailable|terminated|unusable|missing)/i)
+        end
+      end
+      nil
+    end
+
+    def cleanup_current_candidate!(document, reason:)
+      from = Integer(document.fetch("from_workers"))
+      target = Integer(document.fetch("target_workers"))
+      namespace = LocalModelEvaluation::RunpodFleetNamespace.new(
+        root: @root, repo_root: @repo_root, fleet_key: profile_id, create: true
+      )
+      fleet = LocalModelEvaluation::RunpodFleet.new(
+        client: @client, env_path: namespace.env_path, state_root: namespace.state_root,
+        fleet_key: namespace.fleet_key, local_port_base: namespace.local_port_base,
+        capacity_admission: @admission, out: @out, wall_clock: @wall_clock
+      )
+      if from.zero?
+        fleet.destroy(
+          worker_indices: (1..target).to_a,
+          verify_absent: true,
+          destroy_reason: "FO-15 candidate unsuitable after FO-11 proof"
+        )
+      else
+        lifecycle = LocalModelEvaluation::RunpodFleetLifecycle.new(
+          client: @client, fleet_state: fleet.fleet_state, env_path: namespace.env_path,
+          fleet_key: namespace.fleet_key, local_port_base: namespace.local_port_base,
+          capacity_admission: @admission, out: @out, wall_clock: @wall_clock
+        )
+        preflight = lifecycle.preflight_scale(target_worker_count: from)
+        lifecycle.shrink(target_worker_count: from, preflight:)
+      end
+      unless fallback_liability_matches_workers?(from)
+        raise Error, "candidate cleanup completed locally but parent liability is unresolved"
+      end
+      @availability_fallback.reject_current!(reason:, cleanup_status: "verified_absent")
+    rescue StandardError => e
+      begin
+        @availability_fallback.block_current!(
+          reason: "candidate cleanup failed: #{e.message}", cleanup_status: "unresolved"
+        )
+      rescue AvailabilityFallback::Error
+        nil
+      end
+      raise Error, "candidate cleanup failed; fallback is blocked: #{e.message}"
+    end
 
     def readiness_status
       if @campaign_identity_sha256 && !@readiness_gate && !@readiness_observer

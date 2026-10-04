@@ -224,7 +224,15 @@ module LocalModelEvaluation
               cloud: fleet.fetch("cloud")
             )
             campaign_handles[index] = handle if handle
-            pod = attempt_campaign_create(handle) { @client.create_pod(body) }
+            pod = begin
+              attempt_campaign_create(handle) { @client.create_pod(body) }
+            rescue StandardError => e
+              release_rejected_create_if_absent(
+                handle, error: e, expected_name: worker_name(index),
+                reason: "provider scale-up create rejected before returning an identity"
+              )
+              raise
+            end
             pod_id = pod["id"].to_s
             raise Error, "RunPod create response for #{worker_name(index)} did not include a pod id" if pod_id.empty?
 
@@ -787,6 +795,23 @@ module LocalModelEvaluation
       )
     rescue StandardError => e
       @out.puts "WARNING: could not release campaign liability for #{provider_resource_id}: #{e.message}"
+    end
+
+    def release_rejected_create_if_absent(handle, error:, expected_name:, reason:)
+      return unless handle
+      return unless error.is_a?(RunpodClient::Error) && [400, 409, 422].include?(error.status)
+      return unless error.message.match?(/(?:capacity|unavailable|hardware|gpu)/i)
+
+      matches = @client.list_pods.select { |pod| pod["name"] == expected_name }
+      return unless matches.empty?
+
+      record_campaign_absence(
+        handle,
+        provider_resource_id: "unassigned-#{expected_name}",
+        reason:
+      )
+    rescue StandardError => e
+      @out.puts "WARNING: could not prove rejected create absent for #{expected_name}: #{e.message}"
     end
 
     def mark_campaign_resource_absent!(provider_resource_id)

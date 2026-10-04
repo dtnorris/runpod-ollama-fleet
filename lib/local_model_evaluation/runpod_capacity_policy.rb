@@ -19,7 +19,7 @@ module LocalModelEvaluation
       keyword_init: true
     )
 
-    Rejection = Struct.new(:gpu_id, :reason, keyword_init: true)
+    Rejection = Struct.new(:gpu_id, :reason, :hourly_rate_usd, keyword_init: true)
     Ranking = Struct.new(:cloud, :candidates, :rejections, keyword_init: true)
 
     def initialize(client:)
@@ -41,41 +41,54 @@ module LocalModelEvaluation
       ids.each do |gpu_id|
         row = by_id[gpu_id]
         unless row
-          rejections << Rejection.new(gpu_id:, reason: "catalog did not return GPU")
+          rejections << Rejection.new(gpu_id:, reason: "catalog did not return GPU", hourly_rate_usd: nil)
           next
+        end
+
+        rate = begin
+          positive_float(row.dig("price", cloud.downcase), "#{gpu_id} #{cloud} hourly rate")
+        rescue Error
+          nil
         end
 
         memory = row["memory"].to_i
         if memory < min_vram
           rejections << Rejection.new(
             gpu_id:,
-            reason: "#{memory} GB VRAM is below required #{min_vram} GB"
+            reason: "#{memory} GB VRAM is below required #{min_vram} GB",
+            hourly_rate_usd: rate
           )
           next
         end
 
         unless row[cloud.downcase] == true
-          rejections << Rejection.new(gpu_id:, reason: "not available on #{cloud} cloud")
+          rejections << Rejection.new(
+            gpu_id:, reason: "not available on #{cloud} cloud", hourly_rate_usd: rate
+          )
           next
         end
 
         availability = row["availability"].to_s
         if availability.empty? || availability == "NONE"
           label = availability.empty? ? "unknown" : availability
-          rejections << Rejection.new(gpu_id:, reason: "#{cloud} availability is #{label}")
+          rejections << Rejection.new(
+            gpu_id:, reason: "#{cloud} availability is #{label}", hourly_rate_usd: rate
+          )
           next
         end
 
-        begin
-          rate = positive_float(row.dig("price", cloud.downcase), "#{gpu_id} #{cloud} hourly rate")
-        rescue Error => e
-          rejections << Rejection.new(gpu_id:, reason: e.message)
+        unless rate
+          rejections << Rejection.new(
+            gpu_id:, reason: "#{gpu_id} #{cloud} hourly rate must be a positive number",
+            hourly_rate_usd: nil
+          )
           next
         end
         if price_cap && rate > price_cap
           rejections << Rejection.new(
             gpu_id:,
-            reason: format("$%.4f/hr exceeds per-worker cap $%.4f/hr", rate, price_cap)
+            reason: format("$%.4f/hr exceeds per-worker cap $%.4f/hr", rate, price_cap),
+            hourly_rate_usd: rate
           )
           next
         end

@@ -109,6 +109,38 @@ class CampaignLifecycleTest < Minitest::Test
     end
   end
 
+  class FallbackRuntime < Runtime
+    attr_reader :ensure_calls, :bringup_calls
+
+    def initialize(*)
+      super
+      @ensure_calls = 0
+      @bringup_calls = 0
+      @retry_pending = false
+    end
+
+    def ensure_workers!(desired_workers:, **)
+      @ensure_calls += 1
+      self.count = desired_workers
+    end
+
+    def reconcile_bringup!(desired_workers:, transition_guard:)
+      transition_guard.call
+      @bringup_calls += 1
+      if bringup_calls == 1
+        self.count = 0
+        @retry_pending = true
+      else
+        self.count = desired_workers
+        @retry_pending = false
+      end
+      []
+    end
+
+    def fallback_retry_pending? = @retry_pending
+    def fallback_candidate_limit = 2
+  end
+
   class Provider
     attr_reader :create_calls
     attr_accessor :fail_on_create
@@ -286,6 +318,19 @@ class CampaignLifecycleTest < Minitest::Test
 
     assert_equal deadline, @binding.status.fetch("deadline_at_utc")
     assert_equal provider_calls, @events.count("provider_create")
+    assert_equal 1, @events.count("controller_start")
+  end
+
+  def test_supervised_reconciliation_owns_bounded_candidate_fallback
+    profile = @campaign.profiles.find { |row| row.fetch("profile_id") == "qwen35" }
+    @runtimes["qwen35"] = FallbackRuntime.new(profile, nil, @binding, @events)
+
+    @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
+
+    fallback = @runtimes.fetch("qwen35")
+    assert_equal 2, fallback.ensure_calls
+    assert_equal 2, fallback.bringup_calls
+    assert_equal 3, fallback.count
     assert_equal 1, @events.count("controller_start")
   end
 

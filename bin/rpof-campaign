@@ -116,6 +116,17 @@ def render_human(command, result)
            "registry-not-ready=#{row['registry_not_ready_workers'] || '-'} " \
            "registry-unpublished=#{row['registry_unpublished_workers'] || '-'}"
       puts "    registry unavailable: #{row['registry_error']}" if row["registry_status"] == "unavailable"
+      if row["availability_fallback"]
+        fallback = row.fetch("availability_fallback")
+        order = fallback.fetch("candidates").map do |candidate|
+          rate = candidate["hourly_rate_usd"] ? format("$%.4f/hr", candidate.fetch("hourly_rate_usd")) : "rate-unknown"
+          "#{candidate.fetch('gpu_id')}=#{candidate.fetch('status')}(#{rate},cleanup=#{candidate.fetch('cleanup_status')})"
+        end
+        puts "    fallback=#{fallback.fetch('state')} current=#{fallback['current_candidate'] || '-'} " \
+             "selected=#{fallback['selected_candidate'] || '-'}"
+        puts "    candidates: #{order.join(' -> ')}"
+        puts "    fallback stop: #{fallback['stop_reason']}" if fallback["stop_reason"]
+      end
     end
   when "desired", "desired-set"
     state = result.fetch("desired_capacity")
@@ -256,7 +267,7 @@ begin
     RunpodOllamaFleet::CampaignRunpodRuntime.new(
       root: options[:state_root], repo_root: ROOT, profile:, hardware: qualification,
       client:, admission:, capability_request: capability_requests[profile.fetch("profile_id")],
-      campaign_identity_sha256: campaign.identity_sha256, readiness_gate:
+      campaign_identity_sha256: campaign.identity_sha256, readiness_gate:, binding:
     )
   end
   lifecycle = RunpodOllamaFleet::CampaignLifecycle.new(

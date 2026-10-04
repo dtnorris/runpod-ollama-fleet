@@ -262,32 +262,47 @@ module RunpodOllamaFleet
     def reconcile_profile(row, authority, ssh_public_key_path)
       profile = row.fetch("profile")
       runtime = row.fetch("runtime")
-      current = row.fetch("current_workers")
+      initial_current = row.fetch("current_workers")
       desired = desired_workers_for(profile)
       maximum = profile.fetch("max_workers")
-      raise Error, "profile #{profile.fetch('profile_id').inspect} has #{current} workers above max #{maximum}" if current > maximum
+      raise Error, "profile #{profile.fetch('profile_id').inspect} has #{initial_current} workers above max #{maximum}" if initial_current > maximum
 
-      committed = Integer(
-        authority.dig("authority", "committed_workers_by_profile", profile.fetch("profile_id")) || 0
-      )
-      # A pending/ambiguous reservation is already conservative capacity. Never
-      # create around it; the guardian/provider-absence path must resolve it.
-      if current < desired && committed <= current
-        runtime.ensure_workers!(
-          desired_workers: desired,
-          ssh_public_key_path:,
-          original_deadline_at_utc: authority.fetch("deadline_at_utc"),
-          max_hourly_rate_usd: @campaign.max_hourly_rate_usd
+      fallback_rounds = 0
+      bringup = []
+      committed = 0
+      loop do
+        current = runtime.current_worker_count
+        live_authority = fallback_rounds.zero? ? authority : @binding.status
+        committed = Integer(
+          live_authority.dig("authority", "committed_workers_by_profile", profile.fetch("profile_id")) || 0
         )
+        # A pending/ambiguous reservation is already conservative capacity.
+        # Never create around it; the guardian/provider-absence path must
+        # resolve it before FO-15 can consider another authorized candidate.
+        if current < desired && committed <= current
+          runtime.ensure_workers!(
+            desired_workers: desired,
+            ssh_public_key_path:,
+            original_deadline_at_utc: authority.fetch("deadline_at_utc"),
+            max_hourly_rate_usd: @campaign.max_hourly_rate_usd
+          )
+        end
+        bringup = if desired.positive?
+                    runtime.reconcile_bringup!(
+                      desired_workers: desired,
+                      transition_guard: method(:verify_reconciliation_authority!)
+                    )
+                  else
+                    []
+                  end
+        break unless runtime.respond_to?(:fallback_retry_pending?) && runtime.fallback_retry_pending?
+
+        fallback_rounds += 1
+        limit = runtime.respond_to?(:fallback_candidate_limit) ? runtime.fallback_candidate_limit : 1
+        if fallback_rounds >= limit
+          raise Error, "authorized availability fallback candidates are exhausted"
+        end
       end
-      bringup = if desired.positive?
-                  runtime.reconcile_bringup!(
-                    desired_workers: desired,
-                    transition_guard: method(:verify_reconciliation_authority!)
-                  )
-                else
-                  []
-                end
       runtime.status.merge(
         "profile_id" => profile.fetch("profile_id"),
         "desired_workers" => desired,
@@ -299,7 +314,9 @@ module RunpodOllamaFleet
             "status" => state.fetch("overall_status")
           }
         end,
-        "action" => reconciliation_action(current:, desired:, committed:, bringup:)
+        "action" => reconciliation_action(
+          current: initial_current, desired:, committed:, bringup:
+        )
       )
     rescue CampaignRunpodRuntime::Error => e
       raise TransientReconciliationError,
