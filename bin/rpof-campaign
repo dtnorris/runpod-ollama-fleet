@@ -25,10 +25,11 @@ options = {
 }
 
 parser = OptionParser.new do |o|
-  o.banner = "Usage: bin/rpof campaign plan|start|status|stop|desired|desired-set|add|drain|remove " \
+  o.banner = "Usage: bin/rpof campaign plan|start|status|stop|desired|desired-set|add|drain|remove|consumer-bind " \
              "--campaign FILE --budget FILE [options]"
   o.on("--campaign FILE", "DW-04 campaign declaration") { |v| options[:campaign] = v }
   o.on("--budget FILE", "DW-05 campaign budget declaration") { |v| options[:budget] = v }
+  o.on("--consumer-binding FILE", "Explicit immutable consumer binding (consumer-bind only)") { |v| options[:consumer_binding] = v }
   o.on("--hardware FILE", "Hardware qualification registry") { |v| options[:hardware] = v }
   o.on("--state-root DIR", "Durable RPOF state root") { |v| options[:state_root] = v }
   o.on("--ssh-public-key FILE", "OpenSSH public key for authorized start") { |v| options[:ssh_public_key] = v }
@@ -200,10 +201,13 @@ end
 begin
   parser.parse!(ARGV)
   raise OptionParser::InvalidArgument, "unexpected arguments: #{ARGV.join(' ')}" unless ARGV.empty?
-  commands = %w[plan start status stop desired desired-set add drain remove]
+  commands = %w[plan start status stop desired desired-set add drain remove consumer-bind]
   raise OptionParser::InvalidArgument, "command must be #{commands.join(', ')}" unless commands.include?(command)
   raise OptionParser::MissingArgument, "--campaign" unless options[:campaign]
   raise OptionParser::MissingArgument, "--budget" unless options[:budget]
+  if options[:consumer_binding] && command != "consumer-bind"
+    raise OptionParser::InvalidArgument, "--consumer-binding is valid only for consumer-bind"
+  end
   if options[:authorize_paid] && command != "start"
     raise OptionParser::InvalidArgument, "--authorize-paid is valid only for campaign start"
   end
@@ -297,6 +301,9 @@ begin
     campaign:, binding:, runtime_factory:, price_resolver:, controller_supervisor:
   )
   result = case command
+           when "consumer-bind"
+             raise OptionParser::MissingArgument, "--consumer-binding" unless options[:consumer_binding]
+             lifecycle.bind_consumer(load_json_object(options[:consumer_binding], "consumer binding"))
            when "plan" then lifecycle.plan
            when "start"
              reporter = lambda do |report|
@@ -327,7 +334,7 @@ begin
                reason: options[:reason]
              )
            end
-  options[:json] ? puts(JSON.pretty_generate(result)) : render_human(command, result)
+  options[:json] || command == "consumer-bind" ? puts(JSON.pretty_generate(result)) : render_human(command, result)
   exit 2 if command == "start" && !options[:authorize_paid]
 rescue JSON::ParserError, SystemCallError, KeyError, ArgumentError, OptionParser::ParseError,
        RunpodOllamaFleet::CapacityCampaign::Error,

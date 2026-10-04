@@ -283,6 +283,73 @@ class CampaignLifecycleTest < Minitest::Test
     assert_equal "batch039-parent", result.dig("desired_capacity", "budget_id")
   end
 
+  def test_consumer_target_stays_inside_admission_deadline_and_stop_authority
+    install_consumer_binding
+    @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
+    deadline = @binding.status.fetch("deadline_at_utc")
+    assert_equal 1, @runtimes.fetch("qwen35").count
+    assert_equal 1, @binding.status.dig("authority", "committed_workers")
+    @consumer_count = 100
+    @controller.reconcile!(binding: @binding, ssh_public_key_path: "unused")
+    assert_equal 3, @runtimes.fetch("qwen35").count
+    assert_equal deadline, @binding.status.fetch("deadline_at_utc")
+    @lifecycle.stop
+    before = @events.count("provider_create")
+    assert_raises(RunpodOllamaFleet::CampaignLifecycle::Error) do
+      @lifecycle.reconcile_once(ssh_public_key_path: "unused")
+    end
+    assert_equal before, @events.count("provider_create")
+  end
+
+  def test_consumer_target_preserves_fo15_fallback_loop
+    install_consumer_binding
+    profile = @campaign.profiles.find { |row| row.fetch("profile_id") == "qwen35" }
+    @runtimes["qwen35"] = FallbackRuntime.new(profile, nil, @binding, @events)
+    @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")
+    runtime = @runtimes.fetch("qwen35")
+    assert_equal 2, runtime.ensure_calls
+    assert_equal 2, runtime.bringup_calls
+    assert_equal 1, runtime.count
+  end
+
+  def test_consumer_binding_shares_manual_control_lock
+    path = File.join(File.dirname(@binding.state_path), ".capacity-control.lock")
+    FileUtils.mkdir_p(File.dirname(path))
+    File.open(path, "w") do |lock|
+      lock.flock(File::LOCK_EX)
+      assert_raises(RunpodOllamaFleet::CampaignLifecycle::TransientReconciliationError) do
+        @lifecycle.bind_consumer({})
+      end
+    end
+  end
+
+  def install_consumer_binding
+    @consumer_count = 1
+    rows = @campaign.profiles.map do |profile|
+      request = { "contract_version" => "ollama-capability-request/v0.1",
+                  "ollama" => profile.slice("model", "expected_digest", "required_context_length", "require_fully_gpu_resident") }
+      { "profile_id" => profile.fetch("profile_id"), "consumer_id" => "d" * 64, "plan_sha256" => "e" * 64,
+        "pool_id" => profile.fetch("profile_id"), "capability_request" => request,
+        "source_argv" => ["/offline-demand", profile.fetch("profile_id")] }
+    end
+    source = lambda do |argv|
+      row = rows.find { |item| item["profile_id"] == argv.last }
+      { "contract_version" => "wlo-consumer-demand/v0.1", "consumer_id" => "d" * 64,
+        "plan_sha256" => "e" * 64, "pool_id" => row.fetch("pool_id"),
+        "capability_fingerprint" => RunpodOllamaFleet::OllamaCapabilityRequest.new(JSON.generate(row.fetch("capability_request"))).fingerprint,
+        "observed_at" => @now.iso8601, "heartbeat_at" => @now.iso8601, "fresh" => true,
+        "state" => "active", "runnable_count" => argv.last == "qwen35" ? @consumer_count : 0,
+        "bound_count" => 0, "uncertain_count" => 0, "quiescent" => true }
+    end
+    consumer = RunpodOllamaFleet::ConsumerCapacity.new(binding: @binding, wall_clock: -> { @now }, source:)
+    @lifecycle.instance_variable_set(:@consumer_capacity, consumer)
+    @lifecycle.bind_consumer(
+      "contract_version" => RunpodOllamaFleet::ConsumerCapacity::CONTRACT,
+      "campaign_identity_sha256" => @campaign.identity_sha256, "binding_sha256" => @binding.binding_sha256,
+      "idle_grace_seconds" => 10, "profiles" => rows
+    )
+  end
+
   def test_add_rejects_profile_campaign_hourly_deadline_and_stopped_authority
     @lifecycle.set_desired(profile_counts: { "qwen35" => 1 }, expected_revision: 0, reason: "initial smaller fleet")
     @lifecycle.start(authorize_paid: true, ssh_public_key_path: "unused")

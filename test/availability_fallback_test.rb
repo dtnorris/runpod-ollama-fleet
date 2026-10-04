@@ -215,6 +215,13 @@ class AvailabilityFallbackTest < Minitest::Test
     assert_equal 3, state.fetch("profile_max_workers")
   end
 
+  def test_retirement_reconciliation_before_initial_fleet_is_empty
+    provider = Provider.new([gpu(A40, 0.49)])
+    assert_empty runtime(provider:).reconcile_retirements!
+    assert_empty provider.create_bodies
+    assert_empty provider.deleted_ids
+  end
+
   def test_equal_prices_use_gpu_identity_tie_break_not_provider_order
     provider = Provider.new([gpu(BLACKWELL, 0.49), gpu(A40, 0.49)])
     runtime(provider:).ensure_workers!(**ensure_arguments)

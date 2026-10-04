@@ -1,0 +1,97 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Offline external composition. No production RPOF code loads consumer internals.
+wlo = File.expand_path(ARGV.shift || abort("supply the exact WLO checkout"))
+ARGV.replace(["--name", "/fo16/"])
+require File.join(wlo, "lib", "workload_orchestrator")
+require_relative "../test/consumer_capacity_test"
+require_relative "../test/campaign_lifecycle_test"
+
+class ConsumerCapacityTest
+  class SnapshotSource < WorkloadOrchestrator::WorkerSource
+    attr_accessor :document
+    def latest_snapshot = JSON.generate(document)
+  end
+
+  def test_fo16_public_demand_ready_dispatch_pause_bound_work_expiry_and_retirement
+    plan_path = File.join(@fixture.root, "consumer-plan.json")
+    File.write(plan_path, JSON.generate(
+      "contract_version" => "wlo-execution-plan/v0.3", "plan_id" => "offline-consumer",
+      "failure_policy" => { "max_consecutive_failures" => 2, "max_total_failures" => 3 },
+      "pools" => [{ "pool_id" => "pool", "requirements" => { "ollama" => @request.fetch("ollama") } }],
+      "jobs" => [{ "job_id" => "one", "pool_id" => "pool", "argv" => ["offline-only"] }]
+    ))
+    plan = WorkloadOrchestrator::Plan.load(plan_path)
+    store = WorkloadOrchestrator::ExecutionStore.new(
+      plan:, workdir: @fixture.root, output_dir: File.join(@fixture.root, "consumer-output")
+    )
+    store.prepare!
+    store.start!
+    store.consumer_heartbeat!(now: @fixture.now)
+    demand = store.consumer_demand(pool_id: "pool", now: @fixture.now)
+    document = Marshal.load(Marshal.dump(@document))
+    document.fetch("profiles").first.merge!(demand.slice("consumer_id", "plan_sha256", "pool_id"))
+    binding = Binding.new(File.join(@fixture.root, "composed", "binding.json"), @binding.campaign, @binding.binding_sha256)
+    source = lambda do |_argv|
+      raise "source unavailable" if @missing
+      store.consumer_demand(pool_id: "pool", now: @fixture.now)
+    end
+    @capacity = RunpodOllamaFleet::ConsumerCapacity.new(binding:, wall_clock: -> { @fixture.now }, source:)
+    @capacity.bind!(document)
+    assert_equal 1, reconcile
+    snapshots = SnapshotSource.new
+    snapshots.document = @fixture.registry.snapshot
+    poller = WorkloadOrchestrator::WorkerRegistryPoller.new(
+      source: snapshots, checkpoint_path: File.join(@fixture.root, "consumer-checkpoint.json"), clock: -> { @fixture.now }
+    )
+    poller.poll_once
+    assignments = WorkloadOrchestrator::DynamicScheduler.new(plan:, store:).assignments(
+      workers: poller.ready_workers, current_workers: poller.current_workers
+    )
+    assert_equal 1, assignments.length
+    assignment = assignments.first
+    attempt = store.record_dynamic_running!(job: assignment.job, worker: assignment.worker, environment_keys: [])
+    store.pause!
+    assert_equal 0, reconcile
+    @fixture.now += 10
+    reconcile
+    assert_equal "draining", @fixture.worker.dig("lifecycle", "phase")
+    @fixture.now += 1
+    snapshots.document = @fixture.registry.snapshot
+    poller.poll_once
+    assert_empty poller.ready_workers
+    assert_empty WorkloadOrchestrator::DynamicWorkerLossReconciler.new(store:).reconcile!(poller)
+    @fixture.now += 30
+    reconcile
+    assert_empty @fixture.client.deleted
+    assert_equal 1, store.consumer_demand(pool_id: "pool", now: @fixture.now).fetch("bound_count")
+    @missing = true
+    reconcile
+    assert_equal "draining", @fixture.worker.dig("lifecycle", "phase")
+    @missing = false
+    store.record_dynamic_terminal!(attempt:, status: "complete", exit_status: 0)
+    store.clear_pause!
+    store.finish!
+    assert_equal "completed", store.status
+    # A restarted RPOF owner consumes only a fresh public snapshot.
+    @capacity = RunpodOllamaFleet::ConsumerCapacity.new(binding:, wall_clock: -> { @fixture.now }, source:)
+    reconcile
+    assert_equal "retirement_requested", @fixture.worker.dig("lifecycle", "phase")
+    @runtime.reconcile_retirements!
+    @runtime.reconcile_retirements!
+    assert_equal ["pod-1"], @fixture.client.deleted
+    assert_equal "retired", @fixture.worker.dig("lifecycle", "phase")
+  end
+end
+
+class CampaignLifecycleTest
+  def test_fo16_campaign_admission_deadline_stop_and_concurrency
+    test_consumer_target_stays_inside_admission_deadline_and_stop_authority
+    test_consumer_binding_shares_manual_control_lock
+  end
+
+  def test_fo16_scale_up_uses_existing_fallback
+    test_consumer_target_preserves_fo15_fallback_loop
+  end
+end

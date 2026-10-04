@@ -62,6 +62,17 @@ module RunpodOllamaFleet
       Marshal.load(Marshal.dump(row)).merge("state" => "UNAVAILABLE")
     end
 
+    # Read under the publication lock. Retain the maximum across TTL changes,
+    # not merely the expiry of the most recently published (possibly shorter) TTL.
+    def ready_snapshot_expiry
+      state = load_publisher_state
+      return utc_now.iso8601 unless state
+      return nil unless state["schema_version"] == PUBLISHER_STATE_SCHEMA
+      return nil unless state["expiry_history_known"] == true
+
+      [state["ready_snapshots_expire_at_utc"], state.dig("snapshot", "expires_at")].compact.max
+    end
+
     def snapshot_locked
       workers = sources.flat_map { |source| workers_for(source) }
                        .sort_by { |worker| worker.fetch("worker_id") }
@@ -484,6 +495,9 @@ module RunpodOllamaFleet
           "registry_id" => registry_id,
           "revision" => revision,
           "snapshot_sha256" => Digest::SHA256.hexdigest(JSON.generate(snapshot)),
+          "expiry_history_known" => state.nil? || state["expiry_history_known"] == true,
+          "ready_snapshots_expire_at_utc" => [state && state["ready_snapshots_expire_at_utc"],
+                                            state&.dig("snapshot", "expires_at"), snapshot.fetch("expires_at")].compact.max,
           "snapshot" => snapshot
         )
         snapshot
@@ -507,7 +521,23 @@ module RunpodOllamaFleet
 
     def validate_publisher_snapshot!(state)
       expected = %w[registry_id revision schema_version snapshot snapshot_sha256]
-      raise Error, "publisher state fields are invalid" unless state.keys.sort == expected
+      optional = %w[ready_snapshots_expire_at_utc expiry_history_known]
+      raise Error, "publisher state fields are invalid" unless (state.keys - optional).sort == expected
+      if state.key?("expiry_history_known") && ![true, false].include?(state["expiry_history_known"])
+        raise Error, "publisher expiry history marker is invalid"
+      end
+      if state.key?("ready_snapshots_expire_at_utc")
+        unless state.fetch("ready_snapshots_expire_at_utc").is_a?(String) &&
+               state.fetch("ready_snapshots_expire_at_utc").match?(CANONICAL_TIMESTAMP)
+          raise Error, "publisher expiry watermark is not canonical"
+        end
+        Time.iso8601(state.fetch("ready_snapshots_expire_at_utc"))
+      end
+      if state["expiry_history_known"] == true &&
+         (!state["ready_snapshots_expire_at_utc"] ||
+          state.fetch("ready_snapshots_expire_at_utc") < state.dig("snapshot", "expires_at").to_s)
+        raise Error, "publisher expiry history lacks a conservative watermark"
+      end
       raise Error, "publisher registry_id is invalid" unless
         state.fetch("registry_id").is_a?(String) && state.fetch("registry_id").match?(ID)
       raise Error, "publisher revision is invalid" unless

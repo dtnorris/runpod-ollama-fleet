@@ -5,6 +5,7 @@ require "fileutils"
 require_relative "campaign_capacity_admission"
 require_relative "desired_capacity"
 require_relative "dynamic_worker_registry"
+require_relative "consumer_capacity"
 
 module RunpodOllamaFleet
   # Human-facing orchestration for one immutable capacity campaign. Provider
@@ -15,7 +16,7 @@ module RunpodOllamaFleet
     class TransientReconciliationError < Error; end
 
     def initialize(campaign:, binding:, runtime_factory:, price_resolver: nil, wall_clock: nil,
-                   desired_capacity: nil, controller_supervisor: nil, registry_publisher: nil)
+                   desired_capacity: nil, controller_supervisor: nil, registry_publisher: nil, consumer_capacity: nil)
       @campaign = campaign
       @binding = binding
       @runtime_factory = runtime_factory
@@ -24,6 +25,7 @@ module RunpodOllamaFleet
       @desired_capacity = desired_capacity || DesiredCapacity.new(binding:, wall_clock: @wall_clock)
       @controller_supervisor = controller_supervisor
       @registry_publisher = registry_publisher
+      @consumer_capacity = consumer_capacity || ConsumerCapacity.new(binding:, wall_clock: @wall_clock)
       unless binding.campaign.identity_sha256 == campaign.identity_sha256
         raise Error, "campaign binding does not match the requested campaign"
       end
@@ -231,6 +233,12 @@ module RunpodOllamaFleet
       with_capacity_control_lock { select_worker_locked(**options) }
     end
 
+    def bind_consumer(document)
+      with_capacity_control_lock { @consumer_capacity.bind!(document) }
+    rescue ConsumerCapacity::Error => e
+      raise Error, e.message
+    end
+
     def select_worker_locked(operation:, profile_id:, **options)
       authority = existing_authority
       raise Error, "campaign has not been bound" unless authority
@@ -294,6 +302,10 @@ module RunpodOllamaFleet
       verify_started_authority!(authority)
       desired_state = @desired_capacity.current
       profiles = profiles_for(desired_state)
+      profiles = @consumer_capacity.reconcile(profiles:, runtime_factory: lambda do |profile|
+        admission = CampaignCapacityAdmission.new(binding: @binding, profile_id: profile.fetch("profile_id"))
+        @runtime_factory.call(profile, hardware_for(profile), admission)
+      end)
       profiles.each do |profile|
         admission = CampaignCapacityAdmission.new(binding: @binding, profile_id: profile.fetch("profile_id"))
         runtime = @runtime_factory.call(profile, hardware_for(profile), admission)
@@ -316,7 +328,7 @@ module RunpodOllamaFleet
         "profiles" => results,
         "registry" => registry
       }
-    rescue CampaignBudgetBinding::Error, CampaignCapacityAdmission::Error, DesiredCapacity::Error => e
+    rescue CampaignBudgetBinding::Error, CampaignCapacityAdmission::Error, DesiredCapacity::Error, ConsumerCapacity::Error => e
       raise Error, e.message
     rescue CampaignRunpodRuntime::Error => e
       raise TransientReconciliationError, e.message

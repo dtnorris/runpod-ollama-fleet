@@ -450,7 +450,9 @@ module LocalModelEvaluation
           raise Error, "only an active worker can drain" unless worker["status"] == "active"
           registry.with_publication_lock do
             retained = registry.retained_worker(worker)
-            @fleet_state.transition_worker_lifecycle!(**identity, phase: "draining", reason:, registry_worker: retained)
+            expiry = registry.ready_snapshot_expiry
+            @fleet_state.transition_worker_lifecycle!(**identity, phase: "draining", reason:, registry_worker: retained,
+                                                     ready_snapshots_expire_at_utc: expiry)
           end
         when "remove"
           raise Error, "remove requires explicit --confirm-remove; RPOF does not infer execution completion" unless confirm

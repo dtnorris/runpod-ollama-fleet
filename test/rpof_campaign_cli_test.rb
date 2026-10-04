@@ -38,6 +38,22 @@ class RpofCampaignCliTest < Minitest::Test
     refute File.exist?(File.join(@tmp, "campaign-budgets"))
   end
 
+  def test_consumer_bind_passes_exact_document_without_provider_access
+    document = { "contract_version" => "rpof-consumer-binding/v0.1" }
+    path = File.join(@tmp, "binding.json")
+    File.write(path, JSON.generate(document))
+    received = nil
+    stdout, stderr, status = with_stubbed_campaign(:bind_consumer, document, argument_sink: ->(args) { received = args }) do
+      run_cli("consumer-bind", "--consumer-binding", path, "--json")
+    end
+    assert status.success?, stderr
+    assert_equal document, received
+    assert_equal document, JSON.parse(stdout)
+    _stdout, stderr, status = run_cli("plan", "--consumer-binding", path)
+    refute status.success?
+    assert_includes stderr, "only for consumer-bind"
+  end
+
   def test_start_without_authorization_prints_plan_and_exits_before_mutation
     expected = {
       "command" => "campaign plan",
@@ -194,8 +210,8 @@ class RpofCampaignCliTest < Minitest::Test
     campaign = Object.new
     binding = Object.new
     lifecycle = Object.new
-    lifecycle.define_singleton_method(action) do |**arguments|
-      argument_sink&.call(arguments)
+    lifecycle.define_singleton_method(action) do |*positional, **arguments|
+      argument_sink&.call(positional.first || arguments)
       result
     end
 

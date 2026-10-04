@@ -297,7 +297,7 @@ module LocalModelEvaluation
     # Caller holds the existing fleet lifecycle lock. Identity is checked again
     # at each durable transition, including recovery after an uncertain delete.
     def transition_worker_lifecycle!(fleet_id:, worker_id:, generation_id:, pod_id:,
-                                     phase:, reason:, registry_worker: nil, error: nil)
+                                     phase:, reason:, registry_worker: nil, error: nil, ready_snapshots_expire_at_utc: nil)
       record = load(fleet_id)
       worker = record.fetch("workers").find { |row| row["worker_id"] == worker_id }
       unless worker && worker["generation_id"] == generation_id && worker["pod_id"] == pod_id
@@ -320,6 +320,9 @@ module LocalModelEvaluation
         "reason" => reason, "updated_at_utc" => utc_now.iso8601, "error" => error
       )
       lifecycle["registry_worker"] = registry_worker if registry_worker
+      if ready_snapshots_expire_at_utc
+        lifecycle["ready_snapshots_expire_at_utc"] ||= ready_snapshots_expire_at_utc
+      end
       lifecycle["history"] = Array(previous["history"]) + [lifecycle.except("history", "registry_worker")]
       if phase == "retired"
         lifecycle["provider_absence_verified_at_utc"] = utc_now.iso8601

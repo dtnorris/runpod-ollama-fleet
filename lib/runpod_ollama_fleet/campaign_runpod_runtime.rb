@@ -123,7 +123,7 @@ module RunpodOllamaFleet
       assert_selected_candidate_settled!(options.fetch(:worker_id), options.fetch(:operation))
       provider_lifecycle.select_worker!(
         **options,
-        registry: DynamicWorkerRegistry.new(state_root: @root, repo_root: @repo_root)
+        registry: DynamicWorkerRegistry.new(state_root: @root, repo_root: @repo_root, clock: @wall_clock)
       )
     rescue LocalModelEvaluation::RunpodFleetLifecycle::Error,
            LocalModelEvaluation::RunpodFleetState::Error, DynamicWorkerRegistry::Error => e
@@ -131,6 +131,8 @@ module RunpodOllamaFleet
     end
 
     def reconcile_retirements!
+      return [] unless current_record
+
       provider_lifecycle.reconcile_retirements!
     rescue LocalModelEvaluation::RunpodFleetLifecycle::Error,
            LocalModelEvaluation::RunpodFleetState::Error => e
