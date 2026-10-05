@@ -92,8 +92,12 @@ module RunpodOllamaFleet
       heartbeat_thread = Thread.new do
         loop do
           should_stop = mutex.synchronize do
-            condition.wait(mutex, @heartbeat_seconds)
-            stopped
+            if stopped
+              true
+            else
+              condition.wait(mutex, @heartbeat_seconds)
+              stopped
+            end
           end
           break if should_stop
 
