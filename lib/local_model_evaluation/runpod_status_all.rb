@@ -2,6 +2,8 @@
 
 module LocalModelEvaluation
   class RunpodStatusAll
+    DEFAULT_WIDTH = 160
+    MINIMUM_WIDTH = 60
     FLEET_WIDTH = 5
     BURST_WIDTH = 5
     GPU_WIDTH = 18
@@ -9,6 +11,12 @@ module LocalModelEvaluation
     RUNPOD_WIDTH = 8
 
     INFERENCE_STATUSES = %w[active idle unavailable unknown].freeze
+
+    def initialize(width: DEFAULT_WIDTH)
+      @width = [Integer(width), MINIMUM_WIDTH].max
+    rescue ArgumentError, TypeError
+      raise ArgumentError, "status width must be an integer"
+    end
 
     def snapshot(entries)
       fleets = Array(entries).filter_map do |entry|
@@ -102,13 +110,33 @@ module LocalModelEvaluation
         lines << "    #{fleet.fetch('alias')}: #{fleet.fetch('fleet_key')}"
       end
       lines << ""
-      lines << format(
+      worker_lines = wide_worker_lines(snapshot.fetch("workers"))
+      if worker_lines.all? { |line| line.length <= @width }
+        lines.concat(worker_lines)
+        lines << ""
+        lines << "FLEET aliases are listed above; BURST is the worker index within that fleet."
+        lines << "AVAILABLE=bootstrap-qualified; LOADED=live Ollama residency; rate=active managed workers."
+      else
+        lines.concat(stacked_worker_lines(snapshot.fetch("workers")))
+        lines << ""
+        lines << "FLEET aliases are listed above."
+        lines << "BURST is the worker index within that fleet."
+        lines << "AVAILABLE=bootstrap-qualified."
+        lines << "LOADED=live Ollama residency."
+        lines << "RATE=active managed worker hourly rate."
+      end
+      lines.join("\n") + "\n"
+    end
+
+    private
+
+    def wide_worker_lines(workers)
+      lines = [format(
         "%-5s %-5s %-18s %-18s %-18s %-8s %-8s %-11s %-11s %-12s %s",
         "FLEET", "BURST", "GPU", "AVAILABLE", "LOADED", "RUNPOD", "RATE", "INFERENCE",
         "TUNNEL", "REGISTRY", "BOOTSTRAP"
-      )
-
-      snapshot.fetch("workers").each do |worker|
+      )]
+      workers.each do |worker|
         lines << format(
           "%-5s %-5s %-18s %-18s %-18s %-8s $%-7.4f %-11s %-11s %-12s %s",
           truncate(worker.fetch("fleet_alias"), FLEET_WIDTH),
@@ -124,14 +152,33 @@ module LocalModelEvaluation
           worker.fetch("bootstrap_status")
         )
       end
-
-      lines << ""
-      lines << "FLEET aliases are listed above; BURST is the worker index within that fleet."
-      lines << "AVAILABLE=bootstrap-qualified; LOADED=live Ollama residency; rate=active managed workers."
-      lines.join("\n") + "\n"
+      lines
     end
 
-    private
+    def stacked_worker_lines(workers)
+      lines = ["Workers (stacked for #{@width} columns)"]
+      workers.each_with_index do |worker, index|
+        lines << "" if index.positive?
+        fleet = worker.fetch("fleet_alias")
+        burst = worker.fetch("index")
+        lines << "Worker #{fleet}#{burst} (FLEET=#{fleet}; BURST=#{burst})"
+        lines << labeled_line("GPU", worker.fetch("gpu_id"))
+        lines << labeled_line("AVAILABLE", available_model_label(worker))
+        lines << labeled_line("LOADED", loaded_model_label(worker))
+        lines << labeled_line("RUNPOD", worker.fetch("provider_status"))
+        lines << labeled_line("RATE", format("$%.4f/hr", worker.fetch("hourly_rate_usd")))
+        lines << labeled_line("INFERENCE", inference_label(worker.fetch("inference_status")))
+        lines << labeled_line("TUNNEL", worker.fetch("tunnel_status"))
+        lines << labeled_line("REGISTRY", worker.fetch("registry_state"))
+        lines << labeled_line("BOOTSTRAP", worker.fetch("bootstrap_status"))
+      end
+      lines
+    end
+
+    def labeled_line(label, value)
+      prefix = "  #{label}: "
+      "#{prefix}#{truncate(value, @width - prefix.length)}"
+    end
 
     def worker_row(fleet_key, fleet_alias, fleet_snapshot, worker)
       {

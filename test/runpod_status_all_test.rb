@@ -1,9 +1,16 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
+require "open3"
+require "rbconfig"
+require "tmpdir"
 require_relative "../lib/local_model_evaluation/runpod_status_all"
+require_relative "../lib/local_model_evaluation/runpod_fleet_state"
 
 class RunpodStatusAllTest < Minitest::Test
+  ROOT = File.expand_path("..", __dir__)
+  CliWorker = Struct.new(:index, :pod_id, :name, :host, :ssh_port, :hourly_rate, keyword_init: true)
+
   def setup
     @overview = LocalModelEvaluation::RunpodStatusAll.new
   end
@@ -219,6 +226,82 @@ class RunpodStatusAllTest < Minitest::Test
 
     assert_match(/^A\s+1\s+.*COPYING$/, output)
     assert_match(/^A\s+2\s+.*FAILED$/, output)
+  end
+
+  def test_narrow_render_uses_bounded_labeled_worker_blocks
+    copying = bootstrap_worker(1, "pod_a")
+    copying.merge!("status" => "running", "stage" => "COPYING", "progress" => "37%")
+    fleet = entry(
+      "narrow",
+      rate: 0.98,
+      accrued: 0.10,
+      workers: [
+        worker(1, "pod_a", "NVIDIA RTX PRO 6000 Blackwell Server Edition", 0.49,
+               model_status: "unavailable", inference: "unavailable"),
+        worker(2, "pod_b", "NVIDIA A40", 0.49,
+               available: ["qwen3.6:35b-a3b-q4_K_M"], loaded: ["qwen3.6:35b-a3b-q4_K_M"],
+               inference: "active")
+      ],
+      bootstrap_workers: [copying, bootstrap_worker(2, "pod_b")]
+    )
+
+    output = LocalModelEvaluation::RunpodStatusAll.new(width: 72).render(@overview.snapshot([fleet]))
+
+    assert_operator output.lines(chomp: true).map(&:length).max, :<=, 72
+    assert_includes output, "Workers (stacked for 72 columns)"
+    assert_includes output, "Worker A1 (FLEET=A; BURST=1)"
+    assert_includes output, "Worker A2 (FLEET=A; BURST=2)"
+    %w[GPU AVAILABLE LOADED RUNPOD RATE INFERENCE TUNNEL REGISTRY BOOTSTRAP].each do |label|
+      assert_match(/^  #{label}: /, output)
+    end
+    assert_includes output, "  BOOTSTRAP: COPYING 37%"
+    refute_match(/^FLEET BURST GPU/, output)
+  end
+
+  def test_wide_render_preserves_existing_worker_table
+    fleet = entry(
+      "wide",
+      rate: 0.49,
+      accrued: 0.10,
+      workers: [worker(1, "pod_a", "NVIDIA A40", 0.49, available: ["qwen:27b"], inference: "active")],
+      bootstrap_workers: [bootstrap_worker(1, "pod_a")]
+    )
+
+    output = LocalModelEvaluation::RunpodStatusAll.new(width: 160).render(@overview.snapshot([fleet]))
+
+    assert_match(/^FLEET BURST GPU\s+AVAILABLE\s+LOADED\s+RUNPOD/, output)
+    assert_match(/^A\s+1\s+NVIDIA A40.*qwen:27b.*ACTIVE.*PASSED$/, output)
+    assert_operator output.lines(chomp: true).map(&:length).max, :<=, 160
+    refute_includes output, "Workers (stacked"
+  end
+
+  def test_width_option_controls_aggregate_verbose_cli
+    Dir.mktmpdir("rpof-status-width-") do |root|
+      LocalModelEvaluation::RunpodFleetState.new(root:).activate(
+        workers: [CliWorker.new(
+          index: 1, pod_id: "pod_a", name: "af-lme-burst-1",
+          host: "198.51.100.1", ssh_port: 22_001, hourly_rate: 0.49
+        )],
+        cloud: "SECURE",
+        gpu_id: "NVIDIA A40",
+        image: "example/image"
+      )
+      env = {
+        "RUNPOD_API_KEY" => nil,
+        "RPOF_STATE_ROOT" => root,
+        "RPOF_STATE_REPO_ROOT" => root
+      }
+
+      output, error, status = Open3.capture3(
+        env, RbConfig.ruby, File.join(ROOT, "bin/rpof"),
+        "status", "--all", "--verbose", "--width", "72"
+      )
+
+      assert status.success?, error
+      assert_includes output, "Workers (stacked for 72 columns)"
+      assert_includes output, "Worker A1 (FLEET=A; BURST=1)"
+      refute_match(/^FLEET BURST GPU/, output)
+    end
   end
 
   private

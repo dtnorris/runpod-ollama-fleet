@@ -99,7 +99,7 @@ begin
       { "fleet_key" => fleet_key, "snapshot" => snapshot }
     end
 
-    overview = LocalModelEvaluation::RunpodStatusAll.new
+    overview = LocalModelEvaluation::RunpodStatusAll.new(width: options[:width])
     snapshot = overview.snapshot(entries)
     if options[:json]
       puts JSON.pretty_generate(snapshot)
