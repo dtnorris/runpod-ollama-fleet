@@ -2,6 +2,7 @@
 
 require "fileutils"
 require "json"
+require "thread"
 require "time"
 
 module RunpodOllamaFleet
@@ -55,12 +56,18 @@ module RunpodOllamaFleet
       return false unless ledger.fetch("state") == "ARMED" && ledger.fetch("mutation_allowed") == true
 
       heartbeat = @binding.parent_budget.heartbeat!(source: "orchestrator")
-      result = @lifecycle.reconcile_once(ssh_public_key_path: @ssh_public_key_path)
+      persist(runtime_document(
+        "RUNNING", started_at:, last_heartbeat_at: heartbeat.fetch("last_orchestrator_heartbeat_at_utc"),
+        last_action: "reconciling", last_error: nil
+      ))
+      result = reconcile_with_heartbeats(started_at:) do
+        @lifecycle.reconcile_once(ssh_public_key_path: @ssh_public_key_path)
+      end
       actions = result.fetch("profiles").map { |row| "#{row.fetch('profile_id')}:#{row.fetch('action')}" }
       now = utc_now.iso8601
       persist(runtime_document(
-        "RUNNING", started_at:, last_heartbeat_at: heartbeat.fetch("last_orchestrator_heartbeat_at_utc"),
-        last_reconciliation_at: now, last_action: actions.join(","), last_error: nil
+        "RUNNING", started_at:, last_reconciliation_at: now,
+        last_action: actions.join(","), last_error: nil
       ))
       log("reconcile #{actions.join(' ')}")
       true
@@ -75,6 +82,48 @@ module RunpodOllamaFleet
     end
 
     private
+
+    def reconcile_with_heartbeats(started_at:)
+      mutex = Mutex.new
+      condition = ConditionVariable.new
+      stopped = false
+      heartbeat_error = nil
+
+      heartbeat_thread = Thread.new do
+        loop do
+          should_stop = mutex.synchronize do
+            condition.wait(mutex, @heartbeat_seconds)
+            stopped
+          end
+          break if should_stop
+
+          begin
+            heartbeat = @binding.parent_budget.heartbeat!(source: "orchestrator")
+            persist(runtime_document(
+              "RUNNING", started_at:,
+              last_heartbeat_at: heartbeat.fetch("last_orchestrator_heartbeat_at_utc"),
+              last_action: "reconciling", last_error: nil
+            ))
+          rescue StandardError => e
+            heartbeat_error = e
+            break
+          end
+        end
+      end
+
+      result = yield
+      raise heartbeat_error if heartbeat_error
+
+      result
+    ensure
+      if defined?(mutex) && mutex && defined?(condition) && condition
+        mutex.synchronize do
+          stopped = true
+          condition.broadcast
+        end
+      end
+      heartbeat_thread&.join
+    end
 
     def stop(reason, started_at)
       persist(runtime_document("STOPPED", started_at:, last_action: reason))

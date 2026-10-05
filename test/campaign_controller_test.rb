@@ -85,6 +85,41 @@ class CampaignControllerTest < Minitest::Test
     assert_equal "generation-1", row.fetch("generation_id")
   end
 
+  def test_long_reconciliation_keeps_heartbeating_until_it_finishes
+    started = Queue.new
+    release = Queue.new
+    blocking = Object.new
+    blocking.define_singleton_method(:reconcile_once) do |ssh_public_key_path:|
+      raise "missing key" if ssh_public_key_path.empty?
+
+      started << true
+      release.pop
+      { "profiles" => [{ "profile_id" => "qwen", "action" => "created" }] }
+    end
+    instance = controller(lifecycle: blocking, heartbeat_seconds: 0.01)
+
+    worker = Thread.new { instance.tick("2030-01-01T00:00:00Z") }
+    started.pop
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 1.0
+    until @binding.parent_budget.heartbeats >= 2
+      flunk "controller did not heartbeat during reconciliation" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      sleep 0.005
+    end
+
+    row = JSON.parse(File.read(@runtime))
+    assert_equal "RUNNING", row.fetch("state")
+    assert_equal "reconciling", row.fetch("last_action")
+    refute_nil row.fetch("last_heartbeat_at_utc")
+
+    release << true
+    assert worker.value
+    row = JSON.parse(File.read(@runtime))
+    assert_equal "qwen:created", row.fetch("last_action")
+  ensure
+    release << true if defined?(release) && release
+    worker&.join(1)
+  end
+
   def test_teardown_state_stops_before_heartbeat_or_reconciliation
     @binding.parent_budget.state = "TEARDOWN_REQUIRED"
 
@@ -139,11 +174,11 @@ class CampaignControllerTest < Minitest::Test
 
   private
 
-  def controller(sleeper: ->(*) {})
+  def controller(sleeper: ->(*) {}, lifecycle: @lifecycle, heartbeat_seconds: 5)
     RunpodOllamaFleet::CampaignController.new(
-      binding: @binding, lifecycle: @lifecycle, state_path: @runtime,
+      binding: @binding, lifecycle:, state_path: @runtime,
       enabled_path: @enabled, log_path: @log, generation_id: "generation-1",
-      heartbeat_seconds: 5, ssh_public_key_path: "fixture.pub",
+      heartbeat_seconds:, ssh_public_key_path: "fixture.pub",
       wall_clock: -> { @now += 1 }, sleeper:, pid: Process.pid + 1
     )
   end
