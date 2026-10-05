@@ -54,6 +54,10 @@ only if that checkout contains the exact frozen commit.
 
 ## Operator entry point
 
+Start with the [RPOF operator runbook](docs/operator-runbook.md) for inspection,
+bounded paid start, advisory planning evidence, capacity controls and verified
+teardown. All admission and lifecycle authority remains in this component.
+
 `bin/rpof` exposes the current capacity/registry interface:
 
 ```text
