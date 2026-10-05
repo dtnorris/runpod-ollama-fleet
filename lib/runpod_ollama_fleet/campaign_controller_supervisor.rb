@@ -158,13 +158,23 @@ module RunpodOllamaFleet
         ["/bin/launchctl", "bootout", "#{paths.fetch(:domain)}/#{paths.fetch(:label)}"],
         allow_failure: true
       )
-      if launchd_loaded?(paths.fetch(:domain), paths.fetch(:label))
+      unless wait_for_launchd_unloaded(paths.fetch(:domain), paths.fetch(:label))
         raise Error, "campaign controller remains loaded after stop request: #{error.strip} (exit #{code})"
       end
       status(binding:).merge("state" => "STOPPED", "enabled" => false, "launchd_loaded" => false)
     end
 
     private
+
+    def wait_for_launchd_unloaded(domain, label, wait_seconds: 2.0, poll_seconds: 0.05)
+      deadline = @monotonic_clock.call + wait_seconds
+      loop do
+        return true unless launchd_loaded?(domain, label)
+        return false if @monotonic_clock.call >= deadline
+
+        @sleeper.call(poll_seconds)
+      end
+    end
 
     def cleanup_failed_launch(paths)
       File.delete(paths.fetch(:enabled_path)) if File.file?(paths.fetch(:enabled_path))

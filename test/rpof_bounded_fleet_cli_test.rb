@@ -101,7 +101,28 @@ class RpofBoundedFleetCliTest < Minitest::Test
     result = {
       "command" => "campaign status",
       "read_only" => true,
-      "campaign" => { "campaign_id" => "fleet-a-production" }
+      "campaign" => { "campaign_id" => "fleet-a-production" },
+      "desired_capacity" => { "profiles" => [{ "desired_workers" => 1 }] },
+      "budget_state" => "ARMED",
+      "guardian_healthy" => true,
+      "deadline_at_utc" => "2030-01-01T01:00:00Z",
+      "active_workers" => 1,
+      "pending_workers" => 0,
+      "active_plus_pending_hourly_rate_usd" => 0.49,
+      "max_aggregate_hourly_rate_usd" => 0.60,
+      "reserved_maximum_liability_usd" => 0.10,
+      "max_cumulative_compute_usd" => 0.40,
+      "controller" => { "state" => "RUNNING", "pid" => 1234 },
+      "profiles" => [{
+        "profile_id" => "qwen",
+        "provider_active_workers" => 1,
+        "bootstrap_passed_workers" => 1,
+        "tunnel_established_workers" => 1,
+        "registry_ready_workers" => 1,
+        "desired_workers" => 1
+      }],
+      "teardown_reason" => nil,
+      "provider_absence_verified_at_utc" => nil
     }
     response = [JSON.generate(result), "", ExitStatus.new(0)]
     argv = [
@@ -112,6 +133,14 @@ class RpofBoundedFleetCliTest < Minitest::Test
     stdout, stderr, status, = Open3.stub(:capture3, response) { capture_loaded(argv) }
     assert status.success?, stderr
     assert_equal result, JSON.parse(stdout)
+    assert_equal before, retained_hashes
+
+    human_argv = [
+      "view", "--campaign-id", "fleet-a-production", "--state-root", @state_root, "--once"
+    ]
+    stdout, stderr, status, = Open3.stub(:capture3, response) { capture_loaded(human_argv) }
+    assert status.success?, stderr
+    assert_includes stdout, "ATTACHED READ-ONLY fleet view"
     assert_equal before, retained_hashes
 
     interrupter = ->(*_arguments) { raise Interrupt }

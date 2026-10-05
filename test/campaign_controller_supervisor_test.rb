@@ -79,6 +79,18 @@ class CampaignControllerSupervisorTest < Minitest::Test
     assert @commands.any? { |argv| argv.include?("bootout") }
   end
 
+  def test_disable_waits_for_successful_bootout_to_become_observable
+    supervisor = build_supervisor(bootout_unload_after_prints: 2)
+    supervisor.ensure_running!(
+      binding: @binding, ssh_public_key_path: "fixture.pub", heartbeat_timeout_seconds: 30
+    )
+
+    result = supervisor.disable!(binding: @binding)
+
+    assert_equal "STOPPED", result.fetch("state")
+    refute result.fetch("launchd_loaded")
+  end
+
   def test_request_binds_exact_capability_artifact_and_fingerprint
     supervisor = build_supervisor
     supervisor.ensure_running!(
@@ -192,11 +204,18 @@ class CampaignControllerSupervisorTest < Minitest::Test
     File.join(File.dirname(@binding.state_path), "controller", name)
   end
 
-  def build_supervisor(capability_request_paths: { "profile-1" => @capability_path })
+  def build_supervisor(capability_request_paths: { "profile-1" => @capability_path },
+                       bootout_unload_after_prints: 0)
+    pending_unload_prints = 0
     runner = lambda do |argv|
       @commands << argv
       case argv[1]
-      when "print" then ["", "", @loaded ? 0 : 1]
+      when "print"
+        if pending_unload_prints.positive?
+          pending_unload_prints -= 1
+          @loaded = false if pending_unload_prints.zero?
+        end
+        ["", "", @loaded ? 0 : 1]
       when "bootstrap" then @loaded = true; ["", "", 0]
       when "kickstart"
         request = JSON.parse(File.read(controller_path("request.json")))
@@ -210,7 +229,10 @@ class CampaignControllerSupervisorTest < Minitest::Test
           "last_reconciliation_at_utc" => @now.iso8601, "last_action" => "none", "last_error" => nil
         ))
         ["", "", 0]
-      when "bootout" then @loaded = false; ["", "", 0]
+      when "bootout"
+        pending_unload_prints = bootout_unload_after_prints
+        @loaded = false if pending_unload_prints.zero?
+        ["", "", 0]
       else ["", "unexpected", 1]
       end
     end

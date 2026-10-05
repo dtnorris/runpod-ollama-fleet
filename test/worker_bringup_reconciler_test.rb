@@ -189,6 +189,7 @@ class WorkerBringupReconcilerTest < Minitest::Test
 
     assert_equal "in_progress", second.dig("bootstrap", "status")
     assert_equal 1, @bootstrap.starts
+    assert_equal 0, @tunnel.ensures
     assert_equal 0, @capability.verifications
   end
 

@@ -97,7 +97,7 @@ def campaign_argv(command, options, paths, profile_id:)
   ]
   argv.concat(["--ssh-public-key", options.fetch(:ssh_public_key)]) if command == "start"
   argv << "--authorize-paid" if options[:authorize_paid]
-  argv << "--json" if options[:json]
+  argv << "--json" if options[:json] || command == "status"
   argv
 end
 

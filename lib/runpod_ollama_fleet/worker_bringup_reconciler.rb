@@ -6,7 +6,7 @@ require_relative "worker_bringup_identity"
 require_relative "worker_bringup_state"
 
 module RunpodOllamaFleet
-  # Advances one generation through tunnel, bootstrap, and capability evidence.
+  # Advances one generation through bootstrap, tunnel, and capability evidence.
   # It deliberately stops before registry publication.
   class WorkerBringupReconciler
     class Error < StandardError; end
@@ -30,11 +30,9 @@ module RunpodOllamaFleet
         campaign_identity_sha256:, profile:, worker:, generation_id:, capability_request:
       )
       @state.with_current(identity) do |document, checkpoint|
-        reconcile_tunnel(identity, document, checkpoint)
-        if stage_passed?(document, "tunnel")
-          reconcile_bootstrap(identity, document, checkpoint, retry_bootstrap:)
-        end
-        if stage_passed?(document, "bootstrap")
+        reconcile_bootstrap(identity, document, checkpoint, retry_bootstrap:)
+        reconcile_tunnel(identity, document, checkpoint) if stage_passed?(document, "bootstrap")
+        if stage_passed?(document, "bootstrap") && stage_passed?(document, "tunnel")
           reconcile_capability(identity, document, checkpoint)
         end
         finalize(document)

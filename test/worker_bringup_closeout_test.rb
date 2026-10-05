@@ -16,7 +16,7 @@ class WorkerBringupCloseoutTest < Minitest::Test
 
   class Tunnel
     attr_reader :starts
-    attr_accessor :observed, :after_ensure
+    attr_accessor :observed, :before_ensure, :after_ensure
 
     def initialize
       @starts = 0
@@ -26,6 +26,7 @@ class WorkerBringupCloseoutTest < Minitest::Test
     def inspect(identity:) = observed
 
     def ensure!(identity:)
+      before_ensure&.call
       @starts += 1
       self.observed = passed(identity)
       after_ensure&.call
@@ -443,23 +444,23 @@ class WorkerBringupCloseoutTest < Minitest::Test
     assert_equal 0, @tunnel.starts
   end
 
-  def test_bu_c15_teardown_during_tunnel_blocks_bootstrap_and_publication
+  def test_bu_c15_teardown_during_bootstrap_blocks_tunnel_and_publication
     authority = true
-    @tunnel.after_ensure = -> { authority = false }
-    @bootstrap.before_start = lambda do
+    @bootstrap.after_start = -> { authority = false }
+    @tunnel.before_ensure = lambda do
       raise RunpodOllamaFleet::WorkerBringupReconciler::RetryableTransitionError, "teardown" unless authority
     end
 
     state = reconcile
 
-    assert_equal "failed_retryable", state.dig("bootstrap", "status")
+    assert_equal "failed_retryable", state.dig("tunnel", "status")
     refute state.fetch("readiness_prerequisites_satisfied")
-    assert_equal 0, @bootstrap.starts
+    assert_equal 0, @tunnel.starts
   end
 
-  def test_bu_c16_teardown_during_bootstrap_blocks_capability_and_ready
+  def test_bu_c16_teardown_during_tunnel_blocks_capability_and_ready
     authority = true
-    @bootstrap.after_start = -> { authority = false }
+    @tunnel.after_ensure = -> { authority = false }
     @capability.before_verify = lambda do
       raise RunpodOllamaFleet::WorkerBringupReconciler::RetryableTransitionError, "teardown" unless authority
     end
