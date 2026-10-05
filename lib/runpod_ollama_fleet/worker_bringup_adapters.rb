@@ -109,13 +109,15 @@ module RunpodOllamaFleet
     class Bootstrap < Base
       LAUNCH_CONTRACT = "rpof-worker-bootstrap-launch/v0.1"
 
-      def initialize(root:, repo_root:, fleet_state:, shared_store_path:, process_supervisor: nil,
+      def initialize(root:, repo_root:, fleet_state:, shared_store_path:, shared_source_model:,
+                     process_supervisor: nil,
                      clock: nil, **keywords)
         super(**keywords)
         @root = File.expand_path(root)
         @repo_root = File.expand_path(repo_root)
         @fleet_state = fleet_state
         @shared_store_path = shared_store_path.to_s
+        @shared_source_model = shared_source_model.to_s
         @process = process_supervisor || LocalModelEvaluation::ProcessSupervisor.new
         @clock = clock || -> { Time.now.utc }
       end
@@ -190,6 +192,7 @@ module RunpodOllamaFleet
           "--expect-digest", "#{exact.fetch('model')}=#{exact.fetch('expected_digest')}",
           "--context", exact.fetch("required_context_length").to_s,
           "--copy-from-shared-store", @shared_store_path,
+          "--shared-source-model", @shared_source_model,
           "--fleet", identity.fetch("profile_id"),
           "--local-state-root", @root,
           "--bringup-identity", fingerprint(identity),

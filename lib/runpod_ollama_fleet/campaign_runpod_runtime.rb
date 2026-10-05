@@ -555,6 +555,7 @@ module RunpodOllamaFleet
         bootstrap: WorkerBringupAdapters::Bootstrap.new(
           root: @root, repo_root: @repo_root, fleet_state: state,
           shared_store_path: @hardware.fetch("ollama_store_path"),
+          shared_source_model: @hardware.fetch("shared_model"),
           process_supervisor: process, requirement: @capability_request,
           transition_guard:, clock: @wall_clock
         ),

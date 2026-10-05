@@ -106,8 +106,11 @@ class WorkerBringupAdaptersTest < Minitest::Test
     assert_equal "in_progress", result.fetch("status")
     assert_equal 9_001, result.dig("launch_identity", "pid")
     command = process.commands.fetch(0).fetch(:command)
-    assert_includes command, "--copy-from-shared-store"
-    assert_includes command, "/workspace-global/ollama-models"
+    assert_option command, "--model", "qualified-model:latest"
+    assert_option command, "--copy-from-shared-store", "/workspace-global/ollama-models"
+    assert_option command, "--shared-source-model", "qualified-model:q4_K_M"
+    assert_option command, "--expect-digest", "qualified-model:latest=#{DIGEST}"
+    assert_option command, "--context", "131072"
     assert_includes command, "--bringup-identity"
     assert_includes command, @requirement.fingerprint
   end
@@ -199,10 +202,17 @@ class WorkerBringupAdaptersTest < Minitest::Test
   def bootstrap_adapter(process)
     RunpodOllamaFleet::WorkerBringupAdapters::Bootstrap.new(
       root: @tmp, repo_root: File.expand_path("..", __dir__), fleet_state: @state,
-      shared_store_path: "/workspace-global/ollama-models", process_supervisor: process,
+      shared_store_path: "/workspace-global/ollama-models",
+      shared_source_model: "qualified-model:q4_K_M", process_supervisor: process,
       requirement: @requirement, transition_guard: -> { true },
       clock: -> { Time.utc(2030, 1, 1) }
     )
+  end
+
+  def assert_option(command, option, expected)
+    index = command.index(option)
+    refute_nil index
+    assert_equal expected, command.fetch(index + 1)
   end
 
   def write_bootstrap(status, attempt_id: "attempt-1")

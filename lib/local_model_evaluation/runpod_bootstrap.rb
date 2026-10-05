@@ -32,7 +32,8 @@ module LocalModelEvaluation
     end
 
     def run(worker_indices:, models:, expected_digests: [], clean: false, reuse_existing: false,
-            copy_to_workspace: false, copy_from_shared_store: nil, keep_root_models: false,
+            copy_to_workspace: false, copy_from_shared_store: nil, shared_source_model: nil,
+            keep_root_models: false,
             context: nil, state_root: nil,
             bringup_identity_sha256: nil, bringup_attempt_id: nil, model_requirement_sha256: nil,
             pull_timeout_seconds: DEFAULT_PULL_TIMEOUT_SECONDS,
@@ -70,6 +71,9 @@ module LocalModelEvaluation
         if models.length != 1
           raise Error, "--copy-from-shared-store requires exactly one model"
         end
+        shared_source_model = normalize_shared_source_model(shared_source_model || models.first)
+      elsif shared_source_model
+        raise Error, "--shared-source-model requires --copy-from-shared-store"
       end
       if copy_to_workspace && keep_root_models
         raise Error, "--copy-to-workspace cannot be combined with --keep-root-models"
@@ -116,6 +120,7 @@ module LocalModelEvaluation
           reuse_existing:,
           copy_to_workspace:,
           copy_from_shared_store:,
+          shared_source_model:,
           keep_root_models:,
           state_root:,
           context:,
@@ -133,7 +138,8 @@ module LocalModelEvaluation
     private
 
     def execute_run(fleet:, workers:, models:, digests:, expected_gpus:, clean:, reuse_existing:,
-                    copy_to_workspace:, copy_from_shared_store:, keep_root_models:, state_root:, context:,
+                    copy_to_workspace:, copy_from_shared_store:, shared_source_model:,
+                    keep_root_models:, state_root:, context:,
                     pull_timeout_seconds:, heartbeat_seconds:, poll_seconds:, bootstrap_root:, bringup_binding:)
       started_wall = utc_now
       started_mono = @monotonic_clock.call
@@ -150,6 +156,7 @@ module LocalModelEvaluation
         reuse_existing:,
         copy_to_workspace:,
         copy_from_shared_store:,
+        shared_source_model:,
         keep_root_models:,
         state_root:,
         context:,
@@ -178,6 +185,7 @@ module LocalModelEvaluation
             reuse_existing:,
             copy_to_workspace:,
             copy_from_shared_store:,
+            shared_source_model:,
             keep_root_models:,
             state_root:,
             context:,
@@ -372,8 +380,18 @@ module LocalModelEvaluation
       digests
     end
 
+    def normalize_shared_source_model(value)
+      model = value.to_s
+      valid = !model.include?("..") &&
+              model.match?(%r{\A[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*(?::[A-Za-z0-9._-]+)?\z})
+      raise Error, "--shared-source-model is invalid" unless valid
+
+      model
+    end
+
     def spawn_worker(worker:, models:, digests:, expected_gpu:, clean:, reuse_existing:, copy_to_workspace:,
-                     copy_from_shared_store:, keep_root_models:, context:, pull_timeout_seconds:, state_root:, run_dir:)
+                     copy_from_shared_store:, shared_source_model:, keep_root_models:, context:,
+                     pull_timeout_seconds:, state_root:, run_dir:)
       index = worker.fetch("index")
       command = [@remote_setup_path, "--worker", index.to_s]
       command.concat(["--expect-gpu", expected_gpu])
@@ -382,6 +400,7 @@ module LocalModelEvaluation
       command << "--reuse-existing" if reuse_existing
       command << "--copy-to-workspace" if copy_to_workspace
       command.concat(["--copy-from-shared-store", copy_from_shared_store]) if copy_from_shared_store
+      command.concat(["--shared-source-model", shared_source_model]) if shared_source_model
       command << "--keep-root-models" if keep_root_models
       command.concat(["--state-root", state_root]) if state_root
       models.each do |model|
@@ -634,7 +653,8 @@ module LocalModelEvaluation
     end
 
     def initial_record(fleet:, workers:, models:, digests:, expected_gpus:, clean:, reuse_existing:,
-                       copy_to_workspace:, copy_from_shared_store:, keep_root_models:, state_root:, context:,
+                       copy_to_workspace:, copy_from_shared_store:, shared_source_model:,
+                       keep_root_models:, state_root:, context:,
                        pull_timeout_seconds:, heartbeat_seconds:, started_wall:, run_id:, bringup_binding:)
       gpu_ids = expected_gpus.values.uniq
       {
@@ -655,6 +675,7 @@ module LocalModelEvaluation
         "reuse_existing" => reuse_existing,
         "copy_to_workspace" => copy_to_workspace,
         "copy_from_shared_store" => copy_from_shared_store,
+        "shared_source_model" => shared_source_model,
         "model_store_mode" => (copy_from_shared_store ? "shared_copy_to_root" : (reuse_existing ? "workspace_reuse" : (copy_to_workspace ? "workspace" : "root"))),
         "keep_root_models" => keep_root_models,
         "state_root" => state_root || "/workspace/lme-worker-state",

@@ -516,22 +516,61 @@ class RunpodBootstrapTest < Minitest::Test
       models: ["gemma4:26b"],
       expected_digests: ["gemma4:26b=#{DIGEST}"],
       copy_from_shared_store: "/workspace-global/ollama-models",
+      shared_source_model: "gemma4:26b-q4_K_M",
       state_root: "/root/lme-worker-state",
       poll_seconds: 0.005
     )
 
     assert_equal "passed", record.fetch("status")
     assert_equal "/workspace-global/ollama-models", record.fetch("copy_from_shared_store")
+    assert_equal "gemma4:26b-q4_K_M", record.fetch("shared_source_model")
     assert_equal "shared_copy_to_root", record.fetch("model_store_mode")
     @process_supervisor.commands.each do |entry|
       command = entry.fetch(:command)
       option_index = command.index("--copy-from-shared-store")
       refute_nil option_index
       assert_equal "/workspace-global/ollama-models", command.fetch(option_index + 1)
+      source_index = command.index("--shared-source-model")
+      refute_nil source_index
+      assert_equal "gemma4:26b-q4_K_M", command.fetch(source_index + 1)
       refute_includes command, "--reuse-existing"
       refute_includes command, "--copy-to-workspace"
       refute_includes command, "--clean"
     end
+  end
+
+  def test_copy_from_shared_store_defaults_source_to_requested_model
+    script = fake_remote_script("puts 'same model fixture'\n")
+
+    record = build_runner(script).run(
+      worker_indices: [1],
+      models: ["gemma4:26b"],
+      expected_digests: ["gemma4:26b=#{DIGEST}"],
+      copy_from_shared_store: "/workspace-global/ollama-models",
+      state_root: "/root/lme-worker-state",
+      poll_seconds: 0.005
+    )
+
+    assert_equal "gemma4:26b", record.fetch("shared_source_model")
+    command = @process_supervisor.commands.fetch(0).fetch(:command)
+    source_index = command.index("--shared-source-model")
+    assert_equal "gemma4:26b", command.fetch(source_index + 1)
+  end
+
+  def test_copy_from_shared_store_rejects_invalid_source_model_before_spawning
+    script = fake_remote_script("raise 'must not run'\n")
+
+    error = assert_raises(LocalModelEvaluation::RunpodBootstrap::Error) do
+      build_runner(script).run(
+        worker_indices: [1], models: ["gemma4:26b"],
+        expected_digests: ["gemma4:26b=#{DIGEST}"],
+        copy_from_shared_store: "/workspace-global/ollama-models",
+        shared_source_model: "../invalid"
+      )
+    end
+
+    assert_includes error.message, "--shared-source-model is invalid"
+    assert_empty @process_supervisor.commands
   end
 
   def test_keep_root_models_is_forwarded_and_recorded

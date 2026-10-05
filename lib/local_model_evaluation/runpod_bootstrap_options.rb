@@ -37,6 +37,10 @@ module LocalModelEvaluation
         if opts[:models].length != 1
           raise OptionParser::InvalidArgument, "--copy-from-shared-store requires exactly one --model"
         end
+        validate_shared_source_model!(opts[:shared_source_model]) if opts[:shared_source_model]
+      elsif opts[:shared_source_model]
+        raise OptionParser::InvalidArgument,
+              "--shared-source-model requires --copy-from-shared-store"
       end
       if opts[:copy_to_workspace] && opts[:keep_root_models]
         raise OptionParser::InvalidArgument, "--copy-to-workspace cannot be combined with --keep-root-models"
@@ -54,6 +58,15 @@ module LocalModelEvaluation
       raise OptionParser::InvalidArgument, "unexpected arguments: #{remaining_args.join(' ')}" unless remaining_args.empty?
 
       true
+    end
+
+    def validate_shared_source_model!(value)
+      model = value.to_s
+      valid = !model.include?("..") &&
+              model.match?(%r{\A[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*(?::[A-Za-z0-9._-]+)?\z})
+      return if valid
+
+      raise OptionParser::InvalidArgument, "--shared-source-model is invalid"
     end
   end
 end

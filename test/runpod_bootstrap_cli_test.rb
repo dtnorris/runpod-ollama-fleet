@@ -16,6 +16,7 @@ class RunpodBootstrapCliTest < Minitest::Test
     assert_includes out, "--reuse-existing"
     assert_includes out, "--copy-to-workspace"
     assert_includes out, "--copy-from-shared-store"
+    assert_includes out, "--shared-source-model"
     assert_includes out, "--keep-root-models"
     assert_includes out, "--pull-timeout-seconds"
   end
@@ -84,6 +85,18 @@ class RunpodBootstrapCliTest < Minitest::Test
     )
   end
 
+  def test_shared_source_model_requires_copy_mode_and_valid_identity
+    assert_invalid(
+      "--shared-source-model requires --copy-from-shared-store",
+      shared_source_model: "gemma4:26b-q4_K_M"
+    )
+    assert_invalid(
+      "--shared-source-model is invalid",
+      copy_from_shared_store: "/workspace-global/ollama-models",
+      shared_source_model: "../gemma4:26b"
+    )
+  end
+
   def test_keep_root_models_requires_exactly_one_model_before_fleet_access
     assert_invalid(
       "--keep-root-models requires exactly one --model",
@@ -110,6 +123,7 @@ class RunpodBootstrapCliTest < Minitest::Test
       reuse_existing: false,
       copy_to_workspace: false,
       copy_from_shared_store: nil,
+      shared_source_model: nil,
       keep_root_models: false
     }
   end

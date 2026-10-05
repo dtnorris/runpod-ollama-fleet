@@ -31,10 +31,16 @@ class RunpodRemoteSetupContractTest < Minitest::Test
       source = File.join(dir, "source")
       destination = File.join(dir, "destination")
       metrics = File.join(dir, "metrics.tsv")
-      model = "fixture:latest"
+      source_model = "fixture:cached-q4_K_M"
+      requested_model = "fixture:runtime"
       digests = ["sha256:#{'a' * 64}", "sha256:#{'b' * 64}"]
-      manifest_rel = File.join("manifests", "registry.ollama.ai", "library", "fixture", "latest")
-      source_manifest = File.join(source, manifest_rel)
+      source_manifest_rel = File.join(
+        "manifests", "registry.ollama.ai", "library", "fixture", "cached-q4_K_M"
+      )
+      destination_manifest_rel = File.join(
+        "manifests", "registry.ollama.ai", "library", "fixture", "runtime"
+      )
+      source_manifest = File.join(source, source_manifest_rel)
       FileUtils.mkdir_p(File.dirname(source_manifest))
       FileUtils.mkdir_p(File.join(source, "blobs"))
       File.write(
@@ -50,7 +56,7 @@ class RunpodRemoteSetupContractTest < Minitest::Test
       total = sizes.sum
 
       stdout, stderr, status = Open3.capture3(
-        "python3", "-", source, destination, model, metrics,
+        "python3", "-", source, destination, source_model, requested_model, metrics,
         stdin_data: shared_copy_python
       )
 
@@ -73,14 +79,35 @@ class RunpodRemoteSetupContractTest < Minitest::Test
         assert_equal size, File.size(destination_blob)
         refute File.exist?("#{destination_blob}.partial")
       end
-      assert_equal File.read(source_manifest), File.read(File.join(destination, manifest_rel))
-      assert_match(/^LME_SHARED_COPY\t#{Regexp.escape(model)}\t#{total}\t/, stdout)
-      assert_includes File.read(metrics), "#{model}\t#{total}\t"
+      assert_equal File.read(source_manifest), File.read(File.join(destination, destination_manifest_rel))
+      refute File.exist?(File.join(destination, source_manifest_rel))
+      assert_match(/^LME_SHARED_COPY\t#{Regexp.escape(requested_model)}\t#{total}\t/, stdout)
+      assert_includes stdout, "LME_SHARED_COPY_SOURCE\t#{source_model}\t#{requested_model}"
+      assert_includes File.read(metrics), "#{source_model}\t#{requested_model}\t#{total}\t"
 
       python = shared_copy_python
       assert_includes python, 'temporary_blob = destination_blob + ".partial"'
       assert_includes python, "os.replace(temporary_blob, destination_blob)"
       refute_includes python, "shutil.copyfile(source_blob, temporary_blob)"
+    end
+  end
+
+  def test_shared_store_copy_missing_source_manifest_fails_without_public_pull
+    Dir.mktmpdir("rpof-shared-copy-missing-") do |dir|
+      source = File.join(dir, "source")
+      destination = File.join(dir, "destination")
+      metrics = File.join(dir, "metrics.tsv")
+      FileUtils.mkdir_p(source)
+
+      stdout, stderr, status = Open3.capture3(
+        "python3", "-", source, destination, "missing:cached", "requested:runtime", metrics,
+        stdin_data: shared_copy_python
+      )
+
+      refute status.success?, stdout + stderr
+      assert_includes stderr, "source manifest not found for missing:cached"
+      refute_includes shared_copy_python, "ollama pull"
+      refute File.exist?(metrics)
     end
   end
 

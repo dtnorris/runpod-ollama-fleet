@@ -94,6 +94,24 @@ class CampaignRunpodRuntimeTest < Minitest::Test
     assert_equal "readiness evidence is invalid", status.fetch("registry_error")
   end
 
+  def test_automatic_bootstrap_receives_frozen_shared_model_binding
+    captured = nil
+    bootstrap = Object.new
+    builder = lambda do |**keywords|
+      captured = keywords
+      bootstrap
+    end
+    runtime = build_runtime([])
+
+    RunpodOllamaFleet::WorkerBringupAdapters::Bootstrap.stub(:new, builder) do
+      runtime.send(:bringup_reconciler, -> { true })
+    end
+
+    refute_nil captured
+    assert_equal "/workspace-global/ollama-models", captured.fetch(:shared_store_path)
+    assert_equal "qwen3.6:35b-a3b-q4_K_M", captured.fetch(:shared_source_model)
+  end
+
   private
 
   def build_runtime(rows, readiness_observer: nil)
@@ -104,7 +122,9 @@ class CampaignRunpodRuntimeTest < Minitest::Test
       hardware: {
         "qualified_gpu_ids" => ["NVIDIA A40", BLACKWELL],
         "cloud" => "SECURE",
-        "global_volume_id" => "test-volume"
+        "global_volume_id" => "test-volume",
+        "ollama_store_path" => "/workspace-global/ollama-models",
+        "shared_model" => "qwen3.6:35b-a3b-q4_K_M"
       },
       client: FakeClient.new(rows),
       readiness_observer:

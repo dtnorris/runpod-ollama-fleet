@@ -17,6 +17,7 @@ PULL_TIMEOUT_SECONDS=360
 STAGING_DIR=/root/.ollama/models
 SHARED_DIR=/workspace/ollama-models
 SOURCE_SHARED_DIR=""
+SOURCE_SHARED_MODEL=""
 PINNED_OLLAMA_RUNTIME_VERSION="v0.34.1"
 PINNED_OLLAMA_RUNTIME_SHA256="f361dc3992ec07e4ad429f4bb2d10d4663ba2c295f9a9a688c7d52f4ba650034"
 PINNED_OLLAMA_RUNTIME_ARCHIVE="/workspace-global/runtime-cache/ollama/${PINNED_OLLAMA_RUNTIME_VERSION}/ollama-linux-amd64.tar.zst"
@@ -66,6 +67,7 @@ Options:
   --clean                       Delete both staging and shared Ollama stores before setup.
   --reuse-existing              Reuse /workspace cache only; never pull, stage, or rsync model data.
   --copy-from-shared-store PATH Copy one model from an already-populated Ollama store to local/root storage; never pull.
+  --shared-source-model MODEL   Source model identity in the shared store (defaults to --model).
   --copy-to-workspace           Persist pulled model data to /workspace instead of serving from root.
   --keep-root-models            Compatibility flag; root storage is already the default for one model.
   -h, --help                    Show this help.
@@ -126,6 +128,10 @@ while (($#)); do
       [[ $# -ge 2 ]] || die "--copy-from-shared-store requires a value"
       SOURCE_SHARED_DIR="$2"
       shift 2 ;;
+    --shared-source-model)
+      [[ $# -ge 2 ]] || die "--shared-source-model requires a value"
+      SOURCE_SHARED_MODEL="$2"
+      shift 2 ;;
     --copy-to-workspace)
       COPY_TO_WORKSPACE=1; shift ;;
     --keep-root-models)
@@ -154,12 +160,20 @@ if [[ -n "$SOURCE_SHARED_DIR" ]]; then
   [[ $KEEP_ROOT_MODELS_EXPLICIT -eq 0 ]] || die "--copy-from-shared-store cannot be combined with --keep-root-models"
   [[ $CLEAN -eq 0 ]] || die "--copy-from-shared-store cannot be combined with --clean"
   [[ ${#MODELS[@]} -eq 1 ]] || die "--copy-from-shared-store requires exactly one --model"
+  if [[ -z "$SOURCE_SHARED_MODEL" ]]; then
+    SOURCE_SHARED_MODEL="${MODELS[0]}"
+  fi
+  [[ "$SOURCE_SHARED_MODEL" != *".."* && \
+     "$SOURCE_SHARED_MODEL" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*(:[A-Za-z0-9._-]+)?$ ]] || \
+    die "--shared-source-model is invalid"
   [[ -d "$SOURCE_SHARED_DIR/manifests" && -d "$SOURCE_SHARED_DIR/blobs" ]] || \
     die "shared source Ollama store is incomplete: $SOURCE_SHARED_DIR"
   [[ -r "$SOURCE_SHARED_DIR" ]] || die "shared source Ollama store is not readable: $SOURCE_SHARED_DIR"
   if [[ "$SOURCE_SHARED_DIR" == "$STAGING_DIR" ]]; then
     die "--copy-from-shared-store must differ from the local staging store"
   fi
+elif [[ -n "$SOURCE_SHARED_MODEL" ]]; then
+  die "--shared-source-model requires --copy-from-shared-store"
 fi
 if [[ $KEEP_ROOT_MODELS_EXPLICIT -eq 1 && $COPY_TO_WORKSPACE -eq 1 ]]; then
   die "--copy-to-workspace cannot be combined with --keep-root-models"
@@ -416,34 +430,35 @@ elif [[ -n "$SOURCE_SHARED_DIR" ]]; then
   rm -rf "$STAGING_DIR"
   mkdir -p "$STAGING_DIR"
   df -h / | tee "$STATE_DIR/disk-before-${safe}.txt"
-  info "Copying only the manifest-referenced blobs for $model from $SOURCE_SHARED_DIR to $STAGING_DIR."
+  info "Copying only the manifest-referenced blobs for shared model $SOURCE_SHARED_MODEL to requested model $model."
   info "No ollama pull will be attempted in shared-store copy mode."
-  python3 - "$SOURCE_SHARED_DIR" "$STAGING_DIR" "$model" "$STATE_DIR/shared-copy-${safe}.tsv" <<'PY'
+  python3 - "$SOURCE_SHARED_DIR" "$STAGING_DIR" "$SOURCE_SHARED_MODEL" "$model" "$STATE_DIR/shared-copy-${safe}.tsv" <<'PY'
 import json
 import os
 import shutil
 import sys
 import time
 
-source, destination, model, metrics_path = sys.argv[1:]
+source, destination, source_model, requested_model, metrics_path = sys.argv[1:]
 source = os.path.realpath(source)
 destination = os.path.realpath(destination)
 if source == destination:
     raise SystemExit("source and destination Ollama stores must differ")
 
-repository, separator, tag = model.partition(":")
-if not separator:
-    tag = "latest"
-if not repository or not tag:
-    raise SystemExit(f"unsupported Ollama model name: {model!r}")
+def manifest_relative_path(model):
+    repository, separator, tag = model.partition(":")
+    if not separator:
+        tag = "latest"
+    if not repository or not tag:
+        raise SystemExit(f"unsupported Ollama model name: {model!r}")
+    return os.path.join(
+        "manifests", "registry.ollama.ai", "library", *repository.split("/"), tag
+    )
 
-manifest_rel = os.path.join(
-    "manifests", "registry.ollama.ai", "library", *repository.split("/"), tag
-)
-source_manifest = os.path.join(source, manifest_rel)
-destination_manifest = os.path.join(destination, manifest_rel)
+source_manifest = os.path.join(source, manifest_relative_path(source_model))
+destination_manifest = os.path.join(destination, manifest_relative_path(requested_model))
 if not os.path.isfile(source_manifest):
-    raise SystemExit(f"source manifest not found for {model}: {source_manifest}")
+    raise SystemExit(f"source manifest not found for {source_model}: {source_manifest}")
 
 with open(source_manifest, "r", encoding="utf-8") as handle:
     manifest = json.load(handle)
@@ -455,7 +470,7 @@ for entry in entries:
     if digest and digest not in digests:
         digests.append(digest)
 if not digests:
-    raise SystemExit(f"source manifest for {model} contains no blob digests")
+    raise SystemExit(f"source manifest for {source_model} contains no blob digests")
 
 blob_paths = []
 total_bytes = 0
@@ -466,7 +481,7 @@ for digest in digests:
     blob_name = f"{algorithm}-{hex_digest}"
     source_blob = os.path.join(source, "blobs", blob_name)
     if not os.path.isfile(source_blob):
-        raise SystemExit(f"source blob missing for {model}: {source_blob}")
+        raise SystemExit(f"source blob missing for {source_model}: {source_blob}")
     blob_paths.append((blob_name, source_blob))
     total_bytes += os.path.getsize(source_blob)
 
@@ -495,7 +510,7 @@ def emit_progress(force=False):
     if not should_emit:
         return
     print(
-        f"LME_COPY_PROGRESS\t{model}\t{copied_bytes}\t{total_bytes}\t{percent:.2f}",
+        f"LME_COPY_PROGRESS\t{requested_model}\t{copied_bytes}\t{total_bytes}\t{percent:.2f}",
         flush=True,
     )
     progress_state["at"] = now
@@ -523,10 +538,13 @@ emit_progress(force=True)
 shutil.copyfile(source_manifest, destination_manifest)
 elapsed = max(time.monotonic() - started, 0.001)
 mib_per_second = (total_bytes / 1024**2) / elapsed
-print(f"LME_SHARED_COPY\t{model}\t{total_bytes}\t{elapsed:.3f}\t{mib_per_second:.3f}", flush=True)
+print(f"LME_SHARED_COPY\t{requested_model}\t{total_bytes}\t{elapsed:.3f}\t{mib_per_second:.3f}", flush=True)
+print(f"LME_SHARED_COPY_SOURCE\t{source_model}\t{requested_model}", flush=True)
 with open(metrics_path, "w", encoding="utf-8") as handle:
-    handle.write(f"model\tbytes\tseconds\tmib_per_second\n")
-    handle.write(f"{model}\t{total_bytes}\t{elapsed:.3f}\t{mib_per_second:.3f}\n")
+    handle.write("source_model\trequested_model\tbytes\tseconds\tmib_per_second\n")
+    handle.write(
+        f"{source_model}\t{requested_model}\t{total_bytes}\t{elapsed:.3f}\t{mib_per_second:.3f}\n"
+    )
 PY
   info "Shared-store copy complete. Local model store now uses: $(du -sh "$STAGING_DIR" | awk '{print $1}')"
 else
@@ -665,6 +683,7 @@ step "Write durable worker evidence"
   echo "reuse_existing=$REUSE_EXISTING"
   echo "copy_to_workspace=$COPY_TO_WORKSPACE"
   echo "copy_from_shared_store=$SOURCE_SHARED_DIR"
+  echo "shared_source_model=$SOURCE_SHARED_MODEL"
   echo "ollama_runtime_mode=$OLLAMA_RUNTIME_MODE"
   echo "ollama_runtime_version=$OLLAMA_RUNTIME_VERSION"
   echo "ollama_runtime_sha256=$OLLAMA_RUNTIME_SHA256"

@@ -26,6 +26,7 @@ opts = {
   reuse_existing: false,
   copy_to_workspace: false,
   copy_from_shared_store: nil,
+  shared_source_model: nil,
   keep_root_models: false,
   context: nil,
   state_root: nil,
@@ -50,6 +51,7 @@ parser = OptionParser.new do |o|
   o.on("--reuse-existing", "Reuse and validate the existing /workspace Ollama cache; never pull or copy models") { opts[:reuse_existing] = true }
   o.on("--copy-to-workspace", "Persist pulled model data to /workspace; fresh single-model bootstrap stays on root by default") { opts[:copy_to_workspace] = true }
   o.on("--copy-from-shared-store PATH", "Copy one model from an already-populated Ollama store to local/root storage; never pull") { |v| opts[:copy_from_shared_store] = v }
+  o.on("--shared-source-model MODEL", "Source model identity in the shared Ollama store (defaults to --model)") { |v| opts[:shared_source_model] = v }
   o.on("--keep-root-models", "Compatibility flag; fresh single-model bootstrap already stays on root by default") { opts[:keep_root_models] = true }
   o.on("--fleet KEY", "Select the managed fleet") { |v| opts[:fleet_key] = v }
   o.on("--state-root PATH", "Remote worker evidence root (default: /workspace/lme-worker-state)") { |v| opts[:state_root] = v }
@@ -95,6 +97,7 @@ begin
     reuse_existing: opts[:reuse_existing],
     copy_to_workspace: opts[:copy_to_workspace],
     copy_from_shared_store: opts[:copy_from_shared_store],
+    shared_source_model: opts[:shared_source_model],
     keep_root_models: opts[:keep_root_models],
     context: opts[:context],
     state_root: opts[:state_root],
