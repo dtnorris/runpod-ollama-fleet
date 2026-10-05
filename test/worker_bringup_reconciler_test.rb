@@ -84,6 +84,15 @@ class WorkerBringupReconcilerTest < Minitest::Test
       }
     end
 
+    def failed_retryable(identity, attempt_id)
+      {
+        "identity_sha256" => fingerprint(identity),
+        "attempt_id" => attempt_id,
+        "status" => "failed_retryable",
+        "evidence" => { "detail" => "deterministic fixture failure" }
+      }
+    end
+
     private
 
     def requirement_for(_identity)
@@ -206,6 +215,51 @@ class WorkerBringupReconcilerTest < Minitest::Test
     assert_equal "failed_terminal", second.fetch("overall_status")
     assert_includes second.dig("bootstrap", "error"), "vanished"
     assert_equal 1, @bootstrap.starts
+  end
+
+  def test_retryable_bootstrap_failure_is_stable_without_retry_authority
+    bootstrap = @bootstrap
+    @bootstrap.start_result = lambda do |identity, attempt_id|
+      bootstrap.failed_retryable(identity, attempt_id)
+    end
+    first = reconciler.reconcile!(**arguments)
+    attempt_id = first.dig("bootstrap", "attempt", "attempt_id")
+    @bootstrap.observed = @bootstrap.failed_retryable(first.fetch("identity"), attempt_id)
+
+    subsequent = 3.times.map { reconciler.reconcile!(**arguments) }
+
+    assert_equal "failed_retryable", first.fetch("overall_status")
+    assert_equal 1, @bootstrap.starts
+    assert_equal 1, @attempts
+    assert subsequent.all? { |state| state.dig("bootstrap", "attempt", "attempt_id") == attempt_id }
+    assert subsequent.all? { |state| state.dig("bootstrap", "status") == "failed_retryable" }
+    assert subsequent.none? { |state| state.fetch("readiness_prerequisites_satisfied") }
+    assert subsequent.all? { |state| state.dig("tunnel", "status") == "not_started" }
+    assert subsequent.all? { |state| state.dig("capability", "status") == "not_started" }
+    assert_equal 0, @tunnel.ensures
+    assert_equal 0, @capability.verifications
+  end
+
+  def test_explicit_retry_authority_retries_once_with_a_new_attempt
+    bootstrap = @bootstrap
+    @bootstrap.start_result = lambda do |identity, attempt_id|
+      bootstrap.failed_retryable(identity, attempt_id)
+    end
+    first = reconciler.reconcile!(**arguments)
+    first_attempt = first.dig("bootstrap", "attempt", "attempt_id")
+    @bootstrap.observed = @bootstrap.failed_retryable(first.fetch("identity"), first_attempt)
+    @bootstrap.start_result = nil
+
+    retried = reconciler.reconcile!(**arguments(retry_bootstrap: true))
+
+    assert_equal "prerequisites_passed", retried.fetch("overall_status")
+    assert retried.fetch("readiness_prerequisites_satisfied")
+    refute_equal first_attempt, retried.dig("bootstrap", "attempt", "attempt_id")
+    assert_equal "attempt-2", retried.dig("bootstrap", "attempt", "attempt_id")
+    assert_equal 2, @bootstrap.starts
+    assert_equal 2, @attempts
+    assert_equal 1, @tunnel.ensures
+    assert_equal 1, @capability.verifications
   end
 
   def test_new_generation_stales_old_state_and_old_generation_cannot_return

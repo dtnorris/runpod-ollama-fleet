@@ -25,6 +25,19 @@ class CampaignRunpodRuntimeTest < Minitest::Test
     end
   end
 
+  class RecordingReconciler
+    attr_reader :calls
+
+    def initialize
+      @calls = []
+    end
+
+    def reconcile!(**keywords)
+      calls << keywords
+      { "readiness_prerequisites_satisfied" => false }
+    end
+  end
+
   def test_selects_cheapest_currently_available_qualified_gpu
     runtime = build_runtime([
       gpu("NVIDIA A40", "HIGH", 0.49, 48),
@@ -112,9 +125,30 @@ class CampaignRunpodRuntimeTest < Minitest::Test
     assert_equal "qwen3.6:35b-a3b-q4_K_M", captured.fetch(:shared_source_model)
   end
 
+  def test_autonomous_reconciliation_never_authorizes_bootstrap_retry
+    reconciler = RecordingReconciler.new
+    capability = Object.new
+    capability.define_singleton_method(:validate_profile!) { |**| true }
+    runtime = build_runtime(
+      [], capability_request: capability, campaign_identity_sha256: "b" * 64,
+      bringup_reconciler_factory: ->(_guard) { reconciler }
+    )
+    fleet = active_fleet
+    runtime.define_singleton_method(:current_record) { fleet }
+
+    3.times do
+      state = runtime.reconcile_bringup!(desired_workers: 1, transition_guard: -> { true }).fetch(0)
+
+      refute state.fetch("readiness_prerequisites_satisfied")
+    end
+
+    assert_equal [false, false, false], reconciler.calls.map { |call| call.fetch(:retry_bootstrap) }
+  end
+
   private
 
-  def build_runtime(rows, readiness_observer: nil)
+  def build_runtime(rows, readiness_observer: nil, capability_request: nil, campaign_identity_sha256: nil,
+                    bringup_reconciler_factory: nil)
     RunpodOllamaFleet::CampaignRunpodRuntime.new(
       root: Dir.tmpdir,
       repo_root: File.expand_path("..", __dir__),
@@ -127,8 +161,19 @@ class CampaignRunpodRuntimeTest < Minitest::Test
         "shared_model" => "qwen3.6:35b-a3b-q4_K_M"
       },
       client: FakeClient.new(rows),
-      readiness_observer:
+      readiness_observer:, capability_request:, campaign_identity_sha256:,
+      bringup_reconciler_factory:
     )
+  end
+
+  def active_fleet
+    {
+      "fleet_id" => "fleet-1", "status" => "active",
+      "workers" => [{
+        "index" => 1, "generation_id" => "generation-1", "status" => "active",
+        "worker_id" => "worker-1", "pod_id" => "pod-1"
+      }]
+    }
   end
 
   def gpu(id, availability, rate, memory)

@@ -170,7 +170,7 @@ module RunpodOllamaFleet
           worker:,
           generation_id: worker.fetch("generation_id"),
           capability_request: @capability_request,
-          retry_bootstrap: true
+          retry_bootstrap: false
         )
       end
       reconcile_fallback_bringup!(fleet, states)
