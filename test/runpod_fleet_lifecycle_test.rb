@@ -363,6 +363,7 @@ class RunpodFleetLifecycleTest < Minitest::Test
   end
 
   def test_scale_and_replace_keep_spend_lease_conservative_across_generations
+    provider_deadline = @now + 3600
     activate(
       [worker(1, "old_1")],
       lease: {
@@ -374,9 +375,11 @@ class RunpodFleetLifecycleTest < Minitest::Test
     @now += 600
     scale_preflight = @lifecycle.preflight_scale(target_worker_count: 2, max_fleet_hourly_usd: 3.0)
     @lifecycle.scale(target_worker_count: 2, ssh_public_key: public_key, preflight: scale_preflight, max_fleet_hourly_usd: 3.0)
+    assert_equal provider_deadline.iso8601, @client.created_bodies.last.fetch("terminateAfter")
     @now += 600
     replace_preflight = @lifecycle.preflight_replace(worker_index: 1, max_fleet_hourly_usd: 3.0)
     @lifecycle.replace(worker_index: 1, ssh_public_key: public_key, preflight: replace_preflight, max_fleet_hourly_usd: 3.0)
+    assert_equal provider_deadline.iso8601, @client.created_bodies.last.fetch("terminateAfter")
     @now += 600
 
     lease = LocalModelEvaluation::RunpodLease.snapshot_for(fleet: @state.current, now: @now)

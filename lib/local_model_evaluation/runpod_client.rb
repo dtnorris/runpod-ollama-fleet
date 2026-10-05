@@ -56,7 +56,7 @@ module LocalModelEvaluation
     end
 
     def create_pod(body)
-      if Array(body["volumeMounts"]).empty?
+      if Array(body["volumeMounts"]).empty? && !body.key?("terminateAfter")
         request("POST", "/pods", body:)
       else
         create_pod_graphql(body)
@@ -83,10 +83,11 @@ module LocalModelEvaluation
         "name" => body.fetch("name"),
         "ports" => Array(body["ports"]).join(","),
         "startSsh" => true,
+        "terminateAfter" => body["terminateAfter"],
         "volumeInGb" => persistent ? Integer(persistent.fetch("size")) : 0,
         "volumeMountPath" => persistent && persistent.fetch("path"),
         "networkVolumeId" => network && network.fetch("volumeId"),
-        "volumeMounts" => Array(body.fetch("volumeMounts"))
+        "volumeMounts" => Array(body["volumeMounts"])
       }.compact
 
       document = graphql_request(

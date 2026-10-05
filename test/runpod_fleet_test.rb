@@ -346,6 +346,85 @@ class RunpodFleetTest < Minitest::Test
     assert_in_delta 0.50, lease.fetch("max_spend_usd"), 0.000001
     expires = Time.parse(lease.fetch("started_at_utc")) + lease.fetch("max_runtime_seconds")
     assert_equal deadline.iso8601, expires.utc.iso8601
+    assert_equal deadline.iso8601, @client.created_bodies.fetch(0).fetch("terminateAfter")
+  end
+
+  def test_create_with_runtime_lease_sends_provider_termination_deadline
+    now = Time.utc(2026, 10, 5, 9, 0, 0)
+    fleet = LocalModelEvaluation::RunpodFleet.new(
+      client: @client,
+      env_path: @env_path,
+      out: @out,
+      sleeper: ->(_seconds) {},
+      clock: -> { 0.0 },
+      wall_clock: -> { now }
+    )
+    @client.create_responses = [{ "id" => "pod_runtime_lease" }]
+    @client.pod_details = {
+      "pod_runtime_lease" => ready_pod(
+        1, "pod_runtime_lease", "198.51.100.51", 22051, 0.69, cloud: "SECURE"
+      )
+    }
+    preflight = fleet.preflight(
+      worker_count: 1,
+      max_fleet_hourly_usd: 1.0,
+      max_runtime_seconds: 1800
+    )
+
+    fleet.create(
+      worker_count: 1,
+      ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest test@example",
+      preflight:,
+      max_fleet_hourly_usd: 1.0,
+      max_runtime_seconds: 1800
+    )
+
+    assert_equal((now + 1800).iso8601, @client.created_bodies.fetch(0).fetch("terminateAfter"))
+  end
+
+  def test_create_with_spend_only_lease_omits_provider_termination_deadline
+    now = Time.utc(2026, 10, 5, 9, 0, 0)
+    fleet = LocalModelEvaluation::RunpodFleet.new(
+      client: @client,
+      env_path: @env_path,
+      out: @out,
+      sleeper: ->(_seconds) {},
+      clock: -> { 0.0 },
+      wall_clock: -> { now }
+    )
+    @client.create_responses = [{ "id" => "pod_spend_lease" }]
+    @client.pod_details = {
+      "pod_spend_lease" => ready_pod(
+        1, "pod_spend_lease", "198.51.100.52", 22052, 0.69, cloud: "SECURE"
+      )
+    }
+    preflight = fleet.preflight(
+      worker_count: 1,
+      max_fleet_hourly_usd: 1.0,
+      max_spend_usd: 1.0
+    )
+
+    fleet.create(
+      worker_count: 1,
+      ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest test@example",
+      preflight:,
+      max_fleet_hourly_usd: 1.0,
+      max_spend_usd: 1.0
+    )
+
+    refute @client.created_bodies.fetch(0).key?("terminateAfter")
+  end
+
+  def test_provider_termination_deadline_rejects_malformed_lease
+    error = assert_raises(LocalModelEvaluation::RunpodFleet::Error) do
+      @fleet.send(
+        :provider_terminate_after_utc,
+        "started_at_utc" => "not-a-time",
+        "max_runtime_seconds" => 1800
+      )
+    end
+
+    assert_includes error.message, "invalid provider termination lease"
   end
 
   def test_create_rejects_preflight_for_different_storage_before_paid_mutation

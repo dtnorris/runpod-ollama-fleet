@@ -330,7 +330,7 @@ module LocalModelEvaluation
         (1..worker_count).each do |index|
           body = create_body(
             index, ssh_public_key, cloud, container_disk_gb:, volume_gb:, network_volume_id:,
-            global_volume_id:
+            global_volume_id:, terminate_after_utc: provider_terminate_after_utc(lease)
           )
           handle = reserve_campaign_capacity(
             operation_type: "create",
@@ -504,7 +504,8 @@ module LocalModelEvaluation
       end
     end
 
-    def create_body(index, ssh_public_key, cloud, container_disk_gb:, volume_gb:, network_volume_id: nil, global_volume_id: nil)
+    def create_body(index, ssh_public_key, cloud, container_disk_gb:, volume_gb:, network_volume_id: nil,
+                    global_volume_id: nil, terminate_after_utc: nil)
       body = {
         "name" => worker_name(index),
         "image" => IMAGE,
@@ -524,6 +525,7 @@ module LocalModelEvaluation
           "count" => 1
         }
       }
+      body["terminateAfter"] = terminate_after_utc if terminate_after_utc
       if global_volume_id
         body["volumeMounts"] = [{
           "volumeId" => global_volume_id,
@@ -907,6 +909,15 @@ module LocalModelEvaluation
 
     def lease_configured?(max_runtime_seconds, max_spend_usd)
       !max_runtime_seconds.nil? || !max_spend_usd.nil?
+    end
+
+    def provider_terminate_after_utc(lease)
+      return nil unless lease && lease["max_runtime_seconds"]
+
+      started_at = Time.parse(lease.fetch("started_at_utc")).utc
+      (started_at + Float(lease.fetch("max_runtime_seconds"))).iso8601
+    rescue KeyError, ArgumentError, TypeError => e
+      raise Error, "invalid provider termination lease: #{e.message}"
     end
 
     def build_lease(started_at:, max_runtime_seconds:, max_spend_usd:)

@@ -215,7 +215,10 @@ module LocalModelEvaluation
             current = lifecycle_fleet!(expected_fleet_id: preflight.fleet_id)
             ensure_lease_capacity!(current, pending_started_at: created_at, pending_rates:)
             created_at[index] = utc_now
-            body = create_body(index, ssh_public_key, fleet.fetch("cloud"), profile:, gpu_id: selected_gpu_id)
+            body = create_body(
+              index, ssh_public_key, fleet.fetch("cloud"), profile:, gpu_id: selected_gpu_id,
+              terminate_after_utc: provider_terminate_after_utc(current)
+            )
             handle = reserve_campaign_capacity(
               operation_type: "scale_up",
               logical_resource_id: "burst_#{index}",
@@ -376,7 +379,10 @@ module LocalModelEvaluation
           started_at = utc_now
           profile = provisioning_profile!(current)
           selected_gpu_id = preflight.gpu.fetch("id").to_s
-          body = create_body(index, ssh_public_key, fleet.fetch("cloud"), profile:, gpu_id: selected_gpu_id)
+          body = create_body(
+            index, ssh_public_key, fleet.fetch("cloud"), profile:, gpu_id: selected_gpu_id,
+            terminate_after_utc: provider_terminate_after_utc(current)
+          )
           handle = reserve_campaign_capacity(
             operation_type: "replace",
             logical_resource_id: "burst_#{index}",
@@ -685,7 +691,7 @@ module LocalModelEvaluation
       raise Error, e.message
     end
 
-    def create_body(index, ssh_public_key, cloud, profile:, gpu_id:)
+    def create_body(index, ssh_public_key, cloud, profile:, gpu_id:, terminate_after_utc: nil)
       mounts = if profile["network_volume_id"]
                  { "network" => [{ "volumeId" => profile.fetch("network_volume_id"), "path" => RunpodFleet::VOLUME_MOUNT_PATH }] }
                elsif profile["volume_gb"]
@@ -703,6 +709,7 @@ module LocalModelEvaluation
         "cloud" => cloud,
         "gpu" => { "id" => normalize_gpu_id(gpu_id), "count" => 1 }
       }
+      body["terminateAfter"] = terminate_after_utc if terminate_after_utc
       if profile["global_volume_id"]
         body["volumeMounts"] = [{
           "volumeId" => profile.fetch("global_volume_id"),
@@ -711,6 +718,12 @@ module LocalModelEvaluation
         }]
       end
       body
+    end
+
+    def provider_terminate_after_utc(fleet)
+      RunpodLease.snapshot_for(fleet:, now: utc_now)["expires_at_utc"]
+    rescue RunpodLease::Error => e
+      raise Error, e.message
     end
 
     def wait_until_ready(created, cloud:, gpu_id:, wait_seconds:, poll_seconds:)

@@ -60,6 +60,36 @@ class RunpodClientTest < Minitest::Test
     assert_equal body, JSON.parse(seen.fetch(:body))
   end
 
+  def test_create_pod_with_provider_deadline_uses_graphql_terminate_after
+    seen = nil
+    transport = lambda do |request|
+      seen = request
+      Response.new(
+        status: 200,
+        body: JSON.generate("data" => { "podFindAndDeployOnDemand" => { "id" => "pod_lease" } })
+      )
+    end
+
+    terminate_after = "2026-10-05T14:35:00Z"
+    body = {
+      "name" => "af-lme-burst-1",
+      "image" => "runpod/pytorch:test",
+      "disk" => 30,
+      "ports" => ["22/tcp"],
+      "env" => { "PUBLIC_KEY" => "ssh-ed25519 test" },
+      "mounts" => {},
+      "cloud" => "SECURE",
+      "gpu" => { "id" => "NVIDIA A40", "count" => 1 },
+      "terminateAfter" => terminate_after
+    }
+    client = LocalModelEvaluation::RunpodClient.new(api_key: "rpa_test", transport:)
+
+    assert_equal "pod_lease", client.create_pod(body).fetch("id")
+    document = JSON.parse(seen.fetch(:body))
+    assert_includes document.fetch("query"), "podFindAndDeployOnDemand"
+    assert_equal terminate_after, document.dig("variables", "input", "terminateAfter")
+  end
+
   def test_problem_json_raises_typed_error_without_leaking_api_key
     transport = lambda do |_request|
       Response.new(
