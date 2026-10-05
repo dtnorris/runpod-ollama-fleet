@@ -35,16 +35,49 @@ class OperatorDoctorTest < Minitest::Test
   end
 
   def test_pod_stage_precedence_and_healthy_state
-    assert_stage "provider_creation", worker("-", lme_status: "provisioning")
-    assert_stage "bootstrap", worker("FAILED")
-    assert_stage "capability_verification", worker("PASSED", models: [])
-    assert_stage "tunnel", worker("PASSED", tunnel: "ABSENT")
-    assert_stage "tunnel", worker("-", tunnel: "ABSENT")
-    assert_stage "registry_publication", worker("PASSED", registry: "NOT_READY")
+    cases = [
+      ["provider_creation", "blocked", worker("-", lme_status: "provisioning")],
+      ["bootstrap", "waiting", worker("NOT_STARTED", tunnel: "ABSENT")],
+      ["bootstrap", "waiting", worker("IN_PROGRESS", tunnel: "ABSENT")],
+      ["bootstrap", "blocked", worker("FAILED_RETRYABLE", tunnel: "ABSENT")],
+      ["bootstrap", "blocked", worker("FAILED_TERMINAL", tunnel: "ABSENT")],
+      ["tunnel", "blocked", worker("PASSED", tunnel: "ABSENT")],
+      ["capability_verification", "blocked", worker("PASSED", models: [])],
+      ["registry_publication", "blocked", worker("PASSED", registry: "NOT_READY")]
+    ]
+    cases.each { |stage, status, row| assert_stage(stage, row, status:) }
 
     result = doctor(worker("PASSED")).pod("A2")
     assert_equal "healthy", result.fetch("stage")
+    assert_equal "healthy", result.fetch("status")
     assert_nil result.fetch("next_action")
+  end
+
+  def test_bootstrap_diagnosis_describes_current_state
+    summaries = {
+      "NOT_STARTED" => "Bootstrap has not started.",
+      "IN_PROGRESS" => "Bootstrap is currently running.",
+      "FAILED_RETRYABLE" => "Bootstrap failed and is retryable.",
+      "FAILED_TERMINAL" => "Bootstrap failed terminally."
+    }
+
+    summaries.each do |bootstrap, summary|
+      result = doctor(worker(bootstrap, tunnel: "ABSENT")).pod("A2")
+
+      assert_equal "bootstrap", result.fetch("stage")
+      assert_equal summary, result.fetch("summary")
+      refute_equal "tunnel", result.fetch("stage")
+    end
+  end
+
+  def test_missing_current_generation_bootstrap_evidence_precedes_later_healthy_fields
+    row = worker("-", models: ["stale-model:latest"], tunnel: "ESTABLISHED", registry: "READY")
+    result = doctor(row).pod("A2")
+
+    assert_equal "bootstrap", result.fetch("stage")
+    assert_equal "blocked", result.fetch("status")
+    assert_includes result.fetch("summary"), "current worker generation is missing"
+    assert_equal "inspect_bootstrap_log", result.dig("next_action", "action")
   end
 
   def test_pod_alias_canonical_id_and_unknown_handle_resolution
@@ -181,9 +214,10 @@ class OperatorDoctorTest < Minitest::Test
 
   private
 
-  def assert_stage(expected, row)
+  def assert_stage(expected, row, status: "blocked")
     result = doctor(row).pod("A2")
     assert_equal expected, result.fetch("stage")
+    assert_equal status, result.fetch("status")
     assert_equal 1, result.fetch("next_action").keys.count { |key| key == "action" }
   end
 

@@ -118,16 +118,17 @@ module RunpodOllamaFleet
         return result.merge("stage" => "provider_creation",
                             "summary" => "Retained fleet state does not show an active managed pod.")
       end
+      bootstrap = worker.fetch("bootstrap_status")
+      unless bootstrap == "PASSED"
+        return result.merge("stage" => "bootstrap",
+                            "status" => bootstrap_waiting?(bootstrap) ? "waiting" : "blocked",
+                            "summary" => bootstrap_summary(bootstrap),
+                            "next_action" => action("inspect_bootstrap_log"))
+      end
       unless worker.fetch("tunnel_status") == "ESTABLISHED"
         return result.merge("stage" => "tunnel",
                             "summary" => "Managed pod is retained, but its tunnel is not established.",
                             "next_action" => action("inspect_tunnel_status"))
-      end
-      bootstrap = worker.fetch("bootstrap_status")
-      if bootstrap == "-" || bootstrap == "FAILED" || bootstrap == "INTERRUPTED"
-        return result.merge("stage" => "bootstrap",
-                            "summary" => "Bootstrap evidence is #{bootstrap == '-' ? 'missing' : bootstrap.downcase}.",
-                            "next_action" => action("inspect_bootstrap_log"))
       end
       if Array(worker["available_models"]).empty?
         return result.merge("stage" => "capability_verification",
@@ -142,6 +143,31 @@ module RunpodOllamaFleet
 
       result.merge("stage" => "healthy", "status" => "healthy",
                    "summary" => "Pod is registry READY.", "next_action" => nil)
+    end
+
+    def bootstrap_waiting?(status)
+      status != "-" && !status.start_with?("FAILED", "INTERRUPTED")
+    end
+
+    def bootstrap_summary(status)
+      case status
+      when "-"
+        "Bootstrap has not started or retained evidence for the current worker generation is missing."
+      when "NOT_STARTED", "REQUIRED"
+        "Bootstrap has not started."
+      when "IN_PROGRESS"
+        "Bootstrap is currently running."
+      when "FAILED"
+        "Bootstrap failed."
+      when "FAILED_RETRYABLE"
+        "Bootstrap failed and is retryable."
+      when "FAILED_TERMINAL"
+        "Bootstrap failed terminally."
+      when "INTERRUPTED"
+        "Bootstrap was interrupted."
+      else
+        "Bootstrap is incomplete (#{status.downcase.tr('_', ' ')})."
+      end
     end
 
     def campaign_result(authority, ledger, retained, report)
