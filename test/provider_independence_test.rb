@@ -1,13 +1,17 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require_relative "support/sibling_implementation_boundary"
 
 class ProviderIndependenceTest < Minitest::Test
   REPO_ROOT = File.expand_path("..", __dir__)
   RUBY_ROOTS = %w[bin lib test].freeze
 
   def test_loaded_features_contain_no_sibling_implementation
-    forbidden = $LOADED_FEATURES.grep(/(?:adventure[_-]finder|af[_-]workloads|workload[_-]orchestrator|local[_-]ollama[_-]workers)/i)
+    forbidden = SiblingImplementationBoundary.forbidden_features(
+      $LOADED_FEATURES, root: REPO_ROOT,
+      pattern: /(?:adventure[_-]finder|af[_-]workloads|workload[_-]orchestrator|local[_-]ollama[_-]workers)/i
+    )
     assert_empty forbidden
   end
 
