@@ -19,6 +19,14 @@ Read the complete skill before proposing or implementing changes. If
 inaccessible, disclose that limitation; do not claim to have applied an unread
 skill. For reproducible work, record the skill revision used when relevant.
 
+## Canonical Planning Standard
+
+For substantial engineering planning, architectural changes, multi-agent coordination, task decomposition, integration planning, or stalled-work recovery, read and apply the canonical [Agentic Task Planning](https://github.com/dtnorris/agent-skills/blob/main/skills/agentic-task-planning/SKILL.md) skill.
+
+Apply it before defining task boundaries and dependencies. Preserve end-to-end acceptance, independently verifiable work, integration order, recovery, and evidence-based completion.
+
+Skip for routine coding and already-approved implementation tasks. Keep task-specific constraints, safety requirements, and human publication authority controlling. Disclose if the skill cannot be accessed.
+
 ## Working Principles
 
 1. **Inspect before changing.** Verify the exact repository, current Git HEAD,
