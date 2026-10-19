@@ -2,6 +2,7 @@
 
 require "securerandom"
 require "time"
+require_relative "provider_outcome"
 require_relative "worker_bringup_identity"
 require_relative "worker_bringup_state"
 
@@ -9,7 +10,9 @@ module RunpodOllamaFleet
   # Advances one generation through bootstrap, tunnel, and capability evidence.
   # It deliberately stops before registry publication.
   class WorkerBringupReconciler
-    class Error < StandardError; end
+    # Bring-up failures preserve their existing rescue hierarchy and diagnostics
+    # while exposing source-selected provider outcomes to boundary consumers.
+    class Error < ProviderOutcome::Failure; end
     class RetryableTransitionError < Error; end
     class TerminalTransitionError < Error; end
 
@@ -43,6 +46,9 @@ module RunpodOllamaFleet
 
     private
 
+    # Advances tunnel evidence for this identity in the supplied document and
+    # checkpoints success or the original typed/retryable failure; returns the
+    # checkpoint result and may propagate unrelated adapter exceptions.
     def reconcile_tunnel(identity, document, checkpoint)
       observed = invoke(@tunnel, :inspect, identity: identity.document)
       result = if observed.nil? || %w[not_started failed_retryable].include?(observed["status"])
@@ -53,11 +59,14 @@ module RunpodOllamaFleet
       update_stage(document, "tunnel", validate_result(result, identity, "tunnel"))
       checkpoint.call
     rescue RetryableTransitionError => e
-      fail_stage(document, "tunnel", "failed_retryable", e.message, checkpoint)
+      fail_stage(document, "tunnel", "failed_retryable", e, checkpoint)
     rescue TerminalTransitionError => e
-      fail_stage(document, "tunnel", "failed_terminal", e.message, checkpoint)
+      fail_stage(document, "tunnel", "failed_terminal", e, checkpoint)
     end
 
+    # Reconciles this identity and retained attempt under the explicit retry
+    # flag, checkpointing typed failures without changing retry authority.
+    # Returns stage progress; unrelated adapter exceptions propagate.
     def reconcile_bootstrap(identity, document, checkpoint, retry_bootstrap:)
       stage = document.fetch("bootstrap")
       attempt = stage["attempt"]
@@ -100,11 +109,14 @@ module RunpodOllamaFleet
       update_bootstrap(document, result)
       checkpoint.call
     rescue RetryableTransitionError => e
-      fail_stage(document, "bootstrap", "failed_retryable", e.message, checkpoint)
+      fail_stage(document, "bootstrap", "failed_retryable", e, checkpoint)
     rescue TerminalTransitionError => e
-      fail_stage(document, "bootstrap", "failed_terminal", e.message, checkpoint)
+      fail_stage(document, "bootstrap", "failed_terminal", e, checkpoint)
     end
 
+    # Verifies this identity against the supplied adapter result, checkpointing
+    # typed terminal failures with unchanged diagnostics/status. Unrelated
+    # adapter exceptions propagate; successful updates return the checkpoint.
     def reconcile_capability(identity, document, checkpoint)
       observed = invoke(@capability, :inspect, identity: identity.document)
       result = if observed.nil? || %w[not_started failed_retryable].include?(observed["status"])
@@ -117,9 +129,9 @@ module RunpodOllamaFleet
       update_stage(document, "capability", result)
       checkpoint.call
     rescue RetryableTransitionError => e
-      fail_stage(document, "capability", "failed_retryable", e.message, checkpoint)
+      fail_stage(document, "capability", "failed_retryable", e, checkpoint)
     rescue TerminalTransitionError => e
-      fail_stage(document, "capability", "failed_terminal", e.message, checkpoint)
+      fail_stage(document, "capability", "failed_terminal", e, checkpoint)
     end
 
     def classify_retained_process(document, checkpoint)
@@ -160,6 +172,9 @@ module RunpodOllamaFleet
       end
     end
 
+    # Checks an evidence hash against exact identity/runtime requirements.
+    # Returns the comparisons on success; raises TerminalTransitionError for
+    # missing evidence, identity mismatch or capability mismatch.
     def validate_capability_evidence!(evidence, identity)
       raise TerminalTransitionError, "capability evidence is missing" unless evidence.is_a?(Hash)
       bringup = identity.document
@@ -176,7 +191,10 @@ module RunpodOllamaFleet
       comparisons["gpu_id"] = required.fetch("required_gpu_id") if required.key?("required_gpu_id")
       comparisons.each do |field, expected|
         next if evidence[field] == expected
-        raise TerminalTransitionError, "capability evidence #{field} does not match exact capability request"
+        raise TerminalTransitionError.new(
+          "capability evidence #{field} does not match exact capability request",
+          outcome_code: %w[worker_id generation_id provider_resource_id].include?(field) ? :identity_mismatch : :capability_mismatch
+        )
       end
     end
 
@@ -235,18 +253,26 @@ module RunpodOllamaFleet
       document.fetch("bootstrap").fetch("attempt")["launch_identity"] = launch_identity if launch_identity
     end
 
+    # Copies status/evidence from a validated result into a named stage and
+    # removes stale failure metadata. Returns the removed outcome, or nil;
+    # malformed documents/results raise KeyError.
     def update_stage(document, name, result)
       stage = document.fetch(name)
       stage["status"] = result.fetch("status")
       stage["evidence"] = result["evidence"]
       stage["updated_at_utc"] = timestamp
       stage.delete("error")
+      stage.delete("outcome_code")
     end
 
-    def fail_stage(document, name, status, message, checkpoint)
+    # Records an exception or legacy diagnostic for the named failed stage,
+    # retaining its code when typed and unknown otherwise. Returns the supplied
+    # checkpoint result; checkpoint/storage errors propagate.
+    def fail_stage(document, name, status, failure, checkpoint)
       stage = document.fetch(name)
       stage["status"] = status
-      stage["error"] = message
+      stage["error"] = failure.is_a?(Exception) ? failure.message : failure
+      stage["outcome_code"] = ProviderOutcome.code_for(failure).to_s
       stage["updated_at_utc"] = timestamp
       checkpoint.call
     end

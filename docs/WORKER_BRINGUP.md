@@ -65,6 +65,24 @@ capability transition, and registry publication rechecks current campaign
 authority; teardown prevents later stages and publication. Generation changes
 make the prior tunnel, bootstrap, capability, and READY evidence ineligible.
 
+Provider and bring-up exceptions can additionally expose a closed
+`ProviderOutcome::Failure#outcome_code`: `capacity_unavailable`,
+`hardware_mismatch`, `resource_unusable`, `readiness_unavailable`,
+`capability_mismatch`, `identity_mismatch`, or `unknown`. Codes are selected at
+explicit observation sites; untyped provider API errors and ambiguous results
+remain `unknown` regardless of diagnostic wording. Failed bring-up stages retain
+an optional `outcome_code` string; historical stages without it remain readable.
+A successful stage update removes stale failure metadata.
+
+These phase-A annotations do not authorize fallback. `CampaignRunpodRuntime`
+still owns the existing diagnostic-based decisions, and admission, reservations,
+liability and verified absence remain separate mandatory gates. In particular,
+legacy bring-up policy can accept an identity mismatch or a mixed diagnostic
+that the typed vocabulary does not establish as safe. Consumers must not infer
+retry permission from a code alone; unknown/missing codes supply no typed
+permission. Changing fallback authority or resolving these compatibility cases
+requires the separate phase-B policy decision.
+
 The deterministic hard-offline acceptance check is:
 
 ```console

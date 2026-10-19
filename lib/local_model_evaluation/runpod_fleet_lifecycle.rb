@@ -2,6 +2,7 @@
 
 require "set"
 require "time"
+require_relative "../runpod_ollama_fleet/provider_outcome"
 require_relative "runpod_client"
 require_relative "runpod_fleet"
 require_relative "runpod_fleet_state"
@@ -10,7 +11,9 @@ require_relative "runpod_workers"
 
 module LocalModelEvaluation
   class RunpodFleetLifecycle
-    class Error < StandardError; end
+    # Fleet diagnostics retain their public exception class and message; known
+    # provider observations additionally carry the closed outcome vocabulary.
+    class Error < RunpodOllamaFleet::ProviderOutcome::Failure; end
 
     Preflight = Struct.new(
       :operation,
@@ -615,19 +618,22 @@ module LocalModelEvaluation
       result
     end
 
+    # Observes capacity for the fleet cloud/count and exact GPU, returning
+    # [GPU, availability, rate]. Raises Error for invalid inputs or a typed
+    # provider failure for missing catalog capacity; creates no resource.
     def capacity!(fleet, count:, gpu_id:)
       cloud = normalize_cloud(fleet.fetch("cloud"))
       selected_gpu_id = normalize_gpu_id(gpu_id)
       gpu = @client.list_gpu_types(cloud:, count:).find { |candidate| candidate["id"] == selected_gpu_id }
-      raise Error, "RunPod catalog did not return #{selected_gpu_id}" unless gpu
+      raise Error.new("RunPod catalog did not return #{selected_gpu_id}", outcome_code: :capacity_unavailable) unless gpu
       if gpu["memory"].to_i < RunpodFleet::GPU_MEMORY_GB
         raise Error, "#{selected_gpu_id} reports only #{gpu['memory']} GB VRAM; #{RunpodFleet::GPU_MEMORY_GB} GB is required"
       end
-      raise Error, "#{selected_gpu_id} is not available on #{cloud} cloud" unless gpu[cloud.downcase] == true
+      raise Error.new("#{selected_gpu_id} is not available on #{cloud} cloud", outcome_code: :capacity_unavailable) unless gpu[cloud.downcase] == true
 
       availability = gpu["availability"].to_s
       if availability.empty? || availability == "NONE"
-        raise Error, "#{selected_gpu_id} #{cloud} availability is #{availability.empty? ? 'unknown' : availability}"
+        raise Error.new("#{selected_gpu_id} #{cloud} availability is #{availability.empty? ? 'unknown' : availability}", outcome_code: :capacity_unavailable)
       end
       rate = positive_float(gpu.dig("price", cloud.downcase), "#{selected_gpu_id} #{cloud} hourly rate")
       [gpu, availability, rate]
@@ -726,6 +732,8 @@ module LocalModelEvaluation
       raise Error, e.message
     end
 
+    # Polls created index/id pairs for the requested cloud/GPU and timing bounds.
+    # Returns ready workers; raises Error on identity, terminal or timeout failure.
     def wait_until_ready(created, cloud:, gpu_id:, wait_seconds:, poll_seconds:)
       pending = created.to_h
       ready = {}
@@ -737,7 +745,7 @@ module LocalModelEvaluation
           pod = @client.get_pod(pod_id)
           validate_pod!(pod, index, pod_id, cloud:, gpu_id:)
           status = pod["status"].to_s
-          raise Error, "#{worker_name(index)} entered terminal status #{status}" if %w[ERROR TERMINATED].include?(status)
+          raise Error.new("#{worker_name(index)} entered terminal status #{status}", outcome_code: :resource_unusable) if %w[ERROR TERMINATED].include?(status)
           next unless status == "RUNNING"
 
           endpoint = ssh_endpoint(pod)
@@ -762,7 +770,7 @@ module LocalModelEvaluation
         end
 
         break if pending.empty?
-        raise Error, "timed out waiting for RunPod SSH endpoints: #{pending.keys.map { |i| worker_name(i) }.join(', ')}" if @monotonic_clock.call >= deadline
+        raise Error.new("timed out waiting for RunPod SSH endpoints: #{pending.keys.map { |i| worker_name(i) }.join(', ')}", outcome_code: :readiness_unavailable) if @monotonic_clock.call >= deadline
         @sleeper.call(poll_seconds)
       end
 
@@ -771,14 +779,16 @@ module LocalModelEvaluation
       raise Error, e.message
     end
 
+    # Checks observed pod name, cloud and GPU against the selected index/id.
+    # Returns nil on success; raises a typed Error on mismatch.
     def validate_pod!(pod, index, pod_id, cloud:, gpu_id:)
       expected_name = worker_name(index)
-      raise Error, "pod #{pod_id} name mismatch: expected #{expected_name.inspect}, got #{pod['name'].inspect}" unless pod["name"] == expected_name
-      raise Error, "#{expected_name} cloud mismatch: expected #{cloud}, got #{pod['cloud'].inspect}" unless pod["cloud"] == cloud
+      raise Error.new("pod #{pod_id} name mismatch: expected #{expected_name.inspect}, got #{pod['name'].inspect}", outcome_code: :identity_mismatch) unless pod["name"] == expected_name
+      raise Error.new("#{expected_name} cloud mismatch: expected #{cloud}, got #{pod['cloud'].inspect}", outcome_code: :hardware_mismatch) unless pod["cloud"] == cloud
       expected_gpu_id = normalize_gpu_id(gpu_id)
       gpu = pod["gpu"] || {}
       unless gpu["id"] == expected_gpu_id && gpu["count"].to_i == 1
-        raise Error, "#{expected_name} GPU mismatch: expected 1x #{expected_gpu_id}, got #{gpu.inspect}"
+        raise Error.new("#{expected_name} GPU mismatch: expected 1x #{expected_gpu_id}, got #{gpu.inspect}", outcome_code: :hardware_mismatch)
       end
     end
 

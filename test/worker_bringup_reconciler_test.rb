@@ -318,6 +318,72 @@ class WorkerBringupReconcilerTest < Minitest::Test
     assert_includes result.dig("bootstrap", "error"), "fully_gpu_resident"
   end
 
+  # Proves source-selected capability failures survive the durable state round
+  # trip with the original status/message and unchanged terminal behavior.
+  def test_typed_capability_failure_is_retained_across_restart
+    document = capability_request_document
+    document["ollama"]["require_fully_gpu_resident"] = false
+    request = RunpodOllamaFleet::OllamaCapabilityRequest.new(JSON.generate(document))
+    supplied = arguments(profile: profile.merge("require_fully_gpu_resident" => false), capability_request: request)
+
+    result = reconciler.reconcile!(**supplied)
+    retained = RunpodOllamaFleet::WorkerBringupState.new(root: @tmp).read_current(worker_id: "worker-1")
+
+    assert_equal "capability_mismatch", result.dig("bootstrap", "outcome_code")
+    assert_equal result, retained
+    assert_equal "failed_terminal", retained.fetch("overall_status")
+    assert_equal "capability evidence fully_gpu_resident does not match exact capability request", retained.dig("bootstrap", "error")
+    @reconciler = nil
+    assert_equal "capability_mismatch", reconciler.reconcile!(**supplied).dig("bootstrap", "outcome_code")
+    assert_equal 1, @bootstrap.starts
+  end
+
+  # Proves a legacy ambiguous process failure retains unknown rather than
+  # inventing a typed cause from diagnostic text.
+  def test_ambiguous_process_failure_is_retained_as_unknown
+    @bootstrap.start_result = ->(identity, attempt_id) { @bootstrap.in_progress(identity, attempt_id).merge("launch_identity" => nil) }
+
+    result = reconciler.reconcile!(**arguments)
+
+    assert_equal "unknown", result.dig("bootstrap", "outcome_code")
+    assert_equal "failed_terminal", result.fetch("overall_status")
+    refute result.fetch("readiness_prerequisites_satisfied")
+  end
+
+  # Records an actual identity mismatch separately from model unsuitability,
+  # while proving that the legacy campaign decision is deliberately unchanged.
+  def test_identity_code_does_not_override_legacy_bringup_policy
+    original = @capability.method(:verify!)
+    @capability.define_singleton_method(:verify!) do |identity:|
+      original.call(identity:).tap { |result| result.fetch("evidence")["worker_id"] = "other-worker" }
+    end
+
+    result = reconciler.reconcile!(**arguments)
+
+    assert_equal "identity_mismatch", result.dig("capability", "outcome_code")
+    assert_equal "failed_terminal", result.fetch("overall_status")
+    runtime = RunpodOllamaFleet::CampaignRunpodRuntime.allocate
+    assert_equal result.dig("capability", "error"), runtime.send(:retryable_bringup_failure, [result])
+  end
+
+  # A successful retry clears both diagnostic and typed failure metadata so a
+  # recovered stage cannot publish an outcome belonging to a prior attempt.
+  def test_successful_stage_update_clears_old_unknown_failure
+    original = @tunnel.method(:ensure!)
+    @tunnel.define_singleton_method(:ensure!) do |identity:|
+      raise RunpodOllamaFleet::WorkerBringupReconciler::RetryableTransitionError, "fixture tunnel temporarily unavailable"
+    end
+    failed = reconciler.reconcile!(**arguments)
+    assert_equal "unknown", failed.dig("tunnel", "outcome_code")
+    @tunnel.define_singleton_method(:ensure!, original)
+
+    recovered = reconciler.reconcile!(**arguments)
+
+    assert recovered.fetch("readiness_prerequisites_satisfied")
+    refute recovered.fetch("tunnel").key?("outcome_code")
+    refute recovered.fetch("tunnel").key?("error")
+  end
+
   def test_historical_model_requirement_remains_an_explicit_compatibility_input
     legacy = RunpodOllamaFleet::ModelRequirement.new(legacy_requirement_document)
 

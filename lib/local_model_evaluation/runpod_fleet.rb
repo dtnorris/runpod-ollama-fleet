@@ -3,6 +3,7 @@
 require "fileutils"
 require "set"
 require "time"
+require_relative "../runpod_ollama_fleet/provider_outcome"
 require_relative "runpod_fleet_state"
 require_relative "runpod_workers"
 
@@ -27,7 +28,9 @@ module LocalModelEvaluation
     DEFAULT_WAIT_SECONDS = 300
     DEFAULT_POLL_SECONDS = 3.0
 
-    class Error < StandardError; end
+    # Fleet diagnostics retain their public exception class and message; known
+    # provider observations additionally carry the closed outcome vocabulary.
+    class Error < RunpodOllamaFleet::ProviderOutcome::Failure; end
 
     Preflight = Struct.new(
       :worker_count,
@@ -154,6 +157,9 @@ module LocalModelEvaluation
       @gpu_id = selected
     end
 
+    # Checks requested capacity using the injected client and returns Preflight.
+    # Raises Error for invalid inputs/safety limits or a typed provider failure
+    # for missing catalog capacity; it never creates a pod.
     def preflight(worker_count:, cloud: DEFAULT_CLOUD, max_fleet_hourly_usd: DEFAULT_MAX_FLEET_HOURLY_USD,
                   container_disk_gb: DEFAULT_CONTAINER_DISK_GB, volume_gb: nil, network_volume_id: nil,
                   global_volume_id: nil,
@@ -182,12 +188,12 @@ module LocalModelEvaluation
       end
 
       gpu = @client.list_gpu_types(cloud:, count: worker_count).find { |candidate| candidate["id"] == gpu_id }
-      raise Error, "RunPod catalog did not return #{gpu_id}" unless gpu
+      raise Error.new("RunPod catalog did not return #{gpu_id}", outcome_code: :capacity_unavailable) unless gpu
       raise Error, "#{gpu_id} reports only #{gpu['memory']} GB VRAM; #{GPU_MEMORY_GB} GB is required" if gpu["memory"].to_i < GPU_MEMORY_GB
-      raise Error, "#{gpu_id} is not available on #{cloud} cloud" unless gpu[cloud.downcase] == true
+      raise Error.new("#{gpu_id} is not available on #{cloud} cloud", outcome_code: :capacity_unavailable) unless gpu[cloud.downcase] == true
 
       availability = gpu["availability"].to_s
-      raise Error, "#{gpu_id} #{cloud} availability is #{availability.empty? ? 'unknown' : availability}" if availability.empty? || availability == "NONE"
+      raise Error.new("#{gpu_id} #{cloud} availability is #{availability.empty? ? 'unknown' : availability}", outcome_code: :capacity_unavailable) if availability.empty? || availability == "NONE"
 
       rate = positive_float(gpu.dig("price", cloud.downcase), "#{gpu_id} #{cloud} hourly rate")
       fleet_rate = rate * worker_count
@@ -536,6 +542,9 @@ module LocalModelEvaluation
       body
     end
 
+    # Polls created index/id pairs for ready workers under the supplied cloud,
+    # timing and minimum-count bounds. Returns accepted/unaccepted workers;
+    # raises Error on invalid identity, terminal resources or readiness failure.
     def wait_until_ready(created, cloud:, wait_seconds:, poll_seconds:, min_ready_workers:)
       pending = created.to_h
       ready = {}
@@ -554,7 +563,7 @@ module LocalModelEvaluation
               @out.puts "Unavailable #{worker_name(index)}: terminal status #{status}"
               next
             end
-            raise Error, "#{worker_name(index)} entered terminal status #{status}"
+            raise Error.new("#{worker_name(index)} entered terminal status #{status}", outcome_code: :resource_unusable)
           end
 
           next unless status == "RUNNING"
@@ -590,11 +599,13 @@ module LocalModelEvaluation
 
           waiting = pending.keys.map { |i| worker_name(i) }
           if min_ready_workers == created.length
-            raise Error, "timed out waiting for RunPod SSH endpoints: #{waiting.join(', ')}"
+            raise Error.new("timed out waiting for RunPod SSH endpoints: #{waiting.join(', ')}", outcome_code: :readiness_unavailable)
           end
-          raise Error,
-                "timed out waiting for RunPod SSH endpoints: #{waiting.join(', ')}; " \
-                "only #{accepted.length} contiguous ready worker(s), minimum #{min_ready_workers}"
+          raise Error.new(
+            "timed out waiting for RunPod SSH endpoints: #{waiting.join(', ')}; " \
+            "only #{accepted.length} contiguous ready worker(s), minimum #{min_ready_workers}",
+            outcome_code: :readiness_unavailable
+          )
         end
 
         @sleeper.call(poll_seconds)
@@ -602,9 +613,10 @@ module LocalModelEvaluation
 
       accepted = contiguous_ready_prefix(ready)
       if accepted.length < min_ready_workers
-        raise Error,
-              "RunPod readiness ended with only #{accepted.length} contiguous ready worker(s); " \
-              "minimum #{min_ready_workers}"
+        raise Error.new(
+          "RunPod readiness ended with only #{accepted.length} contiguous ready worker(s); " \
+          "minimum #{min_ready_workers}", outcome_code: :readiness_unavailable
+        )
       end
 
       accepted_indices = accepted.map(&:index)
@@ -649,14 +661,16 @@ module LocalModelEvaluation
       end
     end
 
+    # Checks observed pod name, cloud and GPU against the selected index/id.
+    # Returns nil on success; raises a typed Error on mismatch.
     def validate_pod!(pod, index, pod_id, cloud:)
       expected_name = worker_name(index)
-      raise Error, "pod #{pod_id} name mismatch: expected #{expected_name.inspect}, got #{pod['name'].inspect}" unless pod["name"] == expected_name
-      raise Error, "#{expected_name} cloud mismatch: expected #{cloud}, got #{pod['cloud'].inspect}" unless pod["cloud"] == cloud
+      raise Error.new("pod #{pod_id} name mismatch: expected #{expected_name.inspect}, got #{pod['name'].inspect}", outcome_code: :identity_mismatch) unless pod["name"] == expected_name
+      raise Error.new("#{expected_name} cloud mismatch: expected #{cloud}, got #{pod['cloud'].inspect}", outcome_code: :hardware_mismatch) unless pod["cloud"] == cloud
 
       gpu = pod["gpu"] || {}
       unless gpu["id"] == gpu_id && gpu["count"].to_i == 1
-        raise Error, "#{expected_name} GPU mismatch: expected 1x #{gpu_id}, got #{gpu.inspect}"
+        raise Error.new("#{expected_name} GPU mismatch: expected 1x #{gpu_id}, got #{gpu.inspect}", outcome_code: :hardware_mismatch)
       end
     end
 
