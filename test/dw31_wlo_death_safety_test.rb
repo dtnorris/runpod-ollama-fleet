@@ -134,7 +134,7 @@ class Dw31WloDeathSafetyTest < Minitest::Test
   def setup
     skip "set WLO_REPO_ROOT to a current workload-orchestrator checkout" unless File.file?(WLO_LOADER)
 
-    @tmp = Dir.mktmpdir("dw31-wlo-death-")
+    @tmp = File.realpath(Dir.mktmpdir("dw31-wlo-death-"))
     @clock_path = File.join(@tmp, "clock.txt")
     @provider_path = File.join(@tmp, "fake-provider.json")
     @registry_path = File.join(@tmp, "registry.json")

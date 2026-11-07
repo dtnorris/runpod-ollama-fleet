@@ -29,7 +29,7 @@ class Dw31AutonomousGuardianSupervisorTest < Minitest::Test
   def setup
     skip "set WLO_REPO_ROOT to a current workload-orchestrator checkout" unless File.file?(WLO_LOADER)
 
-    @tmp = Dir.mktmpdir("dw31-autonomous-guardian-")
+    @tmp = File.realpath(Dir.mktmpdir("dw31-autonomous-guardian-"))
     @state_root = File.join(@tmp, "state")
     @clock_path = File.join(@tmp, "clock.txt")
     @provider_path = File.join(@tmp, "provider.json")
